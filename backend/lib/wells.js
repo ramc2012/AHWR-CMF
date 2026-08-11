@@ -54,7 +54,12 @@ function rowToWell(r) {
 // READ: list (proposal §6.1 — Wells list). activeRun = EXISTS an open run.
 // ---------------------------------------------------------------------
 async function getWells({ assetUnit, status, q } = {}) {
-    const where = ['w.current_rig_id IS NOT NULL'], vals = [];
+    // No rig-attachment filter: the registry is the WELL's lifecycle, not the
+    // rig's. Producing / planned / suspended / abandoned wells are by definition
+    // not on a rig — the old `current_rig_id IS NOT NULL` clause meant the Wells
+    // page could only ever display in-workover wells and the other KPI tiles
+    // were structurally pinned at zero.
+    const where = [], vals = [];
     if (assetUnit) { vals.push(assetUnit); where.push(`w.asset_unit = $${vals.length}`); }
     if (status) { vals.push(status); where.push(`w.status = $${vals.length}`); }
     if (q) {
@@ -328,11 +333,17 @@ async function trackRunInTxn(client, rigId, job) {
 
     if (open) {
         // The rig moved to a DIFFERENT well/job: close the stale run and clear the
-        // stale well's current_rig_id (only if it still points at this rig).
+        // stale well's current_rig_id (only if it still points at this rig). A
+        // well the rig has LEFT is no longer "in workover" — mark it completed,
+        // but only from the in-service states; an operator/edge-declared final
+        // state (producing/abandoned/suspended) is never overwritten by inference.
         await client.query('UPDATE well_runs SET ended_at = now() WHERE id = $1', [open.id]);
         if (open.well_id && open.well_id !== wellId) {
             await client.query(
-                'UPDATE wells SET current_rig_id = NULL, updated_at = now() WHERE well_id = $1 AND current_rig_id = $2',
+                `UPDATE wells SET current_rig_id = NULL,
+                        status = CASE WHEN status IN ('workover','active','drilling') THEN 'completed' ELSE status END,
+                        updated_at = now()
+                  WHERE well_id = $1 AND current_rig_id = $2`,
                 [open.well_id, rigId]);
         }
     }

@@ -118,10 +118,10 @@ export default function WellDetail() {
                     <WellStatusChip status={well.status} />
                 </Stack>
                 <Grid container spacing={2}>
-                    <Grid item xs={6} sm={4} md={3}><HeaderField label="Location" value={well.location || well.blockLease || 'â€”'} /></Grid>
-                    <Grid item xs={6} sm={4} md={3}><HeaderField label="Country" value={well.country || 'â€”'} /></Grid>
-                    <Grid item xs={6} sm={4} md={3}><HeaderField label="Company man" value={well.companyMan || 'â€”'} /></Grid>
-                    <Grid item xs={6} sm={4} md={3}><HeaderField label="Toolpusher" value={well.toolpusher || 'â€”'} /></Grid>
+                    <Grid item xs={6} sm={4} md={3}><HeaderField label="Location" value={well.location || well.blockLease || '—'} /></Grid>
+                    <Grid item xs={6} sm={4} md={3}><HeaderField label="Country" value={well.country || '—'} /></Grid>
+                    <Grid item xs={6} sm={4} md={3}><HeaderField label="Company man" value={well.companyMan || '—'} /></Grid>
+                    <Grid item xs={6} sm={4} md={3}><HeaderField label="Toolpusher" value={well.toolpusher || '—'} /></Grid>
                     <Grid item xs={6} sm={4} md={3}><HeaderField label="Field" value={well.field || '—'} /></Grid>
                     <Grid item xs={6} sm={4} md={3}><HeaderField label="Asset unit" value={well.assetUnit || '—'} /></Grid>
                     <Grid item xs={6} sm={4} md={3}><HeaderField label="Operator" value={well.operator || '—'} /></Grid>

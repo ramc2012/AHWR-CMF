@@ -271,12 +271,23 @@ function cleanWellText(v) {
     return s && s !== '--' ? s : '';
 }
 
+// Wells lifecycle vocabulary (must match wells.js WELL_STATUSES). Wire text is
+// mapped INTO this enum or dropped: previously any lowercased string passed
+// straight into wells.status — including 'active', which is not in the enum, so
+// started wells sat in a state the portal's own validation would reject and the
+// Wells KPI tiles could not count.
+const VALID_WELL_STATUSES = new Set(['planned', 'drilling', 'completed', 'producing', 'workover', 'suspended', 'abandoned']);
+
 function cleanStatus(v) {
     const text = cleanWellText(v).toLowerCase();
     if (!text) return '';
-    if (['active', 'started', 'inprogress', 'in_progress', 'running'].includes(text.replace(/[^a-z0-9]/g, ''))) return 'active';
+    const squashed = text.replace(/[^a-z0-9]/g, '');
+    // A well actively being serviced by a workover rig IS in workover.
+    if (['active', 'started', 'inprogress', 'in_progress', 'running'].includes(squashed)) return 'workover';
     if (['complete', 'completed', 'done', 'ended'].includes(text)) return 'completed';
-    return text;
+    if (['pa', 'pna', 'plugged', 'pluggedabandoned'].includes(squashed)) return 'abandoned';
+    if (['shutin', 'shut_in', 'suspended'].includes(squashed)) return 'suspended';
+    return VALID_WELL_STATUSES.has(text) ? text : '';
 }
 
 function firstNumber(obj, keys) {
@@ -444,18 +455,28 @@ async function upsertWellFromEvent(client, rigId, well, statusOverride, assignRi
     if (!well.wellId) return null;
     const rigRow = (await client.query(
         'SELECT asset_unit, field, latitude, longitude FROM rigs WHERE rig_id = $1', [rigId])).rows[0] || {};
+    // Status semantics: $6 is the status a NEW row is created with. On conflict,
+    // the existing status is overwritten ONLY when the event actually declared
+    // one ($22) — previously `status = EXCLUDED.status` let any later
+    // well.created/updated event with no status field silently reset a
+    // 'producing' or 'abandoned' well back to the 'workover' default.
+    const declaredStatus = statusOverride || (VALID_WELL_STATUSES.has(well.status) ? well.status : null);
+    // spud_date is a DATE column; only bind a value that will actually cast, so
+    // a malformed wire string cannot 22007-abort the whole batch.
+    const spudDate = well.spudDate && /^\d{4}-\d{2}-\d{2}/.test(String(well.spudDate))
+        ? String(well.spudDate).slice(0, 10) : null;
     await client.query(
         `INSERT INTO wells
            (well_id, name, uwi, well_type, service_type, status, field, asset_unit, country,
             company_man, toolpusher, objective, location, latitude, longitude, total_depth,
-            operator, block_lease, current_rig_id, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+            operator, block_lease, current_rig_id, notes, spud_date)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$23)
          ON CONFLICT (well_id) DO UPDATE SET
            name = COALESCE(EXCLUDED.name, wells.name),
            uwi = COALESCE(EXCLUDED.uwi, wells.uwi),
            well_type = COALESCE(EXCLUDED.well_type, wells.well_type),
            service_type = COALESCE(EXCLUDED.service_type, wells.service_type),
-           status = EXCLUDED.status,
+           status = CASE WHEN $22::text IS NOT NULL THEN $22::text ELSE wells.status END,
            field = COALESCE(EXCLUDED.field, wells.field),
            asset_unit = COALESCE(EXCLUDED.asset_unit, wells.asset_unit),
            country = COALESCE(EXCLUDED.country, wells.country),
@@ -470,12 +491,14 @@ async function upsertWellFromEvent(client, rigId, well, statusOverride, assignRi
            block_lease = COALESCE(EXCLUDED.block_lease, wells.block_lease),
            current_rig_id = CASE WHEN $21::boolean THEN EXCLUDED.current_rig_id ELSE wells.current_rig_id END,
            notes = COALESCE(EXCLUDED.notes, wells.notes),
+           spud_date = COALESCE(EXCLUDED.spud_date, wells.spud_date),
            updated_at = now()`,
-        [well.wellId, well.name || well.wellId, well.uwi || null, well.wellType || 'workover', well.service || null, statusOverride || well.status || 'workover',
+        [well.wellId, well.name || well.wellId, well.uwi || null, well.wellType || 'workover', well.service || null, declaredStatus || 'workover',
          well.field || rigRow.field || null, well.assetUnit || rigRow.asset_unit || null,
          well.country || null, well.companyMan || null, well.toolpusher || null, well.objective || null, well.location || null,
          well.latitude ?? rigRow.latitude ?? null, well.longitude ?? rigRow.longitude ?? null,
-         well.totalDepth, well.operator || null, well.blockLease || null, assignRig ? rigId : null, well.notes || null, !!assignRig]
+         well.totalDepth, well.operator || null, well.blockLease || null, assignRig ? rigId : null, well.notes || null, !!assignRig,
+         declaredStatus, spudDate]
     );
     return well.wellId;
 }
@@ -542,7 +565,10 @@ async function startWellForRig(client, rigId, ev) {
         );
     }
     await client.query('UPDATE wells SET current_rig_id = NULL, updated_at = now() WHERE current_rig_id = $1 AND well_id <> $2', [rigId, wellId]);
-    await client.query('UPDATE wells SET current_rig_id = $2, status = $3, updated_at = now() WHERE well_id = $1', [wellId, rigId, well.status || 'active']);
+    // In-enum fallback: the old 'active' default was outside WELL_STATUSES, so a
+    // started well landed in a state the portal validates against and the Wells
+    // KPI row silently ignored.
+    await client.query('UPDATE wells SET current_rig_id = $2, status = $3, updated_at = now() WHERE well_id = $1', [wellId, rigId, well.status || 'workover']);
     return { wellId, name: well.name || wellId, jobNo };
 }
 
@@ -560,13 +586,24 @@ async function completeWellForRig(client, rigId, ev) {
         wellId = activeOpen && activeOpen.well_id;
     }
     if (!wellId) return null;
+    // Honour the edge's DECLARED post-job state: the operator completing the job
+    // says what the well is handed over as (producing / suspended / abandoned).
+    // 'completed' remains the fallback when no outcome was declared. This is what
+    // makes the Wells page's producing/abandoned tiles reflect real operations
+    // instead of every serviced well terminally reading 'completed'.
+    const finalStatus = VALID_WELL_STATUSES.has(well.status) && well.status !== 'workover'
+        ? well.status : 'completed';
     await lockWellsForRig(client, rigId, wellId);
-    await upsertWellFromEvent(client, rigId, { ...well, wellId, name: well.name || wellId }, 'completed', false);
+    await upsertWellFromEvent(client, rigId, { ...well, wellId, name: well.name || wellId }, finalStatus, false);
     const endedAt = coerceTsIso(ev.ts) || new Date().toISOString();
     await client.query('UPDATE well_runs SET ended_at = $3, summary = COALESCE(summary, $4) WHERE rig_id = $1 AND well_id = $2 AND ended_at IS NULL',
         [rigId, wellId, endedAt, well.notes || null]);
+    // td_date is a DATE column — only bind a castable value (same guard as
+    // spud_date) so a malformed wire string cannot abort the batch.
+    const tdDate = well.tdDate && /^\d{4}-\d{2}-\d{2}/.test(String(well.tdDate))
+        ? String(well.tdDate).slice(0, 10) : endedAt;
     await client.query('UPDATE wells SET status = $2, current_rig_id = CASE WHEN current_rig_id = $4 THEN NULL ELSE current_rig_id END, td_date = COALESCE(td_date, $3::date), updated_at = now() WHERE well_id = $1',
-        [wellId, 'completed', well.tdDate || endedAt, rigId]);
+        [wellId, finalStatus, tdDate, rigId]);
     return { wellId, name: well.name || wellId, wasActive: !!activeOpen };
 }
 async function processEvents(client, rigId, events) {

@@ -144,10 +144,17 @@ export default function Wells() {
         return true;
     }), [rows, unit, status, type, q]);
 
-    // KPI counts span the full (unfiltered) set so the row stays a stable fleet summary.
+    // KPI counts span the full (unfiltered) set so the row stays a stable fleet
+    // summary. Every lifecycle status lands in exactly one bucket: previously
+    // active/drilling/completed/suspended wells counted toward TOTAL only, so
+    // the tiles never summed to the total and rig-started wells (status
+    // 'active'/'workover') were invisible in the WORKOVER tile.
     const counts = useMemo(() => {
-        const c = { total: rows.length, producing: 0, workover: 0, abandoned: 0, planned: 0 };
-        rows.forEach((r) => { if (c[r.status] != null) c[r.status] += 1; });
+        const c = { total: rows.length, producing: 0, workover: 0, completed: 0, planned: 0, suspended: 0, abandoned: 0 };
+        rows.forEach((r) => {
+            const s = r.status === 'active' || r.status === 'drilling' ? 'workover' : r.status;
+            if (c[s] != null) c[s] += 1;
+        });
         return c;
     }, [rows]);
 
@@ -194,8 +201,10 @@ export default function Wells() {
             <Stack direction="row" spacing={2} mb={2} flexWrap="wrap" useFlexGap>
                 <KpiCard label="Total wells" value={counts.total} />
                 <KpiCard label="Producing" value={counts.producing} color={WELL_STATUS_COLOR.producing} />
-                <KpiCard label="Workover" value={counts.workover} color={WELL_STATUS_COLOR.workover} />
+                <KpiCard label="In workover" value={counts.workover} color={WELL_STATUS_COLOR.workover} />
                 <KpiCard label="Planned" value={counts.planned} color={WELL_STATUS_COLOR.planned} />
+                <KpiCard label="Completed" value={counts.completed} color={WELL_STATUS_COLOR.completed} />
+                <KpiCard label="Suspended" value={counts.suspended} color={WELL_STATUS_COLOR.suspended} />
                 <KpiCard label="Abandoned" value={counts.abandoned} color={WELL_STATUS_COLOR.abandoned} />
             </Stack>
 
