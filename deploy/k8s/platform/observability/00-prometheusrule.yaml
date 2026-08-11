@@ -1,0 +1,264 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: crmf-alerts
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: crmf-alerts
+    app.kubernetes.io/component: observability
+    # This label lets the kube-prometheus-stack Prometheus pick the rule up.
+    # The default ruleSelector in kube-prometheus-stack matches release: <stack-release>.
+    # Adjust the value below to match your installed kube-prometheus-stack Helm release name.
+    release: kube-prometheus-stack
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: crmf.backend
+      rules:
+        - alert: CRMFBackendDown
+          # One or more crmf-backend targets have been unscrapeable (or report down) for 2m.
+          expr: |
+            max by (job) (up{job="crmf-backend"}) == 0
+          for: 2m
+          labels:
+            severity: critical
+            service: crmf-backend
+            part_of: crmf
+          annotations:
+            summary: "CRMF backend is down (job {{ $labels.job }})"
+            description: >-
+              No crmf-backend Prometheus target has been scrapeable for 2 minutes.
+              The monitoring API (/ingest, /api, /socket.io) is unavailable to the fleet.
+            runbook_url: "https://crmf.ongc.local/runbooks/backend-down"
+
+        - alert: CRMFBackendAbsent
+          # The backend metrics target has vanished entirely (no series at all).
+          expr: |
+            absent(up{job="crmf-backend"})
+          for: 5m
+          labels:
+            severity: critical
+            service: crmf-backend
+            part_of: crmf
+          annotations:
+            summary: "CRMF backend metrics target is absent"
+            description: >-
+              Prometheus has no up{job="crmf-backend"} series for 5 minutes. The
+              ServiceMonitor/Service may be misconfigured or all backend pods are gone.
+            runbook_url: "https://crmf.ongc.local/runbooks/backend-absent"
+
+    - name: crmf.ingest
+      rules:
+        - alert: CRMFHighIngestErrorRate
+          # >5% of ingest batches erroring over the last 5m (and meaningful traffic).
+          expr: |
+            (
+              sum(rate(crmf_ingest_errors_total[5m]))
+              /
+              clamp_min(sum(rate(crmf_ingest_batches_total[5m])), 1)
+            ) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            service: crmf-backend
+            part_of: crmf
+          annotations:
+            summary: "CRMF ingest error rate is high (>5%)"
+            description: >-
+              {{ $value | humanizePercentage }} of ingest batches have errored over the
+              last 5 minutes. Store-and-forward retries from rig-edge agents may be backing
+              up. Check backend logs in Loki and TimescaleDB write health.
+            runbook_url: "https://crmf.ongc.local/runbooks/ingest-errors"
+
+        - alert: CRMFNoIngest
+          # No ingest batch counter increase for 5m -> the fleet has stopped reporting,
+          # or ingest is wedged. Only fire when the backend is actually up.
+          expr: |
+            (sum(increase(crmf_ingest_batches_total[5m])) == 0)
+            and on()
+            (max(up{job="crmf-backend"}) == 1)
+          for: 5m
+          labels:
+            severity: critical
+            service: crmf-backend
+            part_of: crmf
+          annotations:
+            summary: "CRMF has received no ingest batches for 10 minutes"
+            description: >-
+              crmf_ingest_batches_total has not increased for 5 minutes while the backend
+              is up. Either every rig-edge agent has stopped forwarding (network/upstream
+              outage) or the /ingest path is wedged. Investigate immediately.
+            runbook_url: "https://crmf.ongc.local/runbooks/no-ingest"
+
+    - name: crmf.fleet
+      rules:
+        - alert: CRMFFleetOfflineRatioHigh
+          # >25% of the known fleet is in status="offline" for 10m.
+          # crmf_fleet_rigs is a gauge labelled by status (online/offline/degraded/...).
+          expr: |
+            (
+              sum(crmf_fleet_rigs{status="offline"})
+              /
+              clamp_min(sum(crmf_fleet_rigs), 1)
+            ) > 0.25
+          for: 10m
+          labels:
+            severity: warning
+            service: crmf-fleet
+            part_of: crmf
+          annotations:
+            summary: "More than 25% of the rig fleet is offline"
+            description: >-
+              {{ $value | humanizePercentage }} of rigs are reporting status=offline
+              (offline threshold OFFLINE_SEC=120s). This may indicate a regional comms
+              outage or a backend ingest problem rather than individual rig faults.
+            runbook_url: "https://crmf.ongc.local/runbooks/fleet-offline"
+
+    - name: crmf.dataquality
+      rules:
+        - alert: CRMFDataQualityDegraded
+          # #26: rigs that are connected and ingesting but whose data quality/completeness
+          # has fallen below threshold land in status="degraded" or "stale" (derived in
+          # fleet.js). The binary offline case is alerted separately (CRMFFleetOfflineRatioHigh);
+          # this surfaces the §6.1 Data Quality Monitor failure mode. "pending" rigs are
+          # never-commissioned and excluded from the denominator so they don't dilute it.
+          expr: |
+            (
+              sum(crmf_fleet_rigs{status=~"degraded|stale"})
+              /
+              clamp_min(sum(crmf_fleet_rigs{status!="pending"}), 1)
+            ) > 0.20
+          for: 15m
+          labels:
+            severity: warning
+            service: crmf-fleet
+            part_of: crmf
+          annotations:
+            summary: "CRMF fleet data quality is degraded (>20% degraded/stale)"
+            description: >-
+              {{ $value | humanizePercentage }} of commissioned rigs are reporting
+              status=degraded or stale (connected but below the data-quality/completeness
+              threshold). Investigate sensor dropouts, partial tag sets, or sync lag rather
+              than a full comms outage.
+            runbook_url: "https://crmf.ongc.local/runbooks/data-quality-degraded"
+
+    - name: crmf.platform
+      rules:
+        - alert: CRMFCertExpiringSoon
+          # #27: cert-manager-issued TLS (portal + /ingest) silently dark-fails if ACME
+          # renewal stalls. cert-manager exports the expiry timestamp; warn 14d out.
+          expr: |
+            (
+              certmanager_certificate_expiration_timestamp_seconds{namespace="crmf"} - time()
+            ) < (14 * 24 * 3600)
+          for: 1h
+          labels:
+            severity: warning
+            service: crmf-tls
+            part_of: crmf
+          annotations:
+            summary: "CRMF TLS certificate {{ $labels.name }} expires in <14 days"
+            description: >-
+              cert-manager Certificate {{ $labels.name }} in namespace crmf expires in
+              {{ $value | humanizeDuration }}. A failed ACME/CA renewal will dark-fail the
+              portal and /ingest TLS. Check the Certificate/Order/Challenge status.
+            runbook_url: "https://crmf.ongc.local/runbooks/cert-expiry"
+
+        - alert: CRMFDatabasePVCNearFull
+          # #27: TimescaleDB data/WAL PVCs filling halts Postgres writes (and ingest).
+          # Tied to the missing retention policy (#3). Fire at >85% used for either the
+          # data or WAL volume of the CNPG clusters.
+          expr: |
+            (
+              1 - (
+                kubelet_volume_stats_available_bytes{namespace="crmf", persistentvolumeclaim=~"crmf-timescaledb.*"}
+                /
+                kubelet_volume_stats_capacity_bytes{namespace="crmf", persistentvolumeclaim=~"crmf-timescaledb.*"}
+              )
+            ) > 0.85
+          for: 10m
+          labels:
+            severity: critical
+            service: crmf-timescaledb
+            part_of: crmf
+          annotations:
+            summary: "CRMF DB volume {{ $labels.persistentvolumeclaim }} is >85% full"
+            description: >-
+              PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }}
+              full. A full data/WAL volume stops Postgres accepting writes and breaks ingest.
+              Expand the PVC or apply a data-retention policy on the hypertables.
+            runbook_url: "https://crmf.ongc.local/runbooks/db-pvc-full"
+
+        - alert: CRMFBackupWALArchiveStalled
+          # #27: a stalled barman-cloud WAL archive silently makes the documented PITR/DR
+          # window unrecoverable. CNPG exports the last-failed-backup and WAL-archiving
+          # status; fire if WAL archiving is failing or no successful backup is recent.
+          expr: |
+            (
+              cnpg_collector_pg_wal_archive_failed{namespace="crmf"} > 0
+            )
+            or
+            (
+              (time() - max by (cluster) (cnpg_collector_last_available_backup_timestamp{namespace="crmf"}))
+              > (36 * 3600)
+            )
+          for: 30m
+          labels:
+            severity: critical
+            service: crmf-timescaledb
+            part_of: crmf
+          annotations:
+            summary: "CRMF backup / WAL archive is stalled ({{ $labels.cluster }})"
+            description: >-
+              CNPG reports WAL archiving failures and/or no successful base backup in >36h
+              for cluster {{ $labels.cluster }}. The PITR/DR window is no longer guaranteed.
+              Check barman-cloud connectivity to MinIO (s3://crmf-backups) and the
+              ScheduledBackup status.
+            runbook_url: "https://crmf.ongc.local/runbooks/backup-wal-stall"
+
+        - alert: CRMFRestoreTestStale
+          # #28: the weekly restore-verification CronJob (timescaledb/05-restore-test.yaml)
+          # pushes crmf_restore_test_success + crmf_restore_test_timestamp_seconds to the
+          # Pushgateway. Fire if the last verification failed, or none has succeeded in >8d
+          # (covers a missed/failed weekly run). absent() also catches a never-run job.
+          expr: |
+            (max(crmf_restore_test_success) < 1)
+            or
+            ((time() - max(crmf_restore_test_timestamp_seconds)) > (8 * 24 * 3600))
+            or
+            (absent(crmf_restore_test_timestamp_seconds))
+          for: 1h
+          labels:
+            severity: warning
+            service: crmf-timescaledb
+            part_of: crmf
+          annotations:
+            summary: "CRMF backup restore-verification is stale or failing"
+            description: >-
+              No successful backup restore-test in the last 8 days (or the last run failed
+              its sanity checks). A backup that cannot be test-restored is false comfort —
+              inspect the crmf-timescaledb-restore-test CronJob logs.
+            runbook_url: "https://crmf.ongc.local/runbooks/restore-test-stale"
+
+    - name: crmf.timescaledb
+      rules:
+        - alert: CRMFTimescaleReplicationLag
+          # CloudNativePG exposes cnpg_pg_replication_lag (seconds) per replica.
+          # Alert when a streaming replica falls more than 30s behind the primary.
+          expr: |
+            max by (pod) (cnpg_pg_replication_lag{cluster="crmf-timescaledb"}) > 30
+          for: 5m
+          labels:
+            severity: warning
+            service: crmf-timescaledb
+            part_of: crmf
+          annotations:
+            summary: "CRMF TimescaleDB replica {{ $labels.pod }} is lagging"
+            description: >-
+              Streaming replication lag on {{ $labels.pod }} is {{ $value | humanizeDuration }}
+              behind the primary (crmf-timescaledb). Sustained lag risks stale reads on
+              read-replica queries and slow failover. Check CNPG cluster status and WAL volume.
+            runbook_url: "https://crmf.ongc.local/runbooks/timescale-replication-lag"

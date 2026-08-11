@@ -1,0 +1,48 @@
+CRMF application "{{ .Release.Name }}" deployed to namespace "{{ .Release.Namespace }}".
+Chart {{ .Chart.Name }}-{{ .Chart.Version }} (appVersion {{ .Chart.AppVersion }}).
+
+Components:
+  - backend  Deployment: {{ include "crmf.fullname" . }}-backend   Service: crmf-backend  :{{ .Values.backend.service.port }} (http)
+  - frontend Deployment: {{ include "crmf.fullname" . }}-frontend  Service: crmf-frontend :{{ .Values.frontend.service.port }} (http)
+
+{{- if .Values.ingress.enabled }}
+
+Access (Ingress, class "{{ .Values.ingress.className }}", host {{ .Values.ingress.host }}):
+  http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}/            -> crmf-frontend (React SPA)
+  http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}/api         -> crmf-backend  (REST + POST /ingest)
+  http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}/socket.io    -> crmf-backend  (websocket live updates)
+  proxy-body-size={{ .Values.ingress.proxyBodySize }}, proxy-read-timeout={{ .Values.ingress.proxyReadTimeout }}s
+  {{- if .Values.ingress.tls.enabled }}
+  TLS secret "{{ .Values.ingress.tls.secretName }}" issued by cluster-issuer "{{ .Values.ingress.tls.clusterIssuer }}".
+  {{- end }}
+{{- else }}
+
+Ingress is DISABLED. Reach the backend in-cluster via:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/crmf-backend {{ .Values.backend.service.port }}:{{ .Values.backend.service.port }}
+{{- end }}
+
+Configuration:
+  ConfigMap "crmf-config" (PGHOST={{ .Values.config.PGHOST }}, METRICS_ENABLED={{ .Values.config.METRICS_ENABLED }},
+    KAFKA_ENABLED={{ .Values.config.KAFKA_ENABLED }}, OIDC_ENABLED={{ .Values.config.OIDC_ENABLED }}).
+{{- if .Values.externalSecret.enabled }}
+  Secret  "crmf-secrets" is EXTERNALLY managed (ExternalSecret / Vault). This chart did NOT render it;
+    ensure that Secret exists in namespace "{{ .Release.Namespace }}" before pods start.
+{{- else }}
+  Secret  "crmf-secrets" was rendered from values (NON-PRODUCTION). For production set
+    externalSecret.enabled=true and provision it via an ExternalSecret / Vault.
+{{- end }}
+
+{{- if .Values.autoscaling.enabled }}
+
+Autoscaling: backend HPA {{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} replicas @ {{ .Values.autoscaling.targetCPUUtilizationPercentage }}% CPU.
+{{- end }}
+{{- if .Values.serviceMonitor.enabled }}
+Metrics: ServiceMonitor scrapes crmf-backend{{ .Values.serviceMonitor.path }} every {{ .Values.serviceMonitor.interval }}.
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+Network: default-deny in effect; ingress-controller, TimescaleDB RW and DNS egress allowed. (Monitoring-only: no egress to rigs/PLCs.)
+{{- end }}
+
+Verify rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "crmf.fullname" . }}-backend
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "crmf.fullname" . }}-frontend

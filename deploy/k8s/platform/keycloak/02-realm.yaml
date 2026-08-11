@@ -1,0 +1,271 @@
+# =============================================================================
+# CRMF Identity Layer — Realm import (Keycloak Operator)
+# -----------------------------------------------------------------------------
+# Declaratively imports the "ongc" realm into the crmf-keycloak instance.
+#
+# Proposal §6.5: Keycloak federated with ONGC Active Directory; RBAC by rig and
+# role. This import defines:
+#   * clients:      crmf-portal (public, standard flow + PKCE),
+#                   crmf-api    (bearer-only resource server)
+#   * realm roles:  admin, operator, viewer
+#   * groups:       /rig-admins, /rig-operators, /rig-viewers  -> role mappings
+#   * LDAP federation: ONGC Active Directory (ldaps://ad.ongc.local) with a
+#                   group LDAP mapper so AD security groups become realm groups
+#   * protocol mapper: adds a "roles" claim (realm roles) to the access token
+#                   audience-targeted at crmf-api, which the backend verifies.
+#
+# Tokens the backend (crmf-backend) expects:
+#   issuer   = https://keycloak.ongc.local/realms/ongc
+#   audience = crmf-api
+#   roles    = top-level "roles" claim, array of: admin | operator | viewer
+#
+# NOTE: LDAP bind credentials are referenced from Secret "crmf-keycloak-ldap"
+# (created below). Replace the placeholder bind DN/password for your AD.
+# =============================================================================
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: crmf-keycloak-ldap
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: crmf-keycloak
+    app.kubernetes.io/component: identity-federation
+type: Opaque
+stringData:
+  # AD service account used by Keycloak to bind & search the directory.
+  # CHANGE-ME in production: source from Vault / External Secrets.
+  bindDn: "CN=svc-keycloak,OU=ServiceAccounts,DC=ongc,DC=local"
+  bindCredential: "ChangeMe-AD-Bind-Password-0001"
+---
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: KeycloakRealmImport
+metadata:
+  name: ongc
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: keycloak-operator
+    app.kubernetes.io/name: crmf-keycloak
+    app.kubernetes.io/component: identity-realm
+spec:
+  keycloakCRName: crmf-keycloak
+  # Re-apply changes on each reconcile (does not delete users/data).
+  # placeHolders allows env-substitution for the LDAP bind secret keys.
+  placeholders:
+    LDAP_BIND_DN:
+      secret:
+        name: crmf-keycloak-ldap
+        key: bindDn
+    LDAP_BIND_CREDENTIAL:
+      secret:
+        name: crmf-keycloak-ldap
+        key: bindCredential
+  realm:
+    realm: ongc
+    enabled: true
+    displayName: "ONGC CRMF"
+    loginTheme: keycloak
+    sslRequired: external
+
+    # Reasonable token lifetimes for an operations portal.
+    accessTokenLifespan: 300            # 5 min
+    ssoSessionIdleTimeout: 1800         # 30 min
+    ssoSessionMaxLifespan: 36000        # 10 h
+    revokeRefreshToken: true
+
+    # -------------------------------------------------------------------------
+    # Realm (RBAC) roles
+    # -------------------------------------------------------------------------
+    roles:
+      realm:
+        - name: admin
+          description: "Full CRMF administration (fleet config, user mgmt, all rigs)."
+        - name: operator
+          description: "Acknowledge alarms and operate dashboards across assigned rigs."
+        - name: viewer
+          description: "Read-only access to dashboards and telemetry."
+
+    # -------------------------------------------------------------------------
+    # Groups -> realm role mappings.
+    # AD groups are synced into these groups by the LDAP group mapper below, so
+    # an AD user in "rig-admins" inherits the realm "admin" role transitively.
+    # -------------------------------------------------------------------------
+    groups:
+      - name: rig-admins
+        realmRoles:
+          - admin
+      - name: rig-operators
+        realmRoles:
+          - operator
+      - name: rig-viewers
+        realmRoles:
+          - viewer
+
+    # -------------------------------------------------------------------------
+    # Clients
+    # -------------------------------------------------------------------------
+    clients:
+      # ---- Public SPA: the CRMF web portal (Authorization Code + PKCE) -------
+      - clientId: crmf-portal
+        name: "CRMF Portal (SPA)"
+        protocol: openid-connect
+        enabled: true
+        publicClient: true                # public => no client secret
+        standardFlowEnabled: true         # Authorization Code flow
+        directAccessGrantsEnabled: false  # no ROPC
+        implicitFlowEnabled: false
+        serviceAccountsEnabled: false
+        fullScopeAllowed: true
+        attributes:
+          # Enforce PKCE (S256) for the public client.
+          pkce.code.challenge.method: "S256"
+          post.logout.redirect.uris: "https://crmf.ongc.local/*"
+        redirectUris:
+          - "https://crmf.ongc.local/*"
+        webOrigins:
+          - "https://crmf.ongc.local"
+        defaultClientScopes:
+          - web-origins
+          - profile
+          - roles
+          - email
+
+      # ---- Bearer-only resource server: the CRMF API -------------------------
+      - clientId: crmf-api
+        name: "CRMF API (resource server)"
+        protocol: openid-connect
+        enabled: true
+        bearerOnly: true                  # validates tokens, never initiates login
+        publicClient: false
+        standardFlowEnabled: false
+        directAccessGrantsEnabled: false
+        # Protocol mappers scoped to this client. The portal's access tokens are
+        # issued with crmf-api in the audience and a flattened "roles" claim, so
+        # the backend can authorize by realm role.
+        protocolMappers:
+          # Add crmf-api to the token audience (aud) so the backend's audience
+          # check (OIDC_AUDIENCE=crmf-api) succeeds.
+          - name: crmf-api-audience
+            protocol: openid-connect
+            protocolMapper: oidc-audience-mapper
+            config:
+              included.client.audience: "crmf-api"
+              access.token.claim: "true"
+              id.token.claim: "false"
+          # Flatten realm roles into a top-level "roles" array claim.
+          - name: realm-roles
+            protocol: openid-connect
+            protocolMapper: oidc-usermodel-realm-role-mapper
+            config:
+              claim.name: "roles"
+              jsonType.label: "String"
+              multivalued: "true"
+              access.token.claim: "true"
+              id.token.claim: "false"
+              userinfo.token.claim: "true"
+
+    # -------------------------------------------------------------------------
+    # Client scope "roles": also emit the flattened "roles" claim on the portal
+    # client's tokens (the portal uses the "roles" default scope above). This
+    # mirrors the per-client mapper so both code paths carry realm roles.
+    # -------------------------------------------------------------------------
+    clientScopes:
+      - name: roles
+        description: "OpenID Connect scope for adding realm roles to the token."
+        protocol: openid-connect
+        attributes:
+          include.in.token.scope: "true"
+          display.on.consent.screen: "false"
+        protocolMappers:
+          - name: realm-roles
+            protocol: openid-connect
+            protocolMapper: oidc-usermodel-realm-role-mapper
+            config:
+              claim.name: "roles"
+              jsonType.label: "String"
+              multivalued: "true"
+              access.token.claim: "true"
+              id.token.claim: "false"
+              userinfo.token.claim: "true"
+
+    # -------------------------------------------------------------------------
+    # User federation — ONGC Active Directory over LDAPS, plus a group mapper.
+    # components keyed by provider type, as expected by realm import JSON.
+    # -------------------------------------------------------------------------
+    components:
+      org.keycloak.storage.UserStorageProvider:
+        - name: ongc-active-directory
+          providerId: ldap
+          config:
+            enabled: ["true"]
+            priority: ["0"]
+            vendor: ["ad"]
+            editMode: ["READ_ONLY"]            # monitoring-only directory; no writeback
+            importEnabled: ["true"]
+            syncRegistrations: ["false"]
+            connectionUrl: ["ldaps://ad.ongc.local:636"]
+            usersDn: ["OU=Users,DC=ongc,DC=local"]
+            authType: ["simple"]
+            bindDn: ["${LDAP_BIND_DN}"]
+            bindCredential: ["${LDAP_BIND_CREDENTIAL}"]
+            useTruststoreSpi: ["ldapsOnly"]
+            connectionPooling: ["true"]
+            # AD attribute conventions
+            usernameLDAPAttribute: ["sAMAccountName"]
+            rdnLDAPAttribute: ["cn"]
+            uuidLDAPAttribute: ["objectGUID"]
+            userObjectClasses: ["person, organizationalPerson, user"]
+            searchScope: ["2"]                 # subtree
+            pagination: ["true"]
+            # Periodic sync
+            fullSyncPeriod: ["86400"]          # daily full sync
+            changedSyncPeriod: ["3600"]        # hourly delta sync
+          subComponents:
+            org.keycloak.storage.ldap.mappers.LDAPStorageMapper:
+              # Map AD security groups -> Keycloak realm groups (rig-admins, etc.)
+              - name: ad-group-mapper
+                providerId: group-ldap-mapper
+                config:
+                  mode: ["READ_ONLY"]
+                  membership.attribute.type: ["DN"]
+                  membership.ldap.attribute: ["member"]
+                  membership.user.ldap.attribute: ["sAMAccountName"]
+                  group.name.ldap.attribute: ["cn"]
+                  group.object.classes: ["group"]
+                  groups.dn: ["OU=Groups,DC=ongc,DC=local"]
+                  preserve.group.inheritance: ["false"]
+                  ignore.missing.groups: ["false"]
+                  # Drop these AD groups into the realm group tree so the
+                  # group->role mappings above take effect.
+                  drop.non.existing.groups.during.sync: ["false"]
+                  user.roles.retrieve.strategy: ["LOAD_GROUPS_BY_MEMBER_ATTRIBUTE"]
+              # Standard username/email/name attribute mappers for AD.
+              - name: username
+                providerId: user-attribute-ldap-mapper
+                config:
+                  ldap.attribute: ["sAMAccountName"]
+                  user.model.attribute: ["username"]
+                  read.only: ["true"]
+                  always.read.value.from.ldap: ["false"]
+              - name: email
+                providerId: user-attribute-ldap-mapper
+                config:
+                  ldap.attribute: ["mail"]
+                  user.model.attribute: ["email"]
+                  read.only: ["true"]
+                  always.read.value.from.ldap: ["false"]
+              - name: first-name
+                providerId: user-attribute-ldap-mapper
+                config:
+                  ldap.attribute: ["givenName"]
+                  user.model.attribute: ["firstName"]
+                  read.only: ["true"]
+              - name: last-name
+                providerId: user-attribute-ldap-mapper
+                config:
+                  ldap.attribute: ["sn"]
+                  user.model.attribute: ["lastName"]
+                  read.only: ["true"]

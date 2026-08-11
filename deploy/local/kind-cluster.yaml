@@ -1,0 +1,23 @@
+# kind (Kubernetes-IN-Docker) cluster for the LOCAL "feel" of the CRMF production deploy.
+# One node plays control-plane + worker. The ingress-ready label + the two
+# extraPortMappings let the ingress-nginx controller (installed by up.sh, kind variant)
+# bind hostPort 80/443 on the node, which kind forwards to the host on 9081/9443
+# (chosen to avoid clashing with the docker-compose stacks and Docker's own 8081).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: crmf-local
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 9081
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 9443
+        protocol: TCP

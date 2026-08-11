@@ -1,0 +1,35 @@
+# =============================================================================
+# CRMF — top-level Ansible playbook
+#
+# Brings up the full Centralised Rig Monitoring Facility production layer on
+# RKE2 (proposal §6.4): cluster bootstrap -> operators -> platform CRs + app.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini site.yml
+#   # subsets:
+#   ansible-playbook -i inventory.ini site.yml --tags rke2
+#   ansible-playbook -i inventory.ini site.yml --tags operators
+#   ansible-playbook -i inventory.ini site.yml --tags deploy
+#   # DR cluster only:
+#   ansible-playbook -i inventory.ini site.yml -e target_cluster=rke2_dr
+#
+# Variables come from group_vars/all.yml (copy from all.example.yml).
+# This playbook is import-only; each phase lives in playbooks/.
+# =============================================================================
+
+- name: Phase 1 — Bootstrap RKE2 cluster (servers + agents)
+  ansible.builtin.import_playbook: playbooks/10-rke2-bootstrap.yml
+  tags:
+    - rke2
+    - bootstrap
+
+- name: Phase 2 — Install cluster operators (cert-manager, CNPG, Strimzi, etc.)
+  ansible.builtin.import_playbook: playbooks/20-operators.yml
+  tags:
+    - operators
+
+- name: Phase 3 — Deploy CRMF platform CRs and application chart
+  ansible.builtin.import_playbook: playbooks/30-crmf-deploy.yml
+  tags:
+    - deploy
+    - crmf

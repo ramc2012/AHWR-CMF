@@ -1,0 +1,35 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "crmf.fullname" . }}-backend
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "crmf.backend.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace | quote }}
+  selector:
+    matchLabels:
+      {{- include "crmf.backend.selectorLabels" . | nindent 6 }}
+  endpoints:
+    # /metrics is scraped ONLY here (internal ServiceMonitor on the pod http port).
+    # No Ingress path exposes /metrics (#15) — see templates/ingress.yaml.
+    - port: http
+      path: {{ .Values.serviceMonitor.path | quote }}
+      interval: {{ .Values.serviceMonitor.interval | quote }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout | quote }}
+      scheme: http
+      {{- if .Values.metrics.token }}
+      # Optional bearer-token auth for /metrics (#15); token lives in crmf-secrets.
+      authorization:
+        type: Bearer
+        credentials:
+          name: crmf-secrets
+          key: METRICS_TOKEN
+      {{- end }}
+{{- end }}

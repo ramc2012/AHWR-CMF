@@ -1,0 +1,29 @@
+# =====================================================================
+# CRMF — Centralised Rig Monitoring Facility
+# Daily base backup of the primary TimescaleDB cluster.
+#
+# WAL is continuously archived to MinIO/S3 by the cluster's
+# barmanObjectStore (00-cluster.yaml). This ScheduledBackup adds a
+# daily base backup so PITR has a recent restore anchor and the
+# retentionPolicy (30d) can prune old chains. The DR cluster (03)
+# bootstraps and stays in sync from this same object store.
+# =====================================================================
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: crmf-timescaledb-daily
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: cloudnative-pg
+    app.kubernetes.io/name: crmf-timescaledb
+    app.kubernetes.io/component: database-backup
+spec:
+  # CloudNativePG cron is a 6-field spec (seconds first). 02:30 daily.
+  schedule: "0 30 2 * * *"
+  immediate: true
+  backupOwnerReference: self
+  method: barmanObjectStore
+  cluster:
+    name: crmf-timescaledb

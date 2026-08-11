@@ -1,0 +1,390 @@
+# =============================================================================
+# CRMF — Centralised Rig Monitoring Facility
+# GitLab CI/CD pipeline (proposal §6.4: GitLab CE + Harbor registry + Ansible / RKE2)
+#
+# MONITORING-ONLY platform: this pipeline builds/scans/ships the central
+# ingest+portal stack. It never writes back to any rig/PLC.
+#
+# Stages:
+#   lint          helm lint + kubeconform on rendered manifests + node --check
+#   build         docker build backend/frontend/fleet-sim -> push to Harbor (tag = commit sha)
+#   scan          trivy image scan of the freshly built images
+#   deploy-staging  helm upgrade --install into namespace "crmf" (kubeconform-validated render)
+#   deploy-prod     manual, protected
+#
+# Registry      : harbor.ongc.local  (project "crmf")
+# Chart         : deploy/helm/crmf   (name "crmf"; values-staging.yaml for staging,
+#                 values-prod.yaml for prod)
+# Platform CRs  : deploy/k8s/platform (validated, not deployed by app pipeline)
+#
+# #17 — staging is self-contained: it deploys with values-staging.yaml (renders
+# crmf-secrets, no ESO/Vault dependency) and does NOT use --atomic, so a staging cluster
+# without a provisioned TimescaleDB reports a soft warning instead of a guaranteed
+# atomic-rollback. Prod keeps externalSecret.enabled=true + --atomic (secrets via ESO/Vault).
+#
+# Required GitLab CI/CD variables (Settings -> CI/CD -> Variables):
+#   HARBOR_USER          Harbor robot/user with push to project "crmf"        (protected)
+#   HARBOR_PASSWORD      Harbor robot token / password                        (protected, masked)
+#   KUBE_CONFIG_STAGING  base64-encoded kubeconfig for the staging RKE2 cluster (protected, file)
+#   KUBE_CONFIG_PROD     base64-encoded kubeconfig for the prod RKE2 cluster    (protected, file)
+# Optional:
+#   HELM_EXTRA_ARGS      extra flags appended to helm upgrade (e.g. --set image.tag=...)
+# =============================================================================
+
+stages:
+  - lint
+  - build
+  - scan
+  - deploy-staging
+  - deploy-prod
+
+variables:
+  # ---- Registry / image coordinates -----------------------------------------
+  HARBOR_REGISTRY: "harbor.ongc.local"
+  HARBOR_PROJECT: "crmf"
+  IMAGE_BACKEND: "harbor.ongc.local/crmf/crmf-backend"
+  IMAGE_FRONTEND: "harbor.ongc.local/crmf/crmf-frontend"
+  IMAGE_FLEETSIM: "harbor.ongc.local/crmf/crmf-fleet-sim"
+  # Immutable per-commit tag plus a moving branch tag.
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+  # ---- Helm / k8s -----------------------------------------------------------
+  K8S_NAMESPACE: "crmf"
+  HELM_RELEASE: "crmf"
+  CHART_DIR: "deploy/helm/crmf"
+  PLATFORM_DIR: "deploy/k8s/platform"
+  # ---- Tool versions (pin for reproducible CI) ------------------------------
+  HELM_VERSION: "v3.15.4"
+  KUBECONFORM_VERSION: "0.6.7"
+  KUBECTL_VERSION: "v1.30.4"
+  TRIVY_VERSION: "0.55.2"
+  # Kubernetes API version kubeconform validates rendered manifests against.
+  KUBECONFORM_K8S_VERSION: "1.30.0"
+  # Build with BuildKit; talk to the dind daemon over TCP.
+  DOCKER_HOST: "tcp://docker:2376"
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_DRIVER: "overlay2"
+  DOCKER_BUILDKIT: "1"
+  GIT_DEPTH: "20"
+
+# Build context for backend & frontend Dockerfiles is the central repo root
+# (their Dockerfiles COPY backend/... and frontend/...). fleet-sim uses its own
+# directory as context (COPY package.json .).
+
+# ---------------------------------------------------------------------------
+# Reusable anchors
+# ---------------------------------------------------------------------------
+.helm_setup: &helm_setup
+  - apk add --no-cache curl bash git tar gzip openssl >/dev/null
+  - curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+  - mv /tmp/linux-amd64/helm /usr/local/bin/helm
+  - helm version --short
+
+# Installs kubeconform AND exports KCFLAGS, the shared validation flags used by
+# every kubeconform invocation below. (KCFLAGS is a shell var — YAML aliases
+# cannot be embedded inside a command string, so we pass flags via the env.)
+# CRDs that ship from operators (CloudNativePG, Strimzi, Keycloak, cert-manager,
+# Prometheus Operator, ingress-nginx) are validated against the upstream
+# CRDs-catalog; -ignore-missing-schemas keeps unknown vendor CRs from failing
+# the gate while still strictly validating core objects.
+.kubeconform_setup: &kubeconform_setup
+  - curl -fsSL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" | tar -xz -C /tmp
+  - mv /tmp/kubeconform /usr/local/bin/kubeconform
+  - kubeconform -v
+  - export KCFLAGS="-strict -summary -ignore-missing-schemas -kubernetes-version ${KUBECONFORM_K8S_VERSION} -schema-location default -schema-location https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
+
+.kubectl_setup: &kubectl_setup
+  - curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+  - chmod +x /usr/local/bin/kubectl
+  - kubectl version --client
+
+# ===========================================================================
+# STAGE: lint
+# ===========================================================================
+
+helm-lint:
+  stage: lint
+  image: alpine:3.20
+  before_script:
+    - *helm_setup
+  script:
+    - echo "helm lint (default + prod + staging values) ..."
+    - helm lint "${CHART_DIR}"
+    - 'test -f "${CHART_DIR}/values-prod.yaml" && helm lint "${CHART_DIR}" -f "${CHART_DIR}/values-prod.yaml" || echo "no values-prod.yaml yet; skipping prod-values lint"'
+    - 'test -f "${CHART_DIR}/values-staging.yaml" && helm lint "${CHART_DIR}" -f "${CHART_DIR}/values-staging.yaml" || echo "no values-staging.yaml yet; skipping staging-values lint"'
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+manifest-validate:
+  stage: lint
+  image: alpine:3.20
+  before_script:
+    - *helm_setup
+    - *kubeconform_setup
+  script:
+    - mkdir -p rendered
+    # Render the application chart (default + prod values) and validate.
+    - echo "Rendering app chart -> rendered/crmf.yaml"
+    - helm template "${HELM_RELEASE}" "${CHART_DIR}" --namespace "${K8S_NAMESPACE}" > rendered/crmf.yaml
+    - 'test -f "${CHART_DIR}/values-prod.yaml" && helm template "${HELM_RELEASE}" "${CHART_DIR}" --namespace "${K8S_NAMESPACE}" -f "${CHART_DIR}/values-prod.yaml" > rendered/crmf-prod.yaml || true'
+    - echo "kubeconform on rendered chart ..."
+    - kubeconform $KCFLAGS rendered/crmf.yaml
+    - 'test -f rendered/crmf-prod.yaml && kubeconform $KCFLAGS rendered/crmf-prod.yaml || true'
+    # Validate the raw platform CRs (CloudNativePG Cluster, Strimzi Kafka,
+    # Keycloak, ServiceMonitor/PrometheusRule, NetworkPolicy, etc.).
+    - |
+      if [ -d "${PLATFORM_DIR}" ] && [ -n "$(find "${PLATFORM_DIR}" -name '*.yaml' -print -quit)" ]; then
+        echo "kubeconform on platform CRs (${PLATFORM_DIR}) ..."
+        kubeconform $KCFLAGS $(find "${PLATFORM_DIR}" -name '*.yaml' | sort)
+      else
+        echo "no platform manifests present yet; skipping"
+      fi
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - rendered/
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+node-syntax-check:
+  stage: lint
+  image: node:20-alpine
+  script:
+    - echo "node --check on backend + fleet-sim sources ..."
+    # Syntax-only check; no install required. Skip vendored deps.
+    - |
+      set -e
+      FAIL=0
+      # POSIX sh (busybox in node:alpine): pipe find into a while-read loop and
+      # accumulate failures via a temp marker (subshell can't mutate FAIL).
+      RC=0
+      for d in backend fleet-sim; do
+        if [ -d "$d" ]; then
+          echo "--- $d ---"
+          for f in $(find "$d" -type f \( -name '*.js' -o -name '*.cjs' -o -name '*.mjs' \) -not -path '*/node_modules/*'); do
+            node --check "$f" || RC=1
+          done
+        fi
+      done
+      FAIL=$RC
+      exit $FAIL
+    # Frontend is TS/JSX (vite); validate the build instead of node --check.
+    - echo "frontend build smoke (vite) ..."
+    - |
+      if [ -f frontend/package.json ]; then
+        cd frontend
+        npm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund
+        npm run build
+      fi
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# ===========================================================================
+# STAGE: build  (docker build + push to Harbor, tagged by commit sha)
+# ===========================================================================
+
+.docker_build_template:
+  stage: build
+  image: docker:27-cli
+  services:
+    - docker:27-dind
+  before_script:
+    - until docker info >/dev/null 2>&1; do echo "waiting for dind..."; sleep 1; done
+    - echo "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" -u "$HARBOR_USER" --password-stdin
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+build-backend:
+  extends: .docker_build_template
+  script:
+    - >-
+      docker build
+      --pull
+      -f backend/Dockerfile
+      -t "${IMAGE_BACKEND}:${IMAGE_TAG}"
+      -t "${IMAGE_BACKEND}:${CI_COMMIT_REF_SLUG}"
+      --label "org.opencontainers.image.revision=${CI_COMMIT_SHA}"
+      --label "org.opencontainers.image.source=${CI_PROJECT_URL}"
+      .
+    - docker push "${IMAGE_BACKEND}:${IMAGE_TAG}"
+    - docker push "${IMAGE_BACKEND}:${CI_COMMIT_REF_SLUG}"
+
+build-frontend:
+  extends: .docker_build_template
+  script:
+    - >-
+      docker build
+      --pull
+      -f frontend/Dockerfile
+      -t "${IMAGE_FRONTEND}:${IMAGE_TAG}"
+      -t "${IMAGE_FRONTEND}:${CI_COMMIT_REF_SLUG}"
+      --label "org.opencontainers.image.revision=${CI_COMMIT_SHA}"
+      --label "org.opencontainers.image.source=${CI_PROJECT_URL}"
+      .
+    - docker push "${IMAGE_FRONTEND}:${IMAGE_TAG}"
+    - docker push "${IMAGE_FRONTEND}:${CI_COMMIT_REF_SLUG}"
+
+build-fleet-sim:
+  extends: .docker_build_template
+  script:
+    # fleet-sim Dockerfile uses its own dir as build context.
+    - >-
+      docker build
+      --pull
+      -f fleet-sim/Dockerfile
+      -t "${IMAGE_FLEETSIM}:${IMAGE_TAG}"
+      -t "${IMAGE_FLEETSIM}:${CI_COMMIT_REF_SLUG}"
+      --label "org.opencontainers.image.revision=${CI_COMMIT_SHA}"
+      --label "org.opencontainers.image.source=${CI_PROJECT_URL}"
+      fleet-sim
+    - docker push "${IMAGE_FLEETSIM}:${IMAGE_TAG}"
+    - docker push "${IMAGE_FLEETSIM}:${CI_COMMIT_REF_SLUG}"
+
+# ===========================================================================
+# STAGE: scan  (trivy image scan of the pushed images)
+# ===========================================================================
+
+.trivy_template:
+  stage: scan
+  image:
+    name: aquasec/trivy:${TRIVY_VERSION}
+    entrypoint: [""]
+  variables:
+    TRIVY_USERNAME: "$HARBOR_USER"
+    TRIVY_PASSWORD: "$HARBOR_PASSWORD"
+    TRIVY_NO_PROGRESS: "true"
+    # Cache DB inside the project to avoid re-pulling every job.
+    TRIVY_CACHE_DIR: ".trivycache/"
+  cache:
+    key: trivy-db
+    paths:
+      - .trivycache/
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+scan-backend:
+  extends: .trivy_template
+  script:
+    - trivy image --exit-code 0 --severity LOW,MEDIUM --format table "${IMAGE_BACKEND}:${IMAGE_TAG}"
+    # Fail the pipeline only on fixable HIGH/CRITICAL findings.
+    - trivy image --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL --format table "${IMAGE_BACKEND}:${IMAGE_TAG}"
+
+scan-frontend:
+  extends: .trivy_template
+  script:
+    - trivy image --exit-code 0 --severity LOW,MEDIUM --format table "${IMAGE_FRONTEND}:${IMAGE_TAG}"
+    - trivy image --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL --format table "${IMAGE_FRONTEND}:${IMAGE_TAG}"
+
+scan-fleet-sim:
+  extends: .trivy_template
+  script:
+    - trivy image --exit-code 0 --severity LOW,MEDIUM --format table "${IMAGE_FLEETSIM}:${IMAGE_TAG}"
+    - trivy image --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL --format table "${IMAGE_FLEETSIM}:${IMAGE_TAG}"
+
+# ===========================================================================
+# STAGE: deploy-staging  (auto on default branch; kubeconform-validated render)
+# ===========================================================================
+
+.deploy_template:
+  image: alpine:3.20
+  before_script:
+    - *helm_setup
+    - *kubeconform_setup
+    - *kubectl_setup
+    - mkdir -p "${HOME}/.kube"
+    - echo "$KUBE_CONFIG" | base64 -d > "${HOME}/.kube/config"
+    - chmod 600 "${HOME}/.kube/config"
+    - kubectl config current-context
+
+deploy-staging:
+  stage: deploy-staging
+  extends: .deploy_template
+  variables:
+    KUBE_CONFIG: "$KUBE_CONFIG_STAGING"
+  environment:
+    name: staging
+    url: https://crmf.staging.ongc.local
+  script:
+    # #17: staging uses values-staging.yaml, NOT values-prod.yaml. The staging overlay
+    # sets externalSecret.enabled=false so the chart RENDERS crmf-secrets from demo
+    # values — staging has no ESO/Vault to provision it out-of-band, which previously
+    # crashlooped the backend and tripped --atomic into a guaranteed rollback.
+    - echo "Re-rendering chart for staging (values-staging.yaml) and validating ..."
+    - >-
+      helm template "${HELM_RELEASE}" "${CHART_DIR}"
+      --namespace "${K8S_NAMESPACE}"
+      -f "${CHART_DIR}/values-staging.yaml"
+      --set image.backend.repository="${HARBOR_PROJECT}/crmf-backend"
+      --set image.frontend.repository="${HARBOR_PROJECT}/crmf-frontend"
+      --set image.registry="${HARBOR_REGISTRY}"
+      --set image.tag="${IMAGE_TAG}"
+      > rendered-staging.yaml
+    - kubeconform $KCFLAGS rendered-staging.yaml
+    - kubectl get namespace "${K8S_NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${K8S_NAMESPACE}"
+    # #17: NO --atomic on staging. A staging environment may legitimately lack a
+    # provisioned TimescaleDB, in which case the backend stays NotReady (readiness is
+    # DB-aware) — that should report as a soft rollout warning, not auto-roll-back the
+    # whole release. Apply, then check rollout WITHOUT failing the job on a not-ready DB.
+    - echo "helm upgrade --install (staging, non-atomic) ..."
+    - >-
+      helm upgrade --install "${HELM_RELEASE}" "${CHART_DIR}"
+      --namespace "${K8S_NAMESPACE}"
+      -f "${CHART_DIR}/values-staging.yaml"
+      --set image.registry="${HARBOR_REGISTRY}"
+      --set image.tag="${IMAGE_TAG}"
+      --timeout 10m
+      ${HELM_EXTRA_ARGS}
+    # Soft rollout check: surface status but do not red-fail the pipeline if the backend
+    # is merely waiting on a DB that staging does not provision.
+    - kubectl -n "${K8S_NAMESPACE}" rollout status deploy/crmf-frontend --timeout=300s || true
+    - |
+      if ! kubectl -n "${K8S_NAMESPACE}" rollout status deploy/crmf-backend --timeout=300s; then
+        echo "WARNING: crmf-backend did not become Ready within 300s."
+        echo "In staging this is most often a missing/unreachable TimescaleDB (readiness is DB-aware)."
+        echo "Pod status for triage:"
+        kubectl -n "${K8S_NAMESPACE}" get pods -l app.kubernetes.io/name=crmf-backend || true
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ===========================================================================
+# STAGE: deploy-prod  (MANUAL, protected)
+# ===========================================================================
+
+deploy-prod:
+  stage: deploy-prod
+  extends: .deploy_template
+  variables:
+    KUBE_CONFIG: "$KUBE_CONFIG_PROD"
+  environment:
+    name: production
+    url: https://crmf.ongc.local
+  script:
+    - echo "Re-rendering chart for PRODUCTION and validating before apply ..."
+    - >-
+      helm template "${HELM_RELEASE}" "${CHART_DIR}"
+      --namespace "${K8S_NAMESPACE}"
+      -f "${CHART_DIR}/values-prod.yaml"
+      --set image.registry="${HARBOR_REGISTRY}"
+      --set image.tag="${IMAGE_TAG}"
+      > rendered-prod.yaml
+    - kubeconform $KCFLAGS rendered-prod.yaml
+    - kubectl get namespace "${K8S_NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${K8S_NAMESPACE}"
+    - echo "helm upgrade --install (PRODUCTION) ..."
+    - >-
+      helm upgrade --install "${HELM_RELEASE}" "${CHART_DIR}"
+      --namespace "${K8S_NAMESPACE}"
+      -f "${CHART_DIR}/values-prod.yaml"
+      --set image.registry="${HARBOR_REGISTRY}"
+      --set image.tag="${IMAGE_TAG}"
+      --atomic --timeout 15m --wait
+      ${HELM_EXTRA_ARGS}
+    - kubectl -n "${K8S_NAMESPACE}" rollout status deploy/crmf-backend --timeout=600s
+    - kubectl -n "${K8S_NAMESPACE}" rollout status deploy/crmf-frontend --timeout=600s
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+  allow_failure: false

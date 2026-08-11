@@ -1,0 +1,154 @@
+# =====================================================================
+# CRMF — Centralised Rig Monitoring Facility
+# TimescaleDB high-availability cluster (CloudNativePG operator).
+#
+# Primary ONGC data centre. 3 instances = 1 primary + 2 hot-standby
+# replicas with synchronous replication (1 sync standby) so a single
+# node loss never loses an acknowledged ingest write.
+#
+# MONITORING-ONLY: this database only RECEIVES telemetry/events from
+# rig-edge agents. Nothing is ever written back to a rig or PLC.
+#
+# IMAGE CAVEAT: stock CloudNativePG images do NOT carry the TimescaleDB
+# extension. We use a PostgreSQL 16 image that bundles timescaledb (+
+# postgis). If your org mirrors images into Harbor, retag to
+# harbor.ongc.local/crmf/timescaledb-postgis:16 and update imageName.
+# shared_preload_libraries MUST include timescaledb for the extension
+# to load (continuous aggregates / compression policies).
+# =====================================================================
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: crmf-timescaledb
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: cloudnative-pg
+    app.kubernetes.io/name: crmf-timescaledb
+    app.kubernetes.io/component: database
+spec:
+  description: "CRMF central TimescaleDB HA cluster (primary site)"
+  # TimescaleDB-enabled PostgreSQL 16 image (bundles the timescaledb extension).
+  imageName: ghcr.io/imusmanmalik/timescaledb-postgis:16
+  imagePullPolicy: IfNotPresent
+
+  instances: 3
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+
+  # ---- Storage ------------------------------------------------------
+  storage:
+    size: 50Gi
+    # storageClass: ongc-block   # set to your CSI class; omit to use cluster default
+  walStorage:
+    size: 20Gi
+    # storageClass: ongc-block
+
+  # ---- Resources ----------------------------------------------------
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+
+  # ---- PostgreSQL / TimescaleDB tuning ------------------------------
+  postgresql:
+    shared_preload_libraries:
+      - timescaledb
+    parameters:
+      max_connections: "300"
+      shared_buffers: "2GB"
+      effective_cache_size: "6GB"
+      work_mem: "32MB"
+      maintenance_work_mem: "512MB"
+      max_wal_size: "4GB"
+      min_wal_size: "1GB"
+      wal_compression: "on"
+      timescaledb.telemetry_level: "off"
+      # TimescaleDB background workers (continuous aggregates + policies):
+      timescaledb.max_background_workers: "8"
+      max_worker_processes: "16"
+      max_parallel_workers: "8"
+
+  # ---- Replication: up to 1 synchronous standby, non-blocking -------
+  # minSyncReplicas: 0 / maxSyncReplicas: 1 keeps a synchronous copy when a
+  # standby is available but never blocks writes when both replicas are down.
+  # (On CNPG >= 1.24 you may instead use spec.postgresql.synchronous.)
+  minSyncReplicas: 0
+  maxSyncReplicas: 1
+
+  # ---- Bootstrap: fresh init of database "crmf" owned by "crmf" ------
+  bootstrap:
+    initdb:
+      database: crmf
+      owner: crmf
+      secret:
+        name: crmf-db-app
+      # Apply the canonical CRMF schema (timescaledb extension + tables)
+      # AFTER the application database/role exist.
+      postInitApplicationSQLRefs:
+        configMapRefs:
+          - name: crmf-schema
+            key: init.sql
+
+  # ---- Superuser / app credentials ----------------------------------
+  # Enable superuser so CREATE EXTENSION timescaledb succeeds at init.
+  enableSuperuserAccess: true
+  superuserSecret:
+    name: crmf-db-superuser
+
+  # ---- Application role login (audit #2) ----------------------------
+  # The schema (crmf-schema ConfigMap) runs as `postgres`, so the running app must connect
+  # as the least-privilege crmf_app role (chart config.PGUSER=crmf_app), which CANNOT drop
+  # or bypass the append-only audit_log trigger — keeping the audit trail tamper-evident.
+  # crmf_app is CREATEd by the schema; managed.roles gives it a login password. The
+  # crmf-db-app-login Secret (kubernetes.io/basic-auth, username crmf_app) MUST carry the
+  # SAME password as the backend's PGPASSWORD (crmf-secrets) — in production both are
+  # sourced from Vault / External-Secrets.
+  managed:
+    roles:
+      - name: crmf_app
+        ensure: present
+        login: true
+        passwordSecret:
+          name: crmf-db-app-login
+
+  # ---- Monitoring (Prometheus Operator PodMonitor) ------------------
+  monitoring:
+    enablePodMonitor: true
+
+  # ---- Backup / PITR to MinIO (S3-compatible) object store ----------
+  # Barman Cloud archives WAL + base backups; the ScheduledBackup in
+  # 02-backup.yaml drives the periodic base backups. The DR cluster
+  # (03) bootstraps from this same bucket.
+  backup:
+    retentionPolicy: "30d"
+    barmanObjectStore:
+      destinationPath: s3://crmf-backups/crmf-timescaledb
+      # In-cluster MinIO Service "minio" serves plain HTTP on :9000 (#6), matching the
+      # MLflow + bucket-init clients. If you front MinIO with a TLS Ingress for
+      # minio.ongc.local, switch this back to https and ensure in-cluster DNS resolves it.
+      endpointURL: http://minio:9000
+      s3Credentials:
+        accessKeyId:
+          name: crmf-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: crmf-backup-s3
+          key: SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+        maxParallel: 4
+      data:
+        compression: gzip
+        immediateCheckpoint: true
+        jobs: 2
+
+  # ---- Pod anti-affinity: spread instances across nodes -------------
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: preferred

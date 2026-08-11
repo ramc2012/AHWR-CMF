@@ -1,0 +1,15 @@
+html[data-crmf-theme='contrast'] body {
+    filter: contrast(1.16) saturate(1.18);
+}
+
+html[data-crmf-theme='green'] body {
+    filter: hue-rotate(72deg) saturate(1.16);
+}
+
+html[data-crmf-theme='purple'] body {
+    filter: hue-rotate(245deg) saturate(1.14);
+}
+
+html[data-crmf-theme='dark'] body {
+    filter: none;
+}

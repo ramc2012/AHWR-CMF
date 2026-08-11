@@ -1,0 +1,323 @@
+# =============================================================================
+# CRMF Ingestion Backbone — MQTT Broker (EMQX)
+# Proposal §6.3: per-rig device identity over MQTT-TLS.
+#
+# EMQX deployed as a StatefulSet (stable network identity + per-node data PVC).
+# A single-node default is shipped here (replicas: 1); scale to 3 and add the
+# emqx cluster discovery env (EMQX_CLUSTER__DISCOVERY_STRATEGY=dns against the
+# headless Service) for HA.
+#
+# Listeners:
+#   1883   mqtt       plaintext (in-cluster / debug only — DISABLE at the edge)
+#   8883   mqtts      TLS, mutual-TLS capable — the rig-facing listener
+#   18083  dashboard  EMQX dashboard / management API
+#
+# Device identity: each rig authenticates with a per-rig client cert (CN=rigId)
+# over mqtts; EMQX maps CN -> username and authorizes the rig to publish only
+# under its own topic prefix (see ../mqtt/README.md and the ACL in this CM).
+#
+# MONITORING-ONLY: the broker only accepts rig->central publishes. No central
+# component publishes commands back to rigs.
+# =============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crmf-emqx
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: emqx
+    app.kubernetes.io/component: mqtt-broker
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crmf-emqx-config
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: emqx
+    app.kubernetes.io/component: mqtt-broker
+data:
+  # Mounted at /opt/emqx/etc/emqx.conf (HOCON). Auth/ACL shown inline so the
+  # device-identity model is reviewable in git; in production back the password
+  # source with a built-in DB / external source as needed.
+  emqx.conf: |
+    node {
+      name = "emqx@127.0.0.1"
+      cookie = "crmf-emqx-cookie"     # override via EMQX_NODE__COOKIE secret
+      data_dir = "/opt/emqx/data"
+    }
+
+    # ---- Plain MQTT (in-cluster / debug). Disable for edge-facing traffic. --
+    listeners.tcp.default {
+      bind = "0.0.0.0:1883"
+      max_connections = 1024000
+    }
+
+    # ---- MQTT over TLS — the rig-facing listener (mutual TLS). --------------
+    listeners.ssl.default {
+      bind = "0.0.0.0:8883"
+      max_connections = 512000
+      ssl_options {
+        # Server cert/key provisioned by cert-manager into Secret
+        # "crmf-emqx-tls" (see commented Certificate below), mounted at /tls.
+        certfile = "/tls/tls.crt"
+        keyfile  = "/tls/tls.key"
+        cacertfile = "/tls/ca.crt"
+        # Require + verify client certs => per-rig device identity.
+        verify = verify_peer
+        fail_if_no_peer_cert = true
+      }
+    }
+
+    dashboard {
+      listeners.http { bind = "0.0.0.0:18083" }
+    }
+
+    # ---- Authentication: map the client-cert CN to the MQTT username. ------
+    authentication = [
+      {
+        mechanism = password_based
+        backend = built_in_database
+        # When mutual TLS is on, EMQX can use the cert CN as the username via
+        # peer_cert_as_username; rigs then need no separate password.
+        password_hash_algorithm { name = sha256 }
+      }
+    ]
+
+    # ---- Authorization (ACL): a rig may only publish under its own prefix. --
+    authorization {
+      no_match = deny
+      sources = [
+        {
+          type = file
+          # %u is the authenticated username (= rig client-cert CN).
+          # Rigs PUBLISH telemetry/events; they never SUBSCRIBE (monitoring-only).
+          rules = """
+            {allow, all, publish, ["rigs/${username}/telemetry"]}.
+            {allow, all, publish, ["rigs/${username}/telemetry/#"]}.
+            {allow, all, publish, ["rigs/${username}/events/#"]}.
+            {allow, all, publish, ["rigs/${username}/status"]}.
+            {deny,  all, subscribe, ["#"]}.
+            {deny,  all, publish, ["#"]}.
+          """
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crmf-mqtt
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: emqx
+    app.kubernetes.io/component: mqtt-broker
+spec:
+  # ClusterIP by default. To expose mqtts to rig-edge agents outside the
+  # cluster, front 8883 with a LoadBalancer or a TLS-passthrough ingress.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: emqx
+    app.kubernetes.io/component: mqtt-broker
+  ports:
+    - name: mqtt
+      port: 1883
+      targetPort: mqtt
+      protocol: TCP
+    - name: mqtts
+      port: 8883
+      targetPort: mqtts
+      protocol: TCP
+    - name: dashboard
+      port: 18083
+      targetPort: dashboard
+      protocol: TCP
+    # Prometheus metrics are served by EMQX on the management/dashboard listener
+    # at /api/v5/prometheus/stats — exposed here as a named "metrics" port so the
+    # observability ServiceMonitor (deploy/k8s/platform/observability) can scrape it.
+    - name: metrics
+      port: 18084
+      targetPort: dashboard
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crmf-mqtt-headless
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: emqx
+    app.kubernetes.io/component: mqtt-broker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true     # needed for emqx DNS cluster discovery
+  selector:
+    app.kubernetes.io/name: emqx
+    app.kubernetes.io/component: mqtt-broker
+  ports:
+    - name: ekka
+      port: 4370
+      targetPort: 4370
+      protocol: TCP
+    - name: mqtts
+      port: 8883
+      targetPort: mqtts
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: crmf-emqx
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: emqx
+    app.kubernetes.io/component: mqtt-broker
+spec:
+  serviceName: crmf-mqtt-headless
+  replicas: 1                        # set to 3 + DNS discovery env for HA
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: emqx
+      app.kubernetes.io/component: mqtt-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: crmf
+        app.kubernetes.io/managed-by: kubectl
+        app.kubernetes.io/name: emqx
+        app.kubernetes.io/component: mqtt-broker
+    spec:
+      serviceAccountName: crmf-emqx
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: emqx
+          image: emqx/emqx:5.8.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: mqtt
+              containerPort: 1883
+              protocol: TCP
+            - name: mqtts
+              containerPort: 8883
+              protocol: TCP
+            - name: dashboard
+              containerPort: 18083
+              protocol: TCP
+            - name: ekka
+              containerPort: 4370
+              protocol: TCP
+          env:
+            - name: EMQX_NODE__DATA_DIR
+              value: "/opt/emqx/data"
+            # Cluster discovery (effective when replicas>1):
+            # - name: EMQX_CLUSTER__DISCOVERY_STRATEGY
+            #   value: "dns"
+            # - name: EMQX_CLUSTER__DNS__NAME
+            #   value: "crmf-mqtt-headless.crmf.svc.cluster.local"
+            # - name: EMQX_CLUSTER__DNS__RECORD_TYPE
+            #   value: "srv"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # EMQX writes mnesia/logs under data_dir
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /opt/emqx/data
+            - name: config
+              mountPath: /opt/emqx/etc/emqx.conf
+              subPath: emqx.conf
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: dashboard
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: mqtts
+            initialDelaySeconds: 30
+            periodSeconds: 15
+      volumes:
+        - name: config
+          configMap:
+            name: crmf-emqx-config
+        - name: tls
+          secret:
+            # Server + CA cert for the 8883 listener. Provision via cert-manager
+            # (see commented Certificate below) or create manually:
+            #   kubectl -n crmf create secret generic crmf-emqx-tls \
+            #     --from-file=tls.crt --from-file=tls.key --from-file=ca.crt
+            secretName: crmf-emqx-tls
+            optional: true
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/part-of: crmf
+          app.kubernetes.io/name: emqx
+          app.kubernetes.io/component: mqtt-broker
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+        # storageClassName: ongc-fast-ssd
+# -----------------------------------------------------------------------------
+# OPTIONAL — cert-manager Certificate for the mqtts listener. The CA that signs
+# this also signs the per-rig client certs, so EMQX can verify_peer. Uncomment
+# once the cluster-issuer / CA is available.
+# ---
+# apiVersion: cert-manager.io/v1
+# kind: Certificate
+# metadata:
+#   name: crmf-emqx-tls
+#   namespace: crmf
+#   labels:
+#     app.kubernetes.io/part-of: crmf
+#     app.kubernetes.io/name: emqx
+#     app.kubernetes.io/component: mqtt-broker
+# spec:
+#   secretName: crmf-emqx-tls
+#   duration: 2160h        # 90d
+#   renewBefore: 360h
+#   commonName: crmf-mqtt.crmf.svc.cluster.local
+#   dnsNames:
+#     - crmf-mqtt.crmf.svc.cluster.local
+#     - crmf-mqtt
+#     - mqtt.crmf.ongc.local
+#   issuerRef:
+#     name: letsencrypt-or-ongc-ca
+#     kind: ClusterIssuer
+#     group: cert-manager.io
+# -----------------------------------------------------------------------------

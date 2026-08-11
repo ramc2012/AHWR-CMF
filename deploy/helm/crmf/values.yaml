@@ -1,0 +1,240 @@
+# Default values for the CRMF application chart.
+# This is a YAML-formatted file. Values are merged with values-prod.yaml in prod.
+
+# -- Override the chart name used in resource names/labels.
+nameOverride: ""
+# -- Override the fully-qualified app name used in resource names.
+fullnameOverride: ""
+
+image:
+  # -- Production container registry (Harbor).
+  registry: harbor.ongc.local
+  # -- Default tag applied to backend/frontend images unless overridden per-component.
+  tag: "1.0.0"
+  # -- Default imagePullPolicy.
+  pullPolicy: IfNotPresent
+  # -- imagePullSecrets (list of {name: ...}); reference pre-created secrets.
+  pullSecrets: []
+  #  - name: harbor-pull-secret
+
+backend:
+  image:
+    repository: crmf/crmf-backend
+    # -- Optional per-component tag/pullPolicy overrides (fall back to .Values.image.*).
+    tag: ""
+    pullPolicy: ""
+  replicaCount: 2
+  # -- Container/Service ports.
+  containerPort: 6000
+  service:
+    type: ClusterIP
+    port: 6000
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  # -- Pod-level annotations (e.g. for config-change rollouts).
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+frontend:
+  image:
+    repository: crmf/crmf-frontend
+    tag: ""
+    pullPolicy: ""
+  replicaCount: 2
+  containerPort: 80
+  service:
+    type: ClusterIP
+    port: 80
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+serviceAccount:
+  # -- Create a dedicated ServiceAccount for the application pods.
+  create: true
+  # -- Name to use; generated from fullname when empty.
+  name: ""
+  annotations: {}
+
+ingress:
+  enabled: true
+  className: nginx
+  host: crmf.ongc.local
+  # -- Extra annotations merged after the required CRMF annotations below.
+  annotations: {}
+  # Required behaviour (rendered by the template, listed here for visibility):
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "64m"      # large gzip /ingest batches
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"  # long-lived /socket.io
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  proxyBodySize: "64m"
+  proxyReadTimeout: "3600"
+  proxySendTimeout: "3600"
+  tls:
+    enabled: true
+    secretName: crmf-tls
+    # -- cert-manager cluster-issuer for the host certificate.
+    clusterIssuer: letsencrypt-or-ongc-ca
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+  # -- Optional memory target (off by default).
+  targetMemoryUtilizationPercentage: 0
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  # -- Namespace label selector matching the ingress-nginx controller namespace.
+  ingressControllerNamespaceLabel:
+    kubernetes.io/metadata.name: ingress-nginx
+  # -- TimescaleDB primary RW service target for backend egress.
+  timescaledb:
+    serviceName: crmf-timescaledb-rw
+    port: 5432
+  # -- Kafka (Strimzi) bootstrap egress (allowed when KAFKA_ENABLED).
+  kafka:
+    port: 9092
+    tlsPort: 9093
+  # -- Keycloak/OIDC egress (allowed when OIDC_ENABLED).
+  keycloak:
+    port: 8443
+  # -- Outbound alarm-notification egress (allowed when NOTIFY_ENABLED): webhooks
+  #    (HTTPS 443) and SMTP. Targets are operator-configured, so egress is by port.
+  notify:
+    httpsPort: 443
+    smtpPort: 587
+
+serviceMonitor:
+  enabled: true
+  # -- Scrape interval and path for the backend /metrics endpoint.
+  interval: 30s
+  scrapeTimeout: 10s
+  path: /metrics
+  # -- Extra labels so the cluster Prometheus selects this ServiceMonitor.
+  labels: {}
+  #  release: kube-prometheus-stack
+
+# Optional bearer token guard for /metrics (#15). /metrics is internal-only (scraped via
+# the ServiceMonitor, never exposed through the Ingress). When token is non-empty it is
+# stored in Secret crmf-secrets as METRICS_TOKEN and the ServiceMonitor sends it as a
+# Bearer Authorization header. Leave empty to keep /metrics open to in-namespace scrapers
+# only (already protected by the NetworkPolicy that allows just Prometheus).
+metrics:
+  token: ""
+
+# Kafka TLS trust (#19). Only meaningful when config.KAFKA_ENABLED=true. The Strimzi
+# operator auto-creates Secret "crmf-kafka-cluster-ca-cert" (key ca.crt) for cluster
+# "crmf-kafka". When enabled, the chart mounts that CA into the backend and injects
+# KAFKA_SSL_CA so kafkajs validates the broker cert against the Strimzi CA instead of
+# Node's public bundle (which would fail with a self-signed-certificate error).
+kafka:
+  tls:
+    # -- Mount the Strimzi cluster CA and set KAFKA_SSL_CA for the backend.
+    enabled: true
+    # -- Secret name the Strimzi operator generates for the cluster CA cert.
+    caSecretName: crmf-kafka-cluster-ca-cert
+    # -- Key within that Secret holding the PEM CA bundle.
+    caSecretKey: ca.crt
+    # -- In-container path the CA is mounted at and KAFKA_SSL_CA points to.
+    mountPath: /etc/kafka/ca
+    caFileName: ca.crt
+
+# Pod security defaults applied to all containers (overridable).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+
+# ConfigMap "crmf-config" contents. Feature flags default kafka/oidc OFF, metrics ON.
+config:
+  PGHOST: crmf-timescaledb-rw
+  PGPORT: "5432"
+  # Audit #2: connect as the least-privilege crmf_app role (NOT the schema owner). Under
+  # CloudNativePG the schema runs as `postgres`, so only crmf_app holds table privileges
+  # and crmf_app cannot drop/bypass the append-only audit_log trigger. crmf_app's login
+  # password is provisioned by the CNPG cluster's managed.roles
+  # (deploy/k8s/platform/timescaledb/00-cluster.yaml) and MUST equal crmf-secrets PGPASSWORD.
+  PGUSER: crmf_app
+  PGDATABASE: crmf
+  PORT: "6000"
+  OFFLINE_SEC: "120"
+  CENTRAL_LATENCY_TARGET: "30"
+  FLEET_SIZE: "50"
+  METRICS_ENABLED: "true"
+  # /metrics is scraped ONLY by the internal ServiceMonitor on the backend pod port
+  # (#15); no Ingress path exposes it (see templates/ingress.yaml). Optionally require a
+  # bearer token on /metrics by setting metrics.token below — when set it is injected as
+  # METRICS_TOKEN via the Secret and the ServiceMonitor is configured to send it.
+  # Kafka (off by default). Strimzi cluster "crmf-kafka" -> bootstrap service
+  # "crmf-kafka-kafka-bootstrap"; :9093 is the TLS+SCRAM listener.
+  KAFKA_ENABLED: "false"
+  KAFKA_BROKERS: "crmf-kafka-kafka-bootstrap.crmf.svc.cluster.local:9093"
+  KAFKA_SSL: "true"
+  # When KAFKA_ENABLED, the backend trusts the Strimzi self-signed CLUSTER CA mounted
+  # at this path (#19); lib/kafka.js reads it into ssl:{ca:[...],rejectUnauthorized:true}.
+  # This var is injected by the deployment ONLY when kafka.tls.enabled (see below); it is
+  # intentionally NOT listed here so it stays unset when TLS trust is not wired.
+  KAFKA_SASL_MECHANISM: "scram-sha-512"
+  KAFKA_SASL_USERNAME: "crmf-backend"
+  # KAFKA_SASL_PASSWORD comes from the KafkaUser "crmf-backend" secret (see crmf-secrets).
+  # OIDC (off by default). Source of truth = Keycloak realm "ongc" (keycloak/02-realm.yaml).
+  OIDC_ENABLED: "false"
+  OIDC_ISSUER: "https://keycloak.ongc.local/realms/ongc"
+  OIDC_JWKS_URI: "https://keycloak.ongc.local/realms/ongc/protocol/openid-connect/certs"
+  OIDC_AUDIENCE: "crmf-api"
+  # Alarm notifications (webhook/email) — dispatch outbound alerts on rising-edge
+  # alarms. Channels are configured at runtime in the portal (Alarm Command Centre).
+  # Email needs SMTP_* (set via crmf-secrets). When enabled, the NetworkPolicy opens
+  # backend egress on 443/587 (see networkPolicy.notify).
+  NOTIFY_ENABLED: "false"
+  NOTIFY_MIN_SEVERITY: "P1"
+  NOTIFY_COOLDOWN_SEC: "300"
+
+# Secret "crmf-secrets" contents.
+# PRODUCTION: do NOT store real secrets here. Provision the "crmf-secrets" Secret
+# via an ExternalSecret (External Secrets Operator) / HashiCorp Vault instead, and
+# set externalSecret.enabled=true so this chart does not render plaintext values.
+externalSecret:
+  # -- When true the chart will NOT render templates/secret.yaml; an out-of-band
+  #    Secret named "crmf-secrets" (ExternalSecret/Vault) is expected to exist.
+  enabled: false
+
+secrets:
+  PGPASSWORD: "changeme-pg-password"
+  JWT_SECRET: "changeme-jwt-secret"
+  INGEST_TOKEN: "changeme-ingest-token"
+  ADMIN_PASSWORD: "changeme-admin-password"
+  # Only used when KAFKA_ENABLED=true. In production, sync this from the Strimzi
+  # KafkaUser "crmf-backend" secret (key: password) via your ExternalSecret/Vault.
+  KAFKA_SASL_PASSWORD: "changeme-kafka-password"

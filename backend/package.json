@@ -1,0 +1,29 @@
+{
+    "name":  "crmf-backend",
+    "version":  "1.0.0",
+    "description":  "Centralised Rig Monitoring Facility — ingestion + fleet portal API (monitoring-only)",
+    "main":  "server.js",
+    "scripts":  {
+                    "start":  "node server.js",
+                    "dev":  "nodemon server.js"
+                },
+    "dependencies":  {
+                         "bcryptjs":  "^2.4.3",
+                         "cors":  "^2.8.5",
+                         "express":  "^4.18.2",
+                         "express-rate-limit":  "^7.4.0",
+                         "helmet":  "^7.1.0",
+                         "jose":  "^5.9.6",
+                         "jsonwebtoken":  "^9.0.2",
+                         "kafkajs":  "^2.2.4",
+                         "ldapts":  "^8.1.8",
+                         "nodemailer":  "^9.0.1",
+                         "pg":  "^8.12.0",
+                         "prom-client":  "^15.1.3",
+                         "socket.io":  "^4.7.2",
+                         "ws":  "^8.18.0"
+                     },
+    "devDependencies":  {
+                            "nodemon":  "^3.0.1"
+                        }
+}

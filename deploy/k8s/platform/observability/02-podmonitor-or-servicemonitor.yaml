@@ -1,0 +1,47 @@
+# ServiceMonitor(s) for CRMF platform components NOT already scraped by their own operator.
+#
+# Coverage note:
+#   - The crmf-backend / crmf-frontend app workloads ship their own ServiceMonitor in the
+#     app Helm chart (deploy/helm/crmf) — do NOT duplicate them here.
+#   - CloudNativePG (crmf-timescaledb) creates its own PodMonitor when `.spec.monitoring.
+#     enablePodMonitor: true` is set on the Cluster — covered by the database agent.
+#   - Strimzi (Kafka) exposes metrics via its own PodMonitors / the Kafka resource's
+#     metricsConfig — covered by the kafka agent.
+#   - Keycloak exposes /metrics on its management port; the keycloak agent owns that wiring.
+#
+# What remains for this file: the MQTT broker, which has no metrics-emitting operator.
+# An MQTT broker (e.g. EMQX or a Mosquitto + prometheus-exporter sidecar) only shows up in
+# Prometheus if we point a ServiceMonitor at it. This is intentionally minimal: it scrapes
+# the broker's Prometheus endpoint if (and only if) the broker Service exposes a "metrics"
+# port. If your broker does not expose Prometheus metrics, delete this document.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: crmf-mqtt
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: crmf-mqtt
+    app.kubernetes.io/component: observability
+    # Must match the kube-prometheus-stack Prometheus serviceMonitorSelector
+    # (default selects on the stack's Helm release label).
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - crmf
+  selector:
+    matchLabels:
+      # Selects the MQTT broker Service owned by the mqtt agent. EMQX dashboard charts label
+      # their metrics Service app.kubernetes.io/name: emqx; adjust to your broker if different.
+      app.kubernetes.io/part-of: crmf
+      app.kubernetes.io/component: mqtt-broker
+  endpoints:
+    - port: metrics          # named "metrics" port on the crmf-mqtt Service (EMQX 18083)
+      path: /api/v5/prometheus/stats   # EMQX Prometheus text endpoint
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true

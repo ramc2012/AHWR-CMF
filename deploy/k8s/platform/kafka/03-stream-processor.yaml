@@ -1,0 +1,167 @@
+# =============================================================================
+# CRMF Ingestion Backbone — Derived-Channels Stream Processor  [SCAFFOLDED]
+# Proposal §6.4: derived channels.
+#
+# !!! SCAFFOLD — image crmf/crmf-stream does not exist yet. This Deployment
+# !!! documents the contract and wiring of the Kafka Streams job; another
+# !!! agent / workstream owns the application code. Replace the image and
+# !!! remove the scaffold guard (replicas: 0) when the job is built.
+#
+# WHAT IT DOES (target behaviour):
+#   - Joins/aggregates over telemetry.ingest (+ events.*) keyed by rigId.
+#   - Computes derived signals, emits to topic "derived.channels" (compacted):
+#       * hookload deviation      — measured vs modelled/expected hookload.
+#       * HPU efficiency index     — hydraulic power unit output / input ratio.
+#       * trip-speed statistics    — rolling mean/percentiles of pipe trip rate.
+#   - Materialises current derived state into TimescaleDB (canonical store),
+#     so REST/socket consumers read one store regardless of source path.
+#
+# IDENTITY: SCRAM user "crmf-stream" (see 02-users.yaml). Credentials are in
+# the User-Operator-managed Secret "crmf-stream" (key "password" / jaas).
+# DB wiring reuses the platform ConfigMap "crmf-config" + Secret "crmf-secrets"
+# (PGHOST=crmf-timescaledb-rw, etc.) — read/append only, monitoring-only.
+# =============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crmf-stream
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: crmf-stream
+    app.kubernetes.io/component: stream-processor
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crmf-stream-config
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: crmf-stream
+    app.kubernetes.io/component: stream-processor
+data:
+  # Kafka Streams application identity + topology wiring.
+  KAFKA_BOOTSTRAP_SERVERS: "crmf-kafka-kafka-bootstrap:9093"   # TLS listener
+  KAFKA_SECURITY_PROTOCOL: "SASL_SSL"
+  KAFKA_SASL_MECHANISM: "SCRAM-SHA-512"
+  STREAMS_APPLICATION_ID: "crmf-stream"
+  STREAMS_NUM_THREADS: "3"
+  # Source / sink topics.
+  TOPIC_TELEMETRY: "telemetry.ingest"
+  TOPIC_EVENTS_PREFIX: "events."
+  TOPIC_DERIVED: "derived.channels"
+  # Derived-channel tuning (defaults; environment-specific).
+  TRIP_SPEED_WINDOW_SEC: "60"
+  HOOKLOAD_DEVIATION_TOLERANCE: "0.05"     # 5% band before flagged as deviation
+  HPU_EFFICIENCY_BASELINE: "0.82"
+  # TimescaleDB sink (canonical store) — host/db from crmf-config at runtime.
+  DERIVED_SINK_TABLE: "derived_channels"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crmf-stream
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: crmf-stream
+    app.kubernetes.io/component: stream-processor
+  annotations:
+    crmf.ongc.local/status: "scaffold"
+    crmf.ongc.local/note: >-
+      Placeholder Kafka Streams job for derived channels. Build image
+      crmf/crmf-stream, then set replicas>=1 and a real tag.
+spec:
+  # SCAFFOLD GUARD: 0 replicas so this applies cleanly without a real image.
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: crmf-stream
+      app.kubernetes.io/component: stream-processor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: crmf
+        app.kubernetes.io/managed-by: kubectl
+        app.kubernetes.io/name: crmf-stream
+        app.kubernetes.io/component: stream-processor
+    spec:
+      serviceAccountName: crmf-stream
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stream
+          # SCAFFOLD: replace with harbor.ongc.local/crmf/crmf-stream:<tag>.
+          image: harbor.ongc.local/crmf/crmf-stream:scaffold
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9404
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: crmf-stream-config
+            - configMapRef:
+                name: crmf-config        # PGHOST/PGPORT/PGUSER/PGDATABASE, etc.
+          env:
+            # DB password (append-only sink) from platform secret.
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: crmf-secrets
+                  key: PGPASSWORD
+            # Kafka SCRAM password from the User-Operator-managed Secret.
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: crmf-stream
+                  key: password
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # Kafka Streams RocksDB state + tmp need a writable path under a
+            # read-only root filesystem.
+            - name: state
+              mountPath: /var/lib/crmf-stream
+            - name: tmp
+              mountPath: /tmp
+          # Liveness/readiness target the Streams health endpoint once built.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: metrics
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 15
+      volumes:
+        - name: state
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

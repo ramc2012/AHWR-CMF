@@ -1,0 +1,21 @@
+---
+# CRMF (Centralised Rig Monitoring Facility) namespace.
+# Pod Security Admission set to "restricted" — the strictest baseline, matching the
+# container hardening used by every CRMF workload (runAsNonRoot, drop ALL caps,
+# seccomp RuntimeDefault, readOnlyRootFilesystem where feasible).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: crmf
+    app.kubernetes.io/component: namespace
+    # Pod Security Standards (enforced + audited + warned) at the "restricted" level.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

@@ -1,0 +1,55 @@
+# Demo ONGC directory tree for the CRMF Windows-domain (LDAP) login demo.
+# Loaded by the openldap container via LDAP_CUSTOM_LDIF_DIR (reliable, vs the
+# image's flaky env-based auto-seed). Stands in for the ONGC AD Domain Controller.
+#
+# Users (cn=user, ou=users): driller1/Driller@123, toolpusher1/Push@123, viewer1/View@123.
+# All are members of cn=crmf-operators -> the backend maps that group to the OPERATOR role.
+
+dn: dc=ongc,dc=local
+objectClass: dcObject
+objectClass: organization
+o: ONGC
+dc: ongc
+
+dn: ou=users,dc=ongc,dc=local
+objectClass: organizationalUnit
+ou: users
+
+dn: ou=groups,dc=ongc,dc=local
+objectClass: organizationalUnit
+ou: groups
+
+dn: cn=driller1,ou=users,dc=ongc,dc=local
+objectClass: inetOrgPerson
+cn: driller1
+sn: Driller
+uid: driller1
+displayName: Driller One
+userPassword: Driller@123
+
+dn: cn=toolpusher1,ou=users,dc=ongc,dc=local
+objectClass: inetOrgPerson
+cn: toolpusher1
+sn: Toolpusher
+uid: toolpusher1
+displayName: Toolpusher One
+userPassword: Push@123
+
+dn: cn=viewer1,ou=users,dc=ongc,dc=local
+objectClass: inetOrgPerson
+cn: viewer1
+sn: Viewer
+uid: viewer1
+displayName: Viewer One
+userPassword: View@123
+
+dn: cn=crmf-operators,ou=groups,dc=ongc,dc=local
+objectClass: groupOfNames
+cn: crmf-operators
+member: cn=driller1,ou=users,dc=ongc,dc=local
+member: cn=toolpusher1,ou=users,dc=ongc,dc=local
+
+dn: cn=crmf-viewers,ou=groups,dc=ongc,dc=local
+objectClass: groupOfNames
+cn: crmf-viewers
+member: cn=viewer1,ou=users,dc=ongc,dc=local

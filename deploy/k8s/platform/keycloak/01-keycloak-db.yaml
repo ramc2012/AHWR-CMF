@@ -1,0 +1,90 @@
+# =============================================================================
+# CRMF Identity Layer — Keycloak backing database (CloudNativePG)
+# -----------------------------------------------------------------------------
+# Dedicated Postgres cluster for the Keycloak Operator. Kept separate from the
+# application's "crmf-timescaledb" cluster so identity data and telemetry data
+# have independent lifecycles, backups and blast radius.
+#
+# Consistent with the timescaledb agent's CNPG conventions:
+#   apiVersion: postgresql.cnpg.io/v1, kind: Cluster
+#   bootstrap.initdb creates an owner role + database
+#   credentials sourced from a Kubernetes Secret of type kubernetes.io/basic-auth
+#
+# Connection coordinates consumed by 00-keycloak.yaml:
+#   host (RW service): crmf-keycloak-db-rw   port: 5432
+#   database:          keycloak
+#   user/password:     from Secret "crmf-keycloak-db-app"
+# =============================================================================
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: crmf-keycloak-db-app
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: crmf-keycloak-db
+    app.kubernetes.io/component: identity-database
+type: kubernetes.io/basic-auth
+stringData:
+  # Application role used by Keycloak to connect to its database.
+  # CHANGE-ME in production: manage via an external secret store (e.g. Vault /
+  # External Secrets Operator) rather than committing a real credential.
+  username: keycloak
+  password: "ChangeMe-Keycloak-DB-Pass-0001"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: crmf-keycloak-db
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: cloudnative-pg
+    app.kubernetes.io/name: crmf-keycloak-db
+    app.kubernetes.io/component: identity-database
+spec:
+  # 2 instances => 1 primary + 1 hot-standby replica for HA failover.
+  instances: 2
+
+  # Pin a recent stable PostgreSQL minor. Plain Postgres is sufficient for
+  # Keycloak (no TimescaleDB extension required here).
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.4
+
+  # Spread replicas across nodes/zones where the scheduler allows.
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: preferred
+
+  bootstrap:
+    initdb:
+      database: keycloak
+      owner: keycloak
+      secret:
+        name: crmf-keycloak-db-app
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+
+  storage:
+    size: 10Gi
+    # storageClass: <set to your cluster's RWO storage class>
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+  # Pod-level security hardening (CNPG manages container securityContext itself,
+  # but these reinforce non-root execution).
+  enableSuperuserAccess: false
+
+  monitoring:
+    enablePodMonitor: true

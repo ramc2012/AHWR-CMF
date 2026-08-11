@@ -1,0 +1,7 @@
+{
+  "name": "crmf-fleet-sim",
+  "version": "1.0.0",
+  "description": "Demo multi-rig simulator — streams edge-contract batches to the CRMF /ingest endpoint",
+  "main": "sim.js",
+  "scripts": { "start": "node sim.js" }
+}

@@ -1,0 +1,438 @@
+# =============================================================================
+# CRMF platform — per-workload ALLOW NetworkPolicies (#5)
+# -----------------------------------------------------------------------------
+# 01-network-baseline.yaml installs a namespace-wide default-deny (podSelector:{})
+# for BOTH Ingress and Egress, re-opening only DNS. NetworkPolicies are ADDITIVE,
+# so without companion allows the stateful data plane is bricked: CNPG replication
+# /switchover, Kafka KRaft quorum, Keycloak<->its DB, MinIO peer + clients, and
+# EMQX clients are all dropped — and even backend->DB fails because nothing allows
+# the DB pod's INGRESS.
+#
+# This file ships those allows. It is intentionally scoped to the PLATFORM stateful
+# services (CNPG TimescaleDB + Keycloak DB, Strimzi Kafka, Keycloak, MinIO, EMQX).
+# The application pods (crmf-backend / crmf-frontend) carry their own allows from the
+# Helm chart's templates/networkpolicy.yaml; those references are honoured here so
+# the cross-workload paths (backend/keycloak/mlflow -> DB, etc.) actually connect.
+#
+# Selector conventions (operator-applied pod labels):
+#   CNPG pods       -> cnpg.io/cluster: <cluster-name>
+#   Strimzi pods    -> strimzi.io/cluster: crmf-kafka
+#   Keycloak pods   -> app: keycloak            (Keycloak Operator StatefulSet)
+#   MinIO pods      -> app.kubernetes.io/name: minio
+#   EMQX pods       -> app.kubernetes.io/name: emqx
+#
+# MONITORING-ONLY: none of these policies permit any egress back toward a rig/PLC.
+# Egress allows here are strictly intra-namespace data-plane (DB/Kafka/MinIO) or to
+# kube-system DNS (already opened by the baseline).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1) CNPG TimescaleDB (crmf-timescaledb): intra-cluster :5432 + client ingress.
+#    - INGRESS:  from peer instances (replication/switchover) and from the app
+#                clients that connect on 5432 (backend, mlflow). Also allow CNPG
+#                operator / cnpg status probes from the cnpg-system namespace.
+#    - EGRESS:   to peer instances on 5432 (streaming replication) and to the
+#                in-cluster MinIO Service :9000 (barman WAL archive + base backups).
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-timescaledb
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: allow-timescaledb
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: crmf-timescaledb
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Peer instances (streaming replication, sync standby, switchover).
+    - from:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: crmf-timescaledb
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Application clients in this namespace that connect on 5432:
+    # backend, mlflow, the ETP/WITSML historian, and the pgbouncer pooler.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: crmf
+              app.kubernetes.io/component: backend
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mlflow
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: etp-witsml
+        - podSelector:
+            matchLabels:
+              cnpg.io/poolerName: crmf-timescaledb-pooler-rw
+      ports:
+        - protocol: TCP
+          port: 5432
+    # CNPG operator + Prometheus metrics scrape (operator manages the instances and
+    # scrapes the 9187 exporter; allow the management/metrics path from any namespace
+    # pod labelled as the cnpg manager or prometheus).
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 9187
+  egress:
+    # Peer instances on 5432 (this instance as a replica/sync source).
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: crmf-timescaledb
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Barman object store: WAL archive + base backups to the in-cluster MinIO :9000.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+# -----------------------------------------------------------------------------
+# 2) CNPG Keycloak DB (crmf-keycloak-db): intra-cluster :5432 + Keycloak ingress.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-keycloak-db
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: allow-keycloak-db
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: crmf-keycloak-db
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Peer instances (HA replication).
+    - from:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: crmf-keycloak-db
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Keycloak server pods connect here.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: keycloak
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: crmf-keycloak
+      ports:
+        - protocol: TCP
+          port: 5432
+    # CNPG operator + Prometheus.
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 9187
+  egress:
+    # Peer instances on 5432.
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: crmf-keycloak-db
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# -----------------------------------------------------------------------------
+# 3) Strimzi Kafka (crmf-kafka): inter-broker (KRaft quorum + replication) and
+#    in-cluster client traffic on the plain (9092) and TLS (9093) listeners.
+#    KRaft controllers gossip on 9090/9091; allow broker<->broker broadly within
+#    the cluster, plus client ingress from the backend and the stream processor.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kafka
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: allow-kafka
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      strimzi.io/cluster: crmf-kafka
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Inter-broker / KRaft controller quorum: any pod in the same Strimzi cluster.
+    - from:
+        - podSelector:
+            matchLabels:
+              strimzi.io/cluster: crmf-kafka
+    # In-cluster clients: backend producer/consumer + stream processor + MQTT bridge.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: crmf
+              app.kubernetes.io/component: backend
+        - podSelector:
+            matchLabels:
+              strimzi.io/cluster: crmf-kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+    # Strimzi operator (cluster + user operators) management + Prometheus scrape.
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              strimzi.io/kind: cluster-operator
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+  egress:
+    # Inter-broker / KRaft quorum egress to peers in the same cluster.
+    - to:
+        - podSelector:
+            matchLabels:
+              strimzi.io/cluster: crmf-kafka
+---
+# -----------------------------------------------------------------------------
+# 4) Keycloak server: ingress from ingress-nginx (8443/8080) and from the backend
+#    (OIDC JWKS direct path); egress to its CNPG DB (5432) and DNS (baseline).
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-keycloak
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: allow-keycloak
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: keycloak
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # ingress-nginx terminates TLS for keycloak.ongc.local and proxies to 8080/8443.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8443
+    # Backend in-namespace OIDC JWKS fetch (direct pod path).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: crmf
+              app.kubernetes.io/component: backend
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8443
+    # Keycloak peer instances (Infinispan cluster cache) + operator + Prometheus.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: keycloak
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+  egress:
+    # -> its CNPG Postgres on 5432.
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: crmf-keycloak-db
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Keycloak peer instances (cluster cache).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: keycloak
+---
+# -----------------------------------------------------------------------------
+# 5) MinIO: peer (distributed-mode) + S3 client ingress (CNPG barman, MLflow,
+#    bucket-init Job). Egress to peers for distributed mode.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-minio
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: allow-minio
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: minio
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # MinIO peers (distributed mode erasure set, headless service).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    # S3 clients: CNPG (barman backups/WAL), MLflow artifacts, bucket-init Job,
+    # the backend (report exports). Match by their stable name labels.
+    - from:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: crmf-timescaledb
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: crmf-timescaledb-dr
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mlflow
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: crmf
+              app.kubernetes.io/component: backend
+      ports:
+        - protocol: TCP
+          port: 9000
+    # Console + Prometheus scrape (MinIO exposes metrics on the S3 port path).
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9001
+  egress:
+    # MinIO peers (distributed mode).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+# -----------------------------------------------------------------------------
+# 6) EMQX MQTT broker: client ingress on 1883/8883, dashboard/metrics, and the
+#    ekka cluster peer port (4370). Egress to peers for clustering.
+#    The rig-facing 8883 listener is reached via a LoadBalancer/TLS-passthrough at
+#    the edge; in-cluster we allow ingress broadly on the broker ports and peer 4370.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-emqx
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: allow-emqx
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: emqx
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # EMQX cluster peers (ekka gossip on 4370) + broker listeners between nodes.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: emqx
+    # MQTT clients (rig-edge via the rig-facing listener, and the MQTT->Kafka bridge).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: crmf-mqtt-kafka-bridge
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 1883
+        - protocol: TCP
+          port: 8883
+    # Dashboard + Prometheus metrics.
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 18083
+        - protocol: TCP
+          port: 18084
+  egress:
+    # EMQX cluster peers.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: emqx

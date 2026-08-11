@@ -1,0 +1,339 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "CRMF — Centralised Rig Monitoring Facility API",
+    "version": "1.0.0",
+    "description": "Monitoring-only fleet API + edge ingestion contract for the AHWR Central Facility (proposal §6.1/§6.3/§6.5). The platform only RECEIVES telemetry/events from rig-edge systems; there is no write path back to any rig or PLC. The /api surface is also mounted at /api/v1 (versioned alias); /api remains the unversioned default."
+  },
+  "servers": [
+    { "url": "/", "description": "Same-origin (portal + ingest share the backend service)" }
+  ],
+  "tags": [
+    { "name": "ingest", "description": "Edge store-and-forward ingestion (fail-closed)" },
+    { "name": "auth", "description": "Portal authentication (local JWT / OIDC)" },
+    { "name": "fleet", "description": "Fleet overview, rig drill-down, alarms, data quality" },
+    { "name": "governance", "description": "Rollout governance, escalations, decisions" },
+    { "name": "maintenance", "description": "Maintenance & Reliability records (§6.1)" },
+    { "name": "reports", "description": "Fleet reporting (snapshot/daily/weekly/monthly)" },
+    { "name": "users", "description": "User & Access Management (admin-only)" },
+    { "name": "audit", "description": "Immutable audit trail (admin-only, read)" },
+    { "name": "ops", "description": "Health/liveness/metrics" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" },
+      "ingestToken": {
+        "type": "http", "scheme": "bearer",
+        "description": "Per-rig device_token or the global INGEST_TOKEN. Ingest is fail-closed: a batch is rejected (401) unless the token matches, or ALLOW_OPEN_INGEST=true in a non-production environment."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": { "error": { "type": "string" } }
+      },
+      "IngestBatch": {
+        "type": "object",
+        "description": "Store-and-forward batch from the rig-edge sync agent.",
+        "properties": {
+          "seq": { "type": "integer", "format": "int64", "description": "Monotonic batch sequence; batches with seq <= last accepted seq are ignored as replays." },
+          "deviceId": { "type": "string", "description": "Rig/device id, e.g. AHWR-50-3." },
+          "schemaVersion": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "channels": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ts": { "type": "string", "format": "date-time" },
+                "values": { "type": "object", "additionalProperties": { "type": "number" }, "description": "{ \"measurement.field\": number }" }
+              }
+            }
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ts": { "type": "string", "format": "date-time" },
+                "type": { "type": "string", "enum": ["alarm", "connection", "activity"] },
+                "payload": { "type": "object" }
+              }
+            }
+          }
+        }
+      },
+      "IngestAck": {
+        "type": "object",
+        "properties": {
+          "ack": { "type": "boolean" },
+          "seq": { "type": "integer", "format": "int64", "nullable": true },
+          "receivedPoints": { "type": "integer" },
+          "receivedEvents": { "type": "integer" }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": ["username", "password"],
+        "properties": {
+          "username": { "type": "string" },
+          "password": { "type": "string" }
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "properties": {
+          "token": { "type": "string" },
+          "user": { "$ref": "#/components/schemas/User" }
+        }
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "username": { "type": "string" },
+          "display": { "type": "string" },
+          "role": { "type": "string", "enum": ["admin", "operator", "viewer"] },
+          "source": { "type": "string", "enum": ["local", "ad"] },
+          "disabled": { "type": "boolean" }
+        }
+      },
+      "MaintenanceRecord": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "rig_id": { "type": "string" },
+          "type": { "type": "string", "enum": ["PM", "calibration", "breakdown", "inspection"] },
+          "title": { "type": "string" },
+          "status": { "type": "string", "enum": ["open", "in_progress", "done", "overdue"] },
+          "due_date": { "type": "string", "format": "date", "nullable": true },
+          "performed_at": { "type": "string", "format": "date-time", "nullable": true },
+          "runtime_hours": { "type": "number", "nullable": true },
+          "outcome": { "type": "string", "nullable": true },
+          "notes": { "type": "string", "nullable": true },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MaintenanceSummary": {
+        "type": "object",
+        "properties": {
+          "pmCompliancePct": { "type": "integer", "nullable": true },
+          "overdue": { "type": "integer" },
+          "openCount": { "type": "integer" },
+          "breakdownCount": { "type": "integer" },
+          "byRig": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "AuditPage": {
+        "type": "object",
+        "properties": {
+          "total": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "rows": { "type": "array", "items": { "type": "object" } }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/ingest": {
+      "post": {
+        "tags": ["ingest"],
+        "summary": "Ingest a store-and-forward batch (fail-closed)",
+        "description": "Accepts an optionally gzipped JSON batch. Auth is fail-closed (per-rig device_token or global INGEST_TOKEN). Malformed fields are coerced/skipped; the batch is never rejected with a 500 leaking DB internals. Replays (seq <= last accepted) are acknowledged as no-ops.",
+        "security": [{ "ingestToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/IngestBatch" } },
+            "application/gzip": { "schema": { "type": "string", "format": "binary" } }
+          }
+        },
+        "responses": {
+          "200": { "description": "Accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IngestAck" } } } },
+          "400": { "description": "Malformed batch", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Unauthorized device", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/livez": {
+      "get": {
+        "tags": ["ops"],
+        "summary": "Process liveness (no DB)",
+        "description": "Returns 200 when the event loop is alive. Does NOT touch the database — use as the Kubernetes livenessProbe so a DB blip cannot trigger a restart storm.",
+        "responses": { "200": { "description": "Alive" } }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": ["ops"],
+        "summary": "Readiness (DB-aware)",
+        "description": "Runs SELECT 1; returns 503 when the DB is unreachable. Use as the readinessProbe.",
+        "responses": { "200": { "description": "Ready" }, "503": { "description": "DB unreachable" } }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["ops"],
+        "summary": "Prometheus metrics",
+        "description": "Guarded by METRICS_TOKEN when set (bearer). Scrape internally in K8s.",
+        "responses": { "200": { "description": "Prometheus exposition format" }, "401": { "description": "Missing/invalid metrics token" } }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Local login",
+        "description": "Stricter rate limit than the rest of /api; failed attempts are audit-logged. Disabled accounts are rejected.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoginRequest" } } } },
+        "responses": {
+          "200": { "description": "Token + user", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoginResponse" } } } },
+          "401": { "description": "Invalid credentials" },
+          "429": { "description": "Too many attempts" }
+        }
+      }
+    },
+    "/api/auth/me": {
+      "get": { "tags": ["auth"], "summary": "Current user", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "User" }, "401": { "description": "Unauthorized" } } }
+    },
+    "/api/fleet": {
+      "get": { "tags": ["fleet"], "summary": "Fleet overview", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Rig rows" } } }
+    },
+    "/api/fleet/summary": {
+      "get": { "tags": ["fleet"], "summary": "Fleet KPI summary", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Summary" } } }
+    },
+    "/api/rigs/{id}": {
+      "get": {
+        "tags": ["fleet"], "summary": "Rig drill-down", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Rig detail (incl. per-tag age)" }, "404": { "description": "Unknown rig" } }
+      }
+    },
+    "/api/rigs/{id}/history": {
+      "get": {
+        "tags": ["fleet"], "summary": "Metric time-series", "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "metric", "in": "query", "schema": { "type": "string" } },
+          { "name": "minutes", "in": "query", "schema": { "type": "integer" } }
+        ],
+        "responses": { "200": { "description": "Points" } }
+      }
+    },
+    "/api/alarms": {
+      "get": {
+        "tags": ["fleet"], "summary": "Alarm command centre", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "priority", "in": "query", "schema": { "type": "string", "enum": ["p1", "p2", "p3"] } }],
+        "responses": { "200": { "description": "Active alarms (offline rigs excluded)" } }
+      }
+    },
+    "/api/data-quality": {
+      "get": { "tags": ["fleet"], "summary": "Data quality monitor", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Per-rig data quality" } } }
+    },
+    "/api/workover": {
+      "get": {
+        "tags": ["fleet"], "summary": "Workover performance", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "hours", "in": "query", "schema": { "type": "integer" } }],
+        "responses": { "200": { "description": "Connection quality + activity" } }
+      }
+    },
+    "/api/governance": {
+      "get": { "tags": ["governance"], "summary": "Governance workspace", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Rollout state" } } }
+    },
+    "/api/governance/deployment/{rigId}": {
+      "patch": {
+        "tags": ["governance"], "summary": "Update deployment status (operator+)", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "rigId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Updated" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/governance/escalations": {
+      "post": { "tags": ["governance"], "summary": "Add escalation (operator+)", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Created" }, "403": { "description": "Forbidden" } } }
+    },
+    "/api/governance/escalations/{id}": {
+      "patch": {
+        "tags": ["governance"], "summary": "Update escalation (operator+)", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": { "200": { "description": "Updated" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/governance/decisions": {
+      "post": { "tags": ["governance"], "summary": "Add decision (operator+, audited)", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Created" }, "403": { "description": "Forbidden" } } }
+    },
+    "/api/maintenance": {
+      "get": {
+        "tags": ["maintenance"], "summary": "List maintenance records", "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "rigId", "in": "query", "schema": { "type": "string" } },
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["open", "in_progress", "done", "overdue"] } }
+        ],
+        "responses": { "200": { "description": "Records", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/MaintenanceRecord" } } } } } }
+      },
+      "post": {
+        "tags": ["maintenance"], "summary": "Add maintenance record (operator+, audited)", "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MaintenanceRecord" } } } },
+        "responses": { "200": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MaintenanceRecord" } } } }, "400": { "description": "Validation error" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/maintenance/summary": {
+      "get": { "tags": ["maintenance"], "summary": "Maintenance KPI summary", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Summary", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MaintenanceSummary" } } } } } }
+    },
+    "/api/maintenance/{id}": {
+      "patch": {
+        "tags": ["maintenance"], "summary": "Update maintenance record (operator+, audited)", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": { "200": { "description": "Updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MaintenanceRecord" } } } }, "404": { "description": "Not found" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/reports/fleet": {
+      "get": {
+        "tags": ["reports"], "summary": "Fleet report", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "period", "in": "query", "schema": { "type": "string", "enum": ["snapshot", "daily", "weekly", "monthly"], "default": "snapshot" } }],
+        "responses": { "200": { "description": "Snapshot rows, or window-aggregated rows for daily/weekly/monthly" } }
+      }
+    },
+    "/api/reports/fleet.csv": {
+      "get": { "tags": ["reports"], "summary": "Fleet snapshot report (CSV)", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "CSV", "content": { "text/csv": {} } } } }
+    },
+    "/api/config/tags": {
+      "get": { "tags": ["fleet"], "summary": "Standard tag dictionary", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Tags" } } }
+    },
+    "/api/config/rigs": {
+      "get": { "tags": ["fleet"], "summary": "Rig registry", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Rigs" } } }
+    },
+    "/api/users": {
+      "get": { "tags": ["users"], "summary": "List users (admin)", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Users (no password hashes)" }, "403": { "description": "Forbidden" } } },
+      "post": {
+        "tags": ["users"], "summary": "Create user (admin, audited)", "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["username", "password"], "properties": { "username": { "type": "string" }, "password": { "type": "string" }, "display": { "type": "string" }, "role": { "type": "string", "enum": ["admin", "operator", "viewer"] } } } } } },
+        "responses": { "200": { "description": "Created" }, "409": { "description": "Already exists" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/users/{username}": {
+      "patch": {
+        "tags": ["users"], "summary": "Update user role/disabled/password (admin, audited)", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "username", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Updated" }, "404": { "description": "Not found" }, "409": { "description": "Last-admin guard" }, "403": { "description": "Forbidden" } }
+      },
+      "delete": {
+        "tags": ["users"], "summary": "Delete user (admin, audited) — refuses self / last admin", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "username", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Deleted" }, "409": { "description": "Self / last-admin guard" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/audit": {
+      "get": {
+        "tags": ["audit"], "summary": "Read audit trail (admin, paginated, newest-first)", "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "maximum": 200, "default": 50 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } },
+          { "name": "action", "in": "query", "schema": { "type": "string" } },
+          { "name": "actor", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Audit page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuditPage" } } } }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/openapi.json": {
+      "get": { "tags": ["ops"], "summary": "This OpenAPI document", "responses": { "200": { "description": "OpenAPI 3 document" } } }
+    }
+  }
+}

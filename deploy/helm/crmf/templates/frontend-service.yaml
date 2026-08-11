@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  # FIXED name (not release-prefixed) — referenced by the Ingress "/" path and NetworkPolicy.
+  name: crmf-frontend
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "crmf.frontend.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.frontend.service.type }}
+  selector:
+    {{- include "crmf.frontend.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.frontend.service.port }}
+      targetPort: http
+      protocol: TCP

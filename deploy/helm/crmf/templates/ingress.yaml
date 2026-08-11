@@ -1,0 +1,69 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "crmf.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "crmf.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress
+  annotations:
+    # Large gzip store-and-forward /ingest batches.
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ .Values.ingress.proxyBodySize | quote }}
+    # Long-lived /socket.io websocket connections.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ .Values.ingress.proxyReadTimeout | quote }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ .Values.ingress.proxySendTimeout | quote }}
+    # WebSocket upgrade support for Socket.IO.
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    {{- if .Values.ingress.tls.enabled }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.clusterIssuer | quote }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName | quote }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          # Rig-edge store-and-forward ingestion (POST /ingest, gzip batches) -> backend.
+          # Must precede the "/" catch-all so it is not routed to the SPA frontend.
+          - path: /ingest
+            pathType: Prefix
+            backend:
+              service:
+                name: crmf-backend
+                port:
+                  number: {{ .Values.backend.service.port }}
+          # REST API (JWT-authed /api/*, incl. /metrics scrape stays in-cluster) -> backend.
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: crmf-backend
+                port:
+                  number: {{ .Values.backend.service.port }}
+          # WebSocket live updates -> backend.
+          - path: /socket.io
+            pathType: Prefix
+            backend:
+              service:
+                name: crmf-backend
+                port:
+                  number: {{ .Values.backend.service.port }}
+          # Everything else (React SPA static assets) -> frontend.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: crmf-frontend
+                port:
+                  number: {{ .Values.frontend.service.port }}
+{{- end }}

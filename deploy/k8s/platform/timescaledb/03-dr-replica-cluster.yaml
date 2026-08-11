@@ -1,0 +1,132 @@
+# =====================================================================
+# CRMF — Centralised Rig Monitoring Facility
+# Disaster-recovery standby cluster (proposal §5.3).
+#
+# *** RUNS AT THE SECOND ONGC DATA CENTRE ***  (DR site).
+#
+# This is a SECOND, independent CloudNativePG cluster running in
+# "replica" mode. It is a continuously-replicating standby that
+# bootstraps from the primary site's object store (recovery of the
+# latest base backup) and then keeps current by replaying WAL streamed
+# into the same MinIO/S3 bucket. It is READ-ONLY (designated primary
+# disabled) until promoted during a DR event — see README "DR promotion
+# runbook".
+#
+# Minimal 2-instance footprint (1 standby-leader + 1 replica) to keep
+# the DR site cheap while still surviving a node loss after promotion.
+#
+# MONITORING-ONLY: like the primary, this database never writes back to
+# any rig or PLC.
+# =====================================================================
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: crmf-timescaledb-dr
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: cloudnative-pg
+    app.kubernetes.io/name: crmf-timescaledb-dr
+    app.kubernetes.io/component: database-dr
+spec:
+  description: "CRMF TimescaleDB DR standby (second ONGC data centre)"
+  # MUST be the same TimescaleDB-enabled image as the primary so WAL
+  # replay and the timescaledb extension are binary-compatible.
+  imageName: ghcr.io/imusmanmalik/timescaledb-postgis:16
+  imagePullPolicy: IfNotPresent
+
+  instances: 2
+  primaryUpdateStrategy: unsupervised
+
+  storage:
+    size: 50Gi
+    # storageClass: ongc-dr-block
+  walStorage:
+    size: 20Gi
+    # storageClass: ongc-dr-block
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      cpu: "2"
+      memory: 8Gi
+
+  postgresql:
+    shared_preload_libraries:
+      - timescaledb
+    parameters:
+      max_connections: "200"
+      shared_buffers: "2GB"
+      effective_cache_size: "6GB"
+      timescaledb.telemetry_level: "off"
+      timescaledb.max_background_workers: "8"
+      max_worker_processes: "16"
+
+  # ---- Replica mode: continuous standby from the primary's bucket ----
+  # While replica.enabled=true this cluster has NO writable primary;
+  # it recovers + replays WAL from the "primarySite" external cluster.
+  # To promote during a DR failover, set replica.enabled: false (see
+  # README runbook) — CNPG then activates a primary here.
+  replica:
+    enabled: true
+    source: primarySite
+
+  bootstrap:
+    # Recover (bootstrap) from the primary site's object store.
+    recovery:
+      source: primarySite
+
+  # ---- External cluster = the primary site's Barman object store -----
+  # Same bucket the primary archives WAL/base backups into. Credentials
+  # are the DR site's read access to that MinIO/S3 bucket.
+  externalClusters:
+    - name: primarySite
+      barmanObjectStore:
+        serverName: crmf-timescaledb
+        destinationPath: s3://crmf-backups/crmf-timescaledb
+        # In-cluster MinIO Service "minio" serves plain HTTP on :9000 (#6). At a separate
+        # DR data centre, point this at that DC's replicated MinIO endpoint (http unless
+        # you terminate TLS in front of it).
+        endpointURL: http://minio:9000
+        s3Credentials:
+          accessKeyId:
+            name: crmf-backup-s3
+            key: ACCESS_KEY_ID
+          secretAccessKey:
+            name: crmf-backup-s3
+            key: SECRET_ACCESS_KEY
+        wal:
+          maxParallel: 4
+
+  # ---- DR site keeps its own backups once promoted -------------------
+  backup:
+    retentionPolicy: "30d"
+    barmanObjectStore:
+      # Distinct path so a promoted DR cluster doesn't clobber primary WAL.
+      destinationPath: s3://crmf-backups/crmf-timescaledb-dr
+      # In-cluster MinIO Service "minio" serves plain HTTP on :9000 (#6).
+      endpointURL: http://minio:9000
+      s3Credentials:
+        accessKeyId:
+          name: crmf-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: crmf-backup-s3
+          key: SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+        maxParallel: 4
+      data:
+        compression: gzip
+        jobs: 2
+
+  monitoring:
+    enablePodMonitor: true
+
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: preferred

@@ -1,0 +1,191 @@
+---
+# MLflow tracking server — CRMF model registry & experiment tracking (proposal §6.4, Phase 2).
+#
+# SCAFFOLDED / PHASE-2: this stands the tracking server up so data scientists can log
+# experiments and register models early, but no CRMF production path depends on it yet.
+#
+# Wiring:
+#   * Backend store  -> a dedicated database "mlflow" on the CNPG cluster crmf-timescaledb-rw
+#                       (Postgres backend-store-uri). The "mlflow" DB/role is provisioned by
+#                       the CNPG agent; credentials come from Secret crmf-mlflow-db.
+#   * Artifact store -> MinIO bucket s3://crmf-mlflow (S3 endpoint http://minio:9000).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crmf-mlflow
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: mlflow
+    app.kubernetes.io/component: ml-tracking
+automountServiceAccountToken: false
+---
+# Connection details for the MLflow Postgres backend store on the CNPG cluster.
+# Replace the password default in production (or materialise from Vault via ESO).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: crmf-mlflow-db
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: mlflow
+    app.kubernetes.io/component: ml-tracking
+type: Opaque
+stringData:
+  MLFLOW_DB_USER: "mlflow"
+  MLFLOW_DB_PASSWORD: "ChangeMe-MLflow-DB-Pass-7a31"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crmf-mlflow-config
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: mlflow
+    app.kubernetes.io/component: ml-tracking
+data:
+  MLFLOW_DB_HOST: "crmf-timescaledb-rw"
+  MLFLOW_DB_PORT: "5432"
+  MLFLOW_DB_NAME: "mlflow"
+  MLFLOW_ARTIFACT_ROOT: "s3://crmf-mlflow/"
+  MLFLOW_S3_ENDPOINT_URL: "http://minio:9000"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crmf-mlflow
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: mlflow
+    app.kubernetes.io/component: ml-tracking
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mlflow
+    app.kubernetes.io/component: ml-tracking
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crmf-mlflow
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: mlflow
+    app.kubernetes.io/component: ml-tracking
+    crmf.ongc.local/phase: "2"
+spec:
+  # PHASE-2 SCAFFOLD (#18): pinned to 0 to match the other honest scaffolds. Two reasons
+  # it cannot run as-shipped: (1) the entrypoint pip-installs drivers at container start
+  # against a community image (defeats readOnlyRootFilesystem and needs egress), and
+  # (2) it depends on an "mlflow" database/role on the CNPG cluster that NO manifest
+  # currently creates — the CNPG bootstrap only provisions "crmf". Before scaling to 1:
+  # add the mlflow DB/role to the CNPG cluster bootstrap and pre-bake the Python deps into
+  # a Harbor-mirrored image.
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mlflow
+      app.kubernetes.io/component: ml-tracking
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: crmf
+        app.kubernetes.io/managed-by: kubectl
+        app.kubernetes.io/name: mlflow
+        app.kubernetes.io/component: ml-tracking
+    spec:
+      serviceAccountName: crmf-mlflow
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mlflow
+          # Community MLflow image; pin/replace with a Harbor-mirrored tag in production.
+          image: ghcr.io/mlflow/mlflow:v2.16.2
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir --user psycopg2-binary boto3 >/dev/null 2>&1 || true
+              exec mlflow server \
+                --host 0.0.0.0 --port 5000 \
+                --backend-store-uri "postgresql://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@${MLFLOW_DB_HOST}:${MLFLOW_DB_PORT}/${MLFLOW_DB_NAME}" \
+                --default-artifact-root "${MLFLOW_ARTIFACT_ROOT}" \
+                --serve-artifacts
+          envFrom:
+            - configMapRef:
+                name: crmf-mlflow-config
+            - secretRef:
+                name: crmf-mlflow-db
+          env:
+            # S3/MinIO credentials for artifact access (reuse MinIO root or a scoped svcacct).
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: crmf-minio-credentials
+                  key: MINIO_ROOT_USER
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: crmf-minio-credentials
+                  key: MINIO_ROOT_PASSWORD
+            - name: HOME
+              value: /tmp
+            - name: PYTHONUSERBASE
+              value: /tmp/.local
+          ports:
+            - name: http
+              containerPort: 5000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            # readOnlyRootFilesystem not set: the entrypoint pip-installs drivers into
+            # /tmp/.local at start. Switch to true once a pre-baked image is mirrored to Harbor.
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

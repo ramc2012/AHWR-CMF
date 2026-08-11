@@ -1,0 +1,63 @@
+# =====================================================================
+# CRMF — Centralised Rig Monitoring Facility
+# Connection pooler (PgBouncer) in front of the primary, read-write.
+#
+# Optional. The backend can connect directly to crmf-timescaledb-rw,
+# but at FLEET_SIZE=50 rigs doing store-and-forward POST /ingest the
+# pooler smooths short connection bursts and caps backend connections
+# against the primary. Exposes Service "crmf-timescaledb-pooler-rw".
+#
+# To route the backend through the pooler, set PGHOST to
+# crmf-timescaledb-pooler-rw instead of crmf-timescaledb-rw.
+# =====================================================================
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: crmf-timescaledb-pooler-rw
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: cloudnative-pg
+    app.kubernetes.io/name: crmf-timescaledb
+    app.kubernetes.io/component: database-pooler
+spec:
+  cluster:
+    name: crmf-timescaledb
+  instances: 2
+  type: rw
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "1000"
+      default_pool_size: "50"
+      min_pool_size: "10"
+      reserve_pool_size: "10"
+      max_db_connections: "120"
+  monitoring:
+    enablePodMonitor: true
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: crmf
+        app.kubernetes.io/name: crmf-timescaledb
+        app.kubernetes.io/component: database-pooler
+    spec:
+      containers:
+        - name: pgbouncer
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault

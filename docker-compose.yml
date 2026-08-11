@@ -1,0 +1,126 @@
+# =====================================================================
+# CRMF - Centralised Rig Monitoring Facility
+# Standalone, independently deployable stack (proposal §3, §5, §6).
+#
+#   Quickstart:
+#       docker compose up -d --build
+#   Portal:   http://localhost:${FRONTEND_PORT:-8090}   (admin / Admin123)
+#
+# Real rig-edge sync agents POST store-and-forward batches to this backend's
+# /ingest endpoint over the ONGC WAN.
+#
+# MONITORING-ONLY: nothing in this stack writes back to any rig or PLC.
+# =====================================================================
+services:
+  # Canonical central store (proposal Â§6.4): TimescaleDB / PostgreSQL.
+  # Pin to a specific TimescaleDB release for production (e.g. 2.17.2-pg16);
+  # the moving `latest` tag is used here for local evaluation.
+  timescaledb:
+    image: ${TIMESCALE_IMAGE:-timescale/timescaledb:latest-pg15}
+    container_name: crmf_timescaledb
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${PGUSER:-crmf}
+      - POSTGRES_PASSWORD=${PGPASSWORD:?set PGPASSWORD in .env}
+      - POSTGRES_DB=${PGDATABASE:-crmf}
+    volumes:
+      - crmf_pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Audit #2: runs AFTER init.sql (lexical "zz-") to give the least-privilege role
+      # crmf_app a login password, so the backend connects as crmf_app (not the owner)
+      # and cannot tamper with the append-only audit_log. Fresh-volume init only.
+      - ./db/app-role-password.sh:/docker-entrypoint-initdb.d/zz-app-role-password.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-crmf} -d ${PGDATABASE:-crmf}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    # Uncomment to inspect the DB from the host (localhost only):
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+  # Ingestion + fleet portal API + live updates.
+  crmf-backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: crmf_backend
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=6000
+      - FRONTEND_PORT=${FRONTEND_PORT:-8090}
+      - INGEST_PORT=${INGEST_PORT:-6000}
+      - CENTRAL_HOST=${CENTRAL_HOST:-}
+      - PGHOST=timescaledb
+      - PGPORT=5432
+      # Offline-friendly DB login: use the main database user from .env so transferred volumes start reliably.
+      - PGUSER=${PGUSER:-crmf}
+      - PGPASSWORD=${PGPASSWORD:?set PGPASSWORD in .env}
+      - PGDATABASE=${PGDATABASE:-crmf}
+      - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET in .env}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-Admin123}
+      # Fail-closed ingest auth (#1): /ingest accepts a batch only if the bearer token
+      # matches a per-rig device token OR this global INGEST_TOKEN.
+      - INGEST_TOKEN=${INGEST_TOKEN:-AHWR-ETP-2026}
+      # Open-ingest escape hatch (#1): when no token is configured, /ingest still
+      # REJECTS (401) unless ALLOW_OPEN_INGEST=true AND NODE_ENV != production.
+      # Left unset here => fail-closed. Never set this in production.
+      - ALLOW_OPEN_INGEST=${ALLOW_OPEN_INGEST:-}
+      - FLEET_SIZE=${FLEET_SIZE:-2}
+      - SEED_RIG_NUMBERS=${SEED_RIG_NUMBERS:-3,6}
+      - CENTRAL_LATENCY_TARGET=${CENTRAL_LATENCY_TARGET:-30}
+      - OFFLINE_SEC=${OFFLINE_SEC:-120}
+      - CORS_ORIGIN=${CORS_ORIGIN:-}
+      # --- Alarm notifications (webhook/email). SMTP_* enables email. ---
+      - NOTIFY_ENABLED=${NOTIFY_ENABLED:-true}
+      - NOTIFY_MIN_SEVERITY=${NOTIFY_MIN_SEVERITY:-P1}
+      - NOTIFY_COOLDOWN_SEC=${NOTIFY_COOLDOWN_SEC:-120}
+      # --- Windows domain / Active Directory login (AUTH contract) ---
+      # Set AUTH_MODE=ldap or both and provide real LDAP_* values to enable AD login.
+      - AUTH_MODE=${AUTH_MODE:-local}             # local | ldap | both
+      - LDAP_URL=${LDAP_URL:-}
+      - LDAP_BIND_DN=${LDAP_BIND_DN:-}
+      - LDAP_BIND_PASSWORD=${LDAP_BIND_PASSWORD:-}
+      - LDAP_SEARCH_BASE=${LDAP_SEARCH_BASE:-}
+      - LDAP_SEARCH_FILTER=${LDAP_SEARCH_FILTER:-(|(uid={username})(cn={username})(sAMAccountName={username}))}
+      - LDAP_DOMAIN=${LDAP_DOMAIN:-ONGC}
+      - LDAP_DEFAULT_ROLE=${LDAP_DEFAULT_ROLE:-viewer}
+      - LDAP_ROLE_ADMIN=${LDAP_ROLE_ADMIN:-crmf-admins}
+      - LDAP_ROLE_OPERATOR=${LDAP_ROLE_OPERATOR:-crmf-operators}
+      - LDAP_ROLE_VIEWER=${LDAP_ROLE_VIEWER:-crmf-viewers}
+      - LDAP_STARTTLS=${LDAP_STARTTLS:-false}
+      - LDAP_TLS_REJECT_UNAUTHORIZED=${LDAP_TLS_REJECT_UNAUTHORIZED:-false}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    # Exposed so real rig-edge sync agents can reach /ingest over the WAN.
+    # In production this sits behind the API gateway / MQTT broker on the VPN.
+    ports:
+      - "${INGEST_PORT:-6000}:6000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:6000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  # Fleet portal (React/Vite/MUI) behind nginx â€” proxies /api and /socket.io.
+  crmf-frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: crmf_frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8090}:80"
+    depends_on:
+      crmf-backend:
+        condition: service_healthy
+
+volumes:
+  crmf_pgdata:
+
+
+

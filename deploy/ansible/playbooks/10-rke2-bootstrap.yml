@@ -1,0 +1,254 @@
+# =============================================================================
+# CRMF — Phase 1: RKE2 bootstrap
+#
+# Installs RKE2 across the control-plane (servers) and worker (agents) nodes,
+# wires the HA join token + TLS SANs, disables the bundled ingress (we install
+# ingress-nginx ourselves per the shared spec), and fetches an admin kubeconfig
+# rewritten to use the control-plane endpoint.
+#
+# Node roles come from inventory:
+#   rke2_node_role=server-bootstrap  -> first server, initialises the cluster
+#   rke2_node_role=server            -> additional control-plane servers
+#   (agents have no role var)        -> workers
+#
+# Defaults (rke2_version, rke2_join_token, rke2_tls_san, ...) live in
+# group_vars/all.yml. Override target with -e target_cluster=rke2_dr for DR.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1a. First server — initialise the cluster
+# ---------------------------------------------------------------------------
+- name: RKE2 — initialise first control-plane server
+  hosts: "{{ target_cluster | default('rke2_servers') }}"
+  become: true
+  gather_facts: true
+  serial: 1
+  vars:
+    rke2_install_url: "https://get.rke2.io"
+  tasks:
+    - name: Identify the bootstrap server
+      ansible.builtin.set_fact:
+        is_bootstrap: "{{ rke2_node_role | default('agent') == 'server-bootstrap' }}"
+
+    - name: Run bootstrap-server block
+      when: is_bootstrap | bool
+      block:
+        - name: Ensure RKE2 config directory exists
+          ansible.builtin.file:
+            path: /etc/rancher/rke2
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Write RKE2 server config (bootstrap)
+          ansible.builtin.copy:
+            dest: /etc/rancher/rke2/config.yaml
+            owner: root
+            group: root
+            mode: "0600"
+            content: |
+              # Managed by Ansible — CRMF bootstrap server
+              token: "{{ rke2_join_token }}"
+              cni: "{{ rke2_cni | default('cilium') }}"
+              write-kubeconfig-mode: "0600"
+              disable:
+              {% for d in rke2_disable | default([]) %}
+                - "{{ d }}"
+              {% endfor %}
+              tls-san:
+              {% for san in rke2_tls_san | default([]) %}
+                - "{{ san }}"
+              {% endfor %}
+              {% if rke2_system_default_registry | default('') | length > 0 %}
+              system-default-registry: "{{ rke2_system_default_registry }}"
+              {% endif %}
+
+        - name: Download RKE2 installer
+          ansible.builtin.get_url:
+            url: "{{ rke2_install_url }}"
+            dest: /tmp/rke2-install.sh
+            mode: "0755"
+
+        - name: Install RKE2 server (bootstrap)
+          ansible.builtin.command:
+            cmd: /tmp/rke2-install.sh
+          environment:
+            INSTALL_RKE2_TYPE: "server"
+            INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+            INSTALL_RKE2_CHANNEL: "{{ rke2_channel | default('stable') }}"
+          args:
+            creates: /usr/local/bin/rke2
+
+        - name: Enable and start rke2-server (bootstrap)
+          ansible.builtin.systemd:
+            name: rke2-server
+            enabled: true
+            state: started
+            daemon_reload: true
+
+        - name: Wait for kube-apiserver to be reachable
+          ansible.builtin.wait_for:
+            port: 6443
+            host: 127.0.0.1
+            timeout: 300
+
+        - name: Wait for node-token to be generated
+          ansible.builtin.wait_for:
+            path: /var/lib/rancher/rke2/server/node-token
+            timeout: 180
+
+# ---------------------------------------------------------------------------
+# 1b. Additional control-plane servers — join the cluster
+# ---------------------------------------------------------------------------
+- name: RKE2 — join additional control-plane servers
+  hosts: "{{ target_cluster | default('rke2_servers') }}"
+  become: true
+  gather_facts: true
+  serial: 1
+  vars:
+    rke2_install_url: "https://get.rke2.io"
+    bootstrap_host: "{{ crmf_bootstrap_host | default(groups[target_cluster | default('rke2_servers')][0]) }}"
+  tasks:
+    - name: Run additional-server block
+      when: (rke2_node_role | default('agent')) == 'server'
+      block:
+        - name: Ensure RKE2 config directory exists
+          ansible.builtin.file:
+            path: /etc/rancher/rke2
+            state: directory
+            mode: "0700"
+
+        - name: Write RKE2 server config (join)
+          ansible.builtin.copy:
+            dest: /etc/rancher/rke2/config.yaml
+            owner: root
+            group: root
+            mode: "0600"
+            content: |
+              # Managed by Ansible — CRMF control-plane (join)
+              server: "https://{{ hostvars[bootstrap_host].ansible_host }}:9345"
+              token: "{{ rke2_join_token }}"
+              cni: "{{ rke2_cni | default('cilium') }}"
+              write-kubeconfig-mode: "0600"
+              disable:
+              {% for d in rke2_disable | default([]) %}
+                - "{{ d }}"
+              {% endfor %}
+              tls-san:
+              {% for san in rke2_tls_san | default([]) %}
+                - "{{ san }}"
+              {% endfor %}
+
+        - name: Download RKE2 installer
+          ansible.builtin.get_url:
+            url: "{{ rke2_install_url }}"
+            dest: /tmp/rke2-install.sh
+            mode: "0755"
+
+        - name: Install RKE2 server (join)
+          ansible.builtin.command:
+            cmd: /tmp/rke2-install.sh
+          environment:
+            INSTALL_RKE2_TYPE: "server"
+            INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+            INSTALL_RKE2_CHANNEL: "{{ rke2_channel | default('stable') }}"
+          args:
+            creates: /usr/local/bin/rke2
+
+        - name: Enable and start rke2-server (join)
+          ansible.builtin.systemd:
+            name: rke2-server
+            enabled: true
+            state: started
+            daemon_reload: true
+
+# ---------------------------------------------------------------------------
+# 1c. Agents — join as workers
+# ---------------------------------------------------------------------------
+- name: RKE2 — join worker agents
+  hosts: "{{ 'dr_agents' if (target_cluster | default('rke2')) == 'rke2_dr' else 'rke2_agents' }}"
+  become: true
+  gather_facts: true
+  vars:
+    rke2_install_url: "https://get.rke2.io"
+    bootstrap_host: "{{ crmf_bootstrap_host | default(groups['rke2_servers'][0]) }}"
+  tasks:
+    - name: Ensure RKE2 config directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        mode: "0700"
+
+    - name: Write RKE2 agent config
+      ansible.builtin.copy:
+        dest: /etc/rancher/rke2/config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Managed by Ansible — CRMF worker agent
+          server: "https://{{ hostvars[bootstrap_host].ansible_host }}:9345"
+          token: "{{ rke2_join_token }}"
+          {% if node_labels is defined and node_labels | length > 0 %}
+          node-label:
+          {% for lbl in node_labels.split(',') %}
+            - "{{ lbl }}"
+          {% endfor %}
+          {% endif %}
+
+    - name: Download RKE2 installer
+      ansible.builtin.get_url:
+        url: "{{ rke2_install_url }}"
+        dest: /tmp/rke2-install.sh
+        mode: "0755"
+
+    - name: Install RKE2 agent
+      ansible.builtin.command:
+        cmd: /tmp/rke2-install.sh
+      environment:
+        INSTALL_RKE2_TYPE: "agent"
+        INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+        INSTALL_RKE2_CHANNEL: "{{ rke2_channel | default('stable') }}"
+      args:
+        creates: /usr/local/bin/rke2
+
+    - name: Enable and start rke2-agent
+      ansible.builtin.systemd:
+        name: rke2-agent
+        enabled: true
+        state: started
+        daemon_reload: true
+
+# ---------------------------------------------------------------------------
+# 1d. Fetch kubeconfig from the bootstrap server to the control host
+# ---------------------------------------------------------------------------
+- name: RKE2 — fetch admin kubeconfig
+  hosts: "{{ crmf_bootstrap_host | default('crmf-cp1') }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read kubeconfig from the server
+      ansible.builtin.slurp:
+        src: /etc/rancher/rke2/rke2.yaml
+      register: rke2_kubeconfig_raw
+
+    - name: Ensure local artifacts directory exists
+      ansible.builtin.file:
+        path: "{{ kubeconfig_local_path | dirname }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Write kubeconfig locally with the cluster endpoint substituted
+      ansible.builtin.copy:
+        dest: "{{ kubeconfig_local_path }}"
+        mode: "0600"
+        content: "{{ rke2_kubeconfig_raw.content | b64decode | replace('127.0.0.1', rke2_api_endpoint) }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Report kubeconfig location
+      ansible.builtin.debug:
+        msg: "Kubeconfig written to {{ kubeconfig_local_path }} (endpoint: {{ rke2_api_endpoint }})"

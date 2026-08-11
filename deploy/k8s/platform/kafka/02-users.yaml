@@ -1,0 +1,116 @@
+# =============================================================================
+# CRMF Ingestion Backbone — Kafka Users + ACLs (Strimzi KafkaUser CRs)
+# Proposal §6.4. Managed by the Strimzi User Operator on cluster crmf-kafka.
+#
+# SCRAM-SHA-512 credentials. The User Operator writes each user's password into
+# a Secret named after the KafkaUser (e.g. Secret "crmf-backend" key "password",
+# and a ready-to-use "sasl.jaas.config"). The backend Deployment mounts/refs
+# that Secret; this is separate from the platform "crmf-secrets" Secret.
+#
+# Principle of least privilege:
+#   crmf-backend  — produces telemetry + events (HTTP /ingest -> Kafka),
+#                   consumes derived.channels (to fan out live updates over
+#                   /socket.io). Read-only on derived; never produces derived.
+#   crmf-stream   — consumes telemetry + events, produces derived.channels.
+#                   This is the only principal allowed to write derived signals.
+# =============================================================================
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: crmf-backend
+  namespace: crmf
+  labels:
+    strimzi.io/cluster: crmf-kafka
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: strimzi
+    app.kubernetes.io/name: kafka-user
+    app.kubernetes.io/component: backend
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # ---- Produce: telemetry.ingest -------------------------------------
+      - resource:
+          type: topic
+          name: telemetry.ingest
+          patternType: literal
+        operations: [Describe, Write]
+        host: "*"
+      # ---- Produce: all events.* topics ----------------------------------
+      - resource:
+          type: topic
+          name: events.
+          patternType: prefix
+        operations: [Describe, Write]
+        host: "*"
+      # ---- Consume: derived.channels (live fan-out) ----------------------
+      - resource:
+          type: topic
+          name: derived.channels
+          patternType: literal
+        operations: [Describe, Read]
+        host: "*"
+      # Consumer group for the backend's derived.channels reader.
+      - resource:
+          type: group
+          name: crmf-backend
+          patternType: prefix
+        operations: [Read]
+        host: "*"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: crmf-stream
+  namespace: crmf
+  labels:
+    strimzi.io/cluster: crmf-kafka
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: strimzi
+    app.kubernetes.io/name: kafka-user
+    app.kubernetes.io/component: stream-processor
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # ---- Consume: raw telemetry ----------------------------------------
+      - resource:
+          type: topic
+          name: telemetry.ingest
+          patternType: literal
+        operations: [Describe, Read]
+        host: "*"
+      # ---- Consume: all events.* -----------------------------------------
+      - resource:
+          type: topic
+          name: events.
+          patternType: prefix
+        operations: [Describe, Read]
+        host: "*"
+      # ---- Produce: derived.channels (sole writer) -----------------------
+      - resource:
+          type: topic
+          name: derived.channels
+          patternType: literal
+        operations: [Describe, Write]
+        host: "*"
+      # ---- Kafka Streams internal topics (changelog / repartition) -------
+      # Kafka Streams auto-creates <application.id>-* internal topics and needs
+      # full rights on them plus its consumer group.
+      - resource:
+          type: topic
+          name: crmf-stream-
+          patternType: prefix
+        operations: [Describe, Read, Write, Create, Delete]
+        host: "*"
+      - resource:
+          type: group
+          name: crmf-stream
+          patternType: prefix
+        operations: [Read]
+        host: "*"

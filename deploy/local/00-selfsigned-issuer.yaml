@@ -1,0 +1,12 @@
+# Local stand-in for the production cert-manager ClusterIssuer
+# (prod uses "letsencrypt-or-ongc-ca"; values-local.yaml points the chart's
+# ingress.tls.clusterIssuer at THIS issuer instead). A self-signed issuer means
+# the Ingress gets a real cert-manager-issued TLS cert (self-signed) into the
+# crmf-tls Secret — same wiring as prod, no public CA needed. The browser will
+# warn about the self-signed cert; that is expected locally.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: crmf-selfsigned
+spec:
+  selfSigned: {}

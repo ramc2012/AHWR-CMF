@@ -1,0 +1,71 @@
+# Helm values overlay for the LOCAL kind deploy. Layered over the chart defaults
+# (deploy/helm/crmf/values.yaml). Keeps the production SHAPE — HPA, PDB, NetworkPolicy,
+# Ingress+TLS, DB-aware readiness / DB-free liveness — but trims replicas and points at
+# local images / a self-signed issuer / the local single-node TimescaleDB.
+#
+#   helm upgrade --install crmf ../helm/crmf -n crmf -f values-local.yaml
+
+image:
+  # The chart builds "<registry>/<repository>:<tag>"; up.sh retags the already-built
+  # compose images to exactly these refs and `kind load`s them into the node.
+  registry: harbor.ongc.local
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent      # use the kind-loaded image; never reach for a real registry
+
+backend:
+  replicaCount: 1               # prod: 2-3 (HPA floor). HPA still manages this (see below).
+
+frontend:
+  replicaCount: 1               # prod: 2-3
+
+ingress:
+  enabled: true
+  className: nginx
+  host: crmf.localtest.me       # *.localtest.me resolves to 127.0.0.1 — no /etc/hosts edit
+  tls:
+    enabled: true
+    secretName: crmf-tls
+    clusterIssuer: crmf-selfsigned   # the local self-signed ClusterIssuer (00-selfsigned-issuer.yaml)
+
+# Real HPA — metrics-server is installed by up.sh so `kubectl get hpa` shows live CPU%.
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# NetworkPolicy objects are applied AND ENFORCED — recent kindnet enforces NetworkPolicy,
+# so the default-deny + explicit allows actually filter traffic (the demo fleet-sim needs
+# its own allow policy in 20-fleet-sim-local.yaml to reach the backend).
+networkPolicy:
+  enabled: true
+
+# No Prometheus Operator in the core tier, so don't render a ServiceMonitor (its CRD
+# is absent and the apply would fail). The `full` tier can flip this on.
+serviceMonitor:
+  enabled: false
+
+# Render the crmf-secrets Secret from the values below (no Vault/ESO locally).
+externalSecret:
+  enabled: false
+
+config:
+  FLEET_SIZE: "50"
+  # Connect as the least-privilege crmf_app role (NOT the chart default `crmf`). Under CNPG
+  # the schema runs as `postgres`, so only crmf_app holds table privileges — the schema's
+  # own comment says the app should use crmf_app. PGHOST/PGDATABASE inherit the chart
+  # defaults (crmf-timescaledb-rw / crmf), which match the local CNPG cluster.
+  PGUSER: crmf_app
+
+# DEMO-ONLY local secrets. PGPASSWORD MUST equal the crmf-db-app password in
+# 10-timescaledb-local.yaml; INGEST_TOKEN MUST equal the fleet-sim token; log in with
+# admin / <ADMIN_PASSWORD>. NEVER use these values anywhere real.
+secrets:
+  PGPASSWORD: "crmf-local-pg"
+  JWT_SECRET: "local-dev-jwt-secret-not-for-real-use"
+  INGEST_TOKEN: "crmf-demo-ingest-token"
+  ADMIN_PASSWORD: "admin123"

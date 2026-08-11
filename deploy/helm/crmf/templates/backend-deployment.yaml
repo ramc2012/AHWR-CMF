@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "crmf.fullname" . }}-backend
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "crmf.backend.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.backend.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "crmf.backend.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "crmf.backend.labels" . | nindent 8 }}
+      annotations:
+        # Roll pods when config/secret content changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.externalSecret.enabled }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.backend.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "crmf.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: backend
+          image: {{ include "crmf.backend.image" . | quote }}
+          imagePullPolicy: {{ default .Values.image.pullPolicy .Values.backend.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.backend.containerPort }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: crmf-config
+            - secretRef:
+                name: crmf-secrets
+          {{- $kafkaOn := eq (.Values.config.KAFKA_ENABLED | toString) "true" }}
+          {{- if and $kafkaOn .Values.kafka.tls.enabled }}
+          env:
+            # Kafka TLS CA trust (#19): only injected when Kafka is on AND TLS trust is
+            # wired, so kafkajs validates the Strimzi self-signed broker cert.
+            - name: KAFKA_SSL_CA
+              value: {{ printf "%s/%s" .Values.kafka.tls.mountPath .Values.kafka.tls.caFileName | quote }}
+          {{- end }}
+          # Readiness is DB-aware (/healthz does SELECT 1): a DB blip drains traffic
+          # from this pod without killing it.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Liveness is DB-FREE (/livez = process-liveness only, no DB call) so a
+          # transient TimescaleDB outage / CNPG switchover cannot trigger a fleet-wide
+          # restart storm (#10). Only a wedged event loop fails this probe.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if and (eq (.Values.config.KAFKA_ENABLED | toString) "true") .Values.kafka.tls.enabled }}
+            # Strimzi cluster CA cert, read-only (#19).
+            - name: kafka-ca
+              mountPath: {{ .Values.kafka.tls.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        # readOnlyRootFilesystem=true => provide a writable scratch dir.
+        - name: tmp
+          emptyDir: {}
+        {{- if and (eq (.Values.config.KAFKA_ENABLED | toString) "true") .Values.kafka.tls.enabled }}
+        - name: kafka-ca
+          secret:
+            secretName: {{ .Values.kafka.tls.caSecretName | quote }}
+            items:
+              - key: {{ .Values.kafka.tls.caSecretKey | quote }}
+                path: {{ .Values.kafka.tls.caFileName | quote }}
+        {{- end }}
+      {{- with .Values.backend.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backend.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backend.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

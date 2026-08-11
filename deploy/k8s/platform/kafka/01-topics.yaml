@@ -1,0 +1,119 @@
+# =============================================================================
+# CRMF Ingestion Backbone — Kafka Topics (Strimzi KafkaTopic CRs)
+# Proposal §6.4. Managed by the Strimzi Topic Operator on cluster crmf-kafka.
+#
+# Topic design (see ../mqtt/README.md for the full rationale):
+#   telemetry.ingest    canonical raw telemetry, high-volume, 12 partitions, 7d
+#   events.alarm        ESD / lockout / threshold alarms (read-only signals)
+#   events.connection   rig online/offline transitions (OFFLINE_SEC heartbeats)
+#   events.activity     operational activity / state-change events
+#   derived.channels    compacted, latest-value-per-key derived signals
+#
+# Partition key convention: rigId (or rigId|channel for derived.channels) so a
+# rig's stream is ordered and co-partitioned across topics.
+# =============================================================================
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: telemetry.ingest
+  namespace: crmf
+  labels:
+    strimzi.io/cluster: crmf-kafka
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: strimzi
+    app.kubernetes.io/name: kafka-topic
+    app.kubernetes.io/component: ingestion
+spec:
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: "604800000"          # 7 days
+    segment.bytes: "1073741824"        # 1 GiB segments
+    cleanup.policy: "delete"
+    max.message.bytes: "10485760"      # 10 MiB — matches broker message.max.bytes
+    min.insync.replicas: "2"
+    compression.type: "producer"       # preserve gzip from rig-edge batches
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: events.alarm
+  namespace: crmf
+  labels:
+    strimzi.io/cluster: crmf-kafka
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: strimzi
+    app.kubernetes.io/name: kafka-topic
+    app.kubernetes.io/component: events
+spec:
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "2592000000"         # 30 days — alarms kept longer for audit
+    cleanup.policy: "delete"
+    min.insync.replicas: "2"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: events.connection
+  namespace: crmf
+  labels:
+    strimzi.io/cluster: crmf-kafka
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: strimzi
+    app.kubernetes.io/name: kafka-topic
+    app.kubernetes.io/component: events
+spec:
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "2592000000"         # 30 days
+    cleanup.policy: "delete"
+    min.insync.replicas: "2"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: events.activity
+  namespace: crmf
+  labels:
+    strimzi.io/cluster: crmf-kafka
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: strimzi
+    app.kubernetes.io/name: kafka-topic
+    app.kubernetes.io/component: events
+spec:
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "1209600000"         # 14 days
+    cleanup.policy: "delete"
+    min.insync.replicas: "2"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: derived.channels
+  namespace: crmf
+  labels:
+    strimzi.io/cluster: crmf-kafka
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: strimzi
+    app.kubernetes.io/name: kafka-topic
+    app.kubernetes.io/component: derived
+spec:
+  partitions: 12
+  replicas: 3
+  config:
+    # Compacted: keep the latest value per key (rigId|channel) so the stream
+    # processor and any consumer can rebuild current derived state on restart.
+    # A long delete retention floor is kept alongside compaction so recent
+    # history is queryable as a changelog.
+    cleanup.policy: "compact,delete"
+    retention.ms: "604800000"          # 7 days of changelog history
+    segment.bytes: "536870912"         # 512 MiB
+    min.cleanable.dirty.ratio: "0.1"
+    delete.retention.ms: "86400000"    # 1 day tombstone retention
+    min.insync.replicas: "2"

@@ -1,0 +1,172 @@
+# =============================================================================
+# CRMF — Phase 3: platform CRs + application chart
+#
+# Applies the platform custom resources (deploy/k8s/platform) in dependency
+# order, then helm-installs the CRMF app chart (deploy/helm/crmf) with
+# values-prod.yaml.
+#
+# Order matters:
+#   1. namespace + image pull secret (Harbor)
+#   2. CloudNativePG Cluster (crmf-timescaledb) — DB must exist before backend
+#   3. Strimzi Kafka + topics/users (optional)
+#   4. Keycloak + realm import (OIDC issuer)
+#   5. MinIO tenant (CNPG backup target)
+#   6. any remaining platform CRs (MQTT bridge, ServiceMonitors, etc.)
+#   7. helm upgrade --install crmf  (backend + frontend + ingress + HPA + PDB)
+#
+# Runs from the control host against the fetched kubeconfig (kubernetes.core).
+# =============================================================================
+
+- name: Deploy CRMF platform + application
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    kubeconfig: "{{ kubeconfig_local_path }}"
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig_local_path }}"
+  tasks:
+
+    # ---- 1. Namespace + image pull secret -----------------------------------
+    - name: Ensure crmf namespace exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ crmf_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: crmf
+              app.kubernetes.io/managed-by: ansible
+              app.kubernetes.io/name: crmf
+
+    - name: Create Harbor image pull secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ crmf_image_pull_secret }}"
+            namespace: "{{ crmf_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: crmf
+              app.kubernetes.io/managed-by: ansible
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: "{{ docker_config_json | to_json | b64encode }}"
+      vars:
+        docker_config_json:
+          auths:
+            "{{ harbor_registry }}":
+              username: "{{ harbor_robot_user }}"
+              password: "{{ harbor_robot_password }}"
+              auth: "{{ (harbor_robot_user ~ ':' ~ harbor_robot_password) | b64encode }}"
+      no_log: true
+
+    # ---- 2-6. Apply platform CRs in subdirectory order ----------------------
+    # Each ordered subdir is applied as a unit; absent dirs are skipped so this
+    # stays correct while sibling agents are still populating deploy/k8s/platform.
+    - name: Apply platform CRs in order
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ crmf_namespace }}"
+        src: "{{ item }}"
+        apply: true
+        wait: true
+        wait_timeout: 600
+      loop: "{{ platform_manifest_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      vars:
+        # Deterministic apply order. Platform CRs live under numbered/grouped
+        # subdirs; sorting the recursive glob gives storage/DB before messaging
+        # before identity before the rest (authors prefix dirs/files with the
+        # subdir name so a lexical sort is the intended order). Plain sort keeps
+        # CR ordering stable while sibling agents are still adding files.
+        platform_manifest_files: >-
+          {{ lookup('ansible.builtin.fileglob', crmf_platform_dir ~ '/**/*.yaml', wantlist=True) | sort }}
+      when:
+        - crmf_platform_dir is defined
+        - (lookup('ansible.builtin.fileglob', crmf_platform_dir ~ '/**/*.yaml', wantlist=True) | length) > 0
+
+    - name: Wait for CloudNativePG cluster to be ready
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Cluster
+        name: "{{ cnpg_cluster_name }}"
+        namespace: "{{ crmf_namespace }}"
+      register: cnpg_cluster
+      until:
+        - cnpg_cluster.resources | length > 0
+        - (cnpg_cluster.resources[0].status.readyInstances | default(0)) >= 1
+      retries: 60
+      delay: 10
+      when: cnpg_cluster_name is defined
+
+    # ---- 7. Helm install the application chart ------------------------------
+    - name: Helm upgrade --install CRMF app chart
+      kubernetes.core.helm:
+        name: "{{ crmf_release_name }}"
+        chart_ref: "{{ crmf_chart_path }}"
+        release_namespace: "{{ crmf_namespace }}"
+        create_namespace: false
+        kubeconfig: "{{ kubeconfig }}"
+        values_files:
+          - "{{ crmf_chart_values }}"
+        # NOTE: these paths MUST match the chart's values.yaml schema exactly,
+        # otherwise the overrides are silently ignored.
+        values:
+          image:
+            registry: "{{ harbor_registry }}"
+            tag: "{{ image_tag }}"
+            pullSecrets:
+              - name: "{{ crmf_image_pull_secret }}"
+          backend:
+            image:
+              repository: "{{ image_backend_repo }}"
+          frontend:
+            image:
+              repository: "{{ image_frontend_repo }}"
+          ingress:
+            host: "{{ crmf_host }}"
+            tls:
+              clusterIssuer: "{{ cert_manager_cluster_issuer }}"
+        wait: true
+        timeout: "15m0s"
+        atomic: true
+
+    - name: Wait for backend rollout
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: crmf-backend
+        namespace: "{{ crmf_namespace }}"
+      register: be_dep
+      until:
+        - be_dep.resources | length > 0
+        - (be_dep.resources[0].status.availableReplicas | default(0)) >= 1
+      retries: 60
+      delay: 10
+
+    - name: Wait for frontend rollout
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: crmf-frontend
+        namespace: "{{ crmf_namespace }}"
+      register: fe_dep
+      until:
+        - fe_dep.resources | length > 0
+        - (fe_dep.resources[0].status.availableReplicas | default(0)) >= 1
+      retries: 60
+      delay: 10
+
+    - name: CRMF deploy complete
+      ansible.builtin.debug:
+        msg: >-
+          CRMF deployed to namespace '{{ crmf_namespace }}'. Portal:
+          https://{{ crmf_host }}/  |  API: https://{{ crmf_host }}/api  |
+          Ingest: https://{{ crmf_host }}/ingest (monitoring-only; no PLC write-back).

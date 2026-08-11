@@ -1,0 +1,119 @@
+# LOCAL-sized TimescaleDB — same CloudNativePG (CNPG) operator + same bootstrap/schema
+# wiring as the production cluster (k8s/platform/timescaledb/00-cluster.yaml), but shrunk
+# to fit a laptop: ONE instance (prod = 3 HA), ~512Mi (prod = 4-8Gi), 2Gi disk (prod =
+# 50Gi+20Gi WAL), and NO Barman/MinIO backup or PodMonitor. The deployment MECHANICS are
+# identical — a CRD-managed Postgres that the operator provisions, health-checks, and
+# (at 3 instances) would auto-fail-over. Schema comes from the SAME crmf-schema ConfigMap
+# the prod cluster uses (applied by up.sh from k8s/platform/timescaledb/01-schema-configmap.yaml).
+---
+# Owner credentials for database "crmf" (CNPG reads username/password from here at initdb).
+# The password MUST equal values-local.yaml secrets.PGPASSWORD so the backend can connect.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: crmf-db-app
+  namespace: crmf
+type: kubernetes.io/basic-auth
+stringData:
+  username: crmf
+  password: crmf-local-pg
+---
+# Superuser (needed so CREATE EXTENSION timescaledb succeeds during bootstrap).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: crmf-db-superuser
+  namespace: crmf
+type: kubernetes.io/basic-auth
+stringData:
+  username: postgres
+  password: crmf-local-su
+---
+# Login credentials for the least-privilege application role `crmf_app`. The canonical
+# schema (init.sql) CREATEs crmf_app and GRANTs it DML on the operational tables, and its
+# own comment says "the application SHOULD connect as crmf_app". Under CNPG the schema runs
+# as `postgres` (so postgres owns the tables and the `crmf` owner role has NO privileges) —
+# so the app MUST connect as crmf_app. CNPG `managed.roles` (below) sets this password on
+# the role the schema created. The password MUST equal values-local.yaml secrets.PGPASSWORD.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: crmf-db-app-login
+  namespace: crmf
+type: kubernetes.io/basic-auth
+stringData:
+  username: crmf_app
+  password: crmf-local-pg
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: crmf-timescaledb
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/name: crmf-timescaledb
+    app.kubernetes.io/component: database
+spec:
+  description: "CRMF TimescaleDB — LOCAL single-node (kind)"
+  # LOCAL arm64: a CNPG-compatible TimescaleDB image built natively on this machine
+  # (see timescaledb-cnpg.Dockerfile). The production CR's
+  # ghcr.io/imusmanmalik/timescaledb-postgis:16 is amd64-ONLY and cannot pull on an arm64
+  # kind node ("no match for platform in manifest"). up.sh builds + kind-loads this image.
+  imageName: crmf/timescaledb-cnpg:16
+  imagePullPolicy: IfNotPresent
+
+  instances: 1                       # prod: 3 (1 primary + 2 sync/async standby)
+  primaryUpdateStrategy: unsupervised
+
+  storage:
+    size: 2Gi                        # prod: 50Gi (+ 20Gi separate WAL volume)
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  postgresql:
+    shared_preload_libraries:
+      - timescaledb                  # required for the timescaledb extension to load
+    parameters:
+      max_connections: "100"
+      shared_buffers: "128MB"
+      effective_cache_size: "384MB"
+      work_mem: "8MB"
+      maintenance_work_mem: "128MB"
+      timescaledb.telemetry_level: "off"
+
+  # Fresh init of database "crmf" owned by "crmf", then apply the canonical CRMF schema.
+  bootstrap:
+    initdb:
+      database: crmf
+      owner: crmf
+      secret:
+        name: crmf-db-app
+      postInitApplicationSQLRefs:
+        configMapRefs:
+          - name: crmf-schema
+            key: init.sql
+
+  enableSuperuserAccess: true
+  superuserSecret:
+    name: crmf-db-superuser
+
+  # Give the schema-created crmf_app role a login password (reconciled AFTER bootstrap,
+  # so the role already exists). The app connects as crmf_app (see values-local.yaml).
+  managed:
+    roles:
+      - name: crmf_app
+        ensure: present
+        login: true
+        passwordSecret:
+          name: crmf-db-app-login
+
+  # Local single-node: no backup, no PodMonitor (no Prometheus operator in the core tier).
+  monitoring:
+    enablePodMonitor: false

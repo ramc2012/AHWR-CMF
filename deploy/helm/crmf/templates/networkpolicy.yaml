@@ -1,0 +1,175 @@
+{{- if .Values.networkPolicy.enabled }}
+# -----------------------------------------------------------------------------
+# Default-deny all ingress + egress for CRMF app pods, then explicitly allow:
+#   - ingress-nginx controller -> frontend:80 and backend:6000
+#   - backend  -> TimescaleDB RW :5432
+#   - backend  -> Kafka (when enabled) and Keycloak/OIDC (when enabled) egress
+#   - DNS (kube-dns) egress for all app pods
+# Monitoring-only: no policy permits any egress back toward rigs/PLCs.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crmf.fullname" . }}-default-deny
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "crmf.labels" . | nindent 4 }}
+    app.kubernetes.io/component: networkpolicy
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "crmf.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Allow DNS resolution (UDP/TCP 53) to kube-dns for all app pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crmf.fullname" . }}-allow-dns
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "crmf.labels" . | nindent 4 }}
+    app.kubernetes.io/component: networkpolicy
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "crmf.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Allow the ingress-nginx controller to reach the frontend on :80.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crmf.fullname" . }}-allow-ingress-frontend
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "crmf.frontend.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "crmf.frontend.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressControllerNamespaceLabel | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.frontend.containerPort }}
+---
+# Allow the ingress-nginx controller to reach the backend on :6000
+# (/api, POST /ingest, /socket.io websockets).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crmf.fullname" . }}-allow-ingress-backend
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "crmf.backend.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "crmf.backend.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # ingress-nginx controller (application traffic).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressControllerNamespaceLabel | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.backend.containerPort }}
+    {{- if .Values.serviceMonitor.enabled }}
+    # Prometheus scrape of /metrics on the backend http port.
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: {{ .Values.backend.containerPort }}
+    {{- end }}
+---
+# Backend egress to the TimescaleDB RW primary (:5432), Kafka and Keycloak/OIDC.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crmf.fullname" . }}-allow-backend-egress
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "crmf.backend.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "crmf.backend.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # -> TimescaleDB primary RW service (CloudNativePG) in this namespace.
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: crmf-timescaledb
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.timescaledb.port }}
+    {{- if eq (.Values.config.KAFKA_ENABLED | toString) "true" }}
+    # -> Kafka brokers (Strimzi) when KAFKA_ENABLED.
+    - to:
+        - podSelector:
+            matchLabels:
+              strimzi.io/cluster: crmf-kafka
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.kafka.port }}
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.kafka.tlsPort }}
+    {{- end }}
+    {{- if eq (.Values.config.OIDC_ENABLED | toString) "true" }}
+    # -> Keycloak (OIDC JWKS fetch) when OIDC_ENABLED. Allow BOTH the direct
+    #    in-namespace Keycloak pod AND the ingress-nginx controller on 443, because
+    #    OIDC_JWKS_URI uses the public host (keycloak.ongc.local) which routes via
+    #    the ingress controller.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: keycloak
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.keycloak.port }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressControllerNamespaceLabel | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if eq (.Values.config.NOTIFY_ENABLED | toString) "true" }}
+    # -> Outbound alarm notifications (webhook HTTPS + SMTP) when NOTIFY_ENABLED.
+    #    Targets are operator-configured at runtime, so this allows egress by port.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.notify.httpsPort }}
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.notify.smtpPort }}
+    {{- end }}
+{{- end }}

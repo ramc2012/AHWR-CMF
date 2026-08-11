@@ -1,0 +1,54 @@
+---
+# Default-deny baseline for the crmf namespace.
+# This denies ALL ingress and egress for every pod in the namespace. Each workload
+# (backend, frontend, timescaledb, kafka, keycloak, minio, ingress traffic, scraping,
+# etc.) must then be explicitly allowed by its own NetworkPolicy owned by that agent.
+# Because policies are additive, this object only needs to establish the deny baseline.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: default-deny-all
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}            # selects every pod in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress/egress rules == deny everything by default.
+---
+# Allow DNS resolution to CoreDNS for every pod. Without this, the default-deny-all
+# policy above would break name resolution for ALL workloads (crmf-timescaledb-rw,
+# Kafka brokers, Keycloak, MinIO, Vault, external OIDC/ACME, etc.).
+# Allows egress to kube-dns on UDP/TCP 53 cluster-wide (kube-system namespace).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: allow-dns-egress
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}            # applies to every pod
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

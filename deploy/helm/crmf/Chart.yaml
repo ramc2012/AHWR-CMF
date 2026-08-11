@@ -1,0 +1,22 @@
+apiVersion: v2
+name: crmf
+version: 1.0.0
+appVersion: "1.0.0"
+description: >-
+  Centralised Rig Monitoring Facility (CRMF) application chart. Deploys the
+  monitoring-only backend (Node/Express/Socket.IO ingest + REST + websockets,
+  Prometheus metrics) and the React/nginx frontend, with ingress path-routing,
+  autoscaling, PDBs, NetworkPolicies and a ServiceMonitor. Data/platform
+  services (TimescaleDB/CloudNativePG, Kafka/Strimzi, Keycloak) are provided by
+  separate charts.
+type: application
+keywords:
+  - crmf
+  - monitoring
+  - telemetry
+  - rig
+  - ahwr
+home: https://crmf.ongc.local
+maintainers:
+  - name: CRMF Platform Team
+    email: crmf-platform@ongc.local

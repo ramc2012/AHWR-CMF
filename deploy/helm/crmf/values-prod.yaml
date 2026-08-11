@@ -1,0 +1,64 @@
+# Production overrides for the CRMF application chart.
+# Apply with:  helm upgrade --install crmf ./crmf -n crmf -f values-prod.yaml
+
+image:
+  registry: harbor.ongc.local
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+  pullSecrets:
+    - name: harbor-pull-secret
+
+backend:
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: "1Gi"
+
+frontend:
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+ingress:
+  enabled: true
+  className: nginx
+  host: crmf.ongc.local
+  proxyBodySize: "64m"
+  proxyReadTimeout: "3600"
+  proxySendTimeout: "3600"
+  tls:
+    enabled: true
+    secretName: crmf-tls
+    clusterIssuer: letsencrypt-or-ongc-ca
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+networkPolicy:
+  enabled: true
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  labels:
+    release: kube-prometheus-stack
+
+# PRODUCTION: secrets MUST come from an ExternalSecret / Vault, never plaintext.
+externalSecret:
+  enabled: true

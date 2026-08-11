@@ -1,0 +1,117 @@
+# =============================================================================
+# CRMF Identity Layer — Keycloak instance (Keycloak Operator)
+# -----------------------------------------------------------------------------
+# Deploys a 2-instance (HA) Keycloak managed by the Keycloak Operator
+# (k8s.keycloak.org/v2alpha1). Backed by the dedicated CloudNativePG cluster
+# defined in 01-keycloak-db.yaml.
+#
+# Proposal §6.5: Keycloak federated with ONGC Active Directory; RBAC by rig and
+# role. This file stands up the server; realm/clients/LDAP federation are
+# imported via 02-realm.yaml (KeycloakRealmImport).
+#
+# External URL (via Ingress / cert-manager TLS): https://keycloak.ongc.local
+# The backend OIDC issuer therefore resolves to:
+#   https://keycloak.ongc.local/realms/ongc
+# =============================================================================
+---
+# -----------------------------------------------------------------------------
+# Database connection credential reference for Keycloak.
+# We reuse the CNPG-generated app secret (crmf-keycloak-db-app), but Keycloak's
+# `db.usernameSecret`/`db.passwordSecret` expect specific keys. The CNPG
+# basic-auth secret exposes "username" and "password", which we map below.
+# -----------------------------------------------------------------------------
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: Keycloak
+metadata:
+  name: crmf-keycloak
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: keycloak-operator
+    app.kubernetes.io/name: crmf-keycloak
+    app.kubernetes.io/component: identity-provider
+spec:
+  # HA: 2 server replicas behind the operator-managed Service.
+  instances: 2
+
+  # Pin a stable Keycloak image; the operator defaults to a matching version,
+  # but pinning keeps upgrades explicit.
+  image: quay.io/keycloak/keycloak:25.0.6
+
+  # External hostname. The operator can manage its own Ingress, but in CRMF the
+  # platform Ingress (NGINX) terminates TLS for keycloak.ongc.local. We disable
+  # the operator-managed ingress and expose strict mode for correct URLs behind
+  # the reverse proxy.
+  hostname:
+    hostname: keycloak.ongc.local
+    strict: false
+
+  # Let the platform NGINX Ingress front Keycloak instead of the operator's
+  # default ingress object (keeps all north-south routing in one place).
+  ingress:
+    enabled: false
+
+  # ---------------------------------------------------------------------------
+  # HTTP / TLS. TLS is terminated upstream at NGINX Ingress using the
+  # cert-manager-issued certificate. We therefore run Keycloak with HTTP enabled
+  # behind the proxy and trust X-Forwarded-* headers.
+  #
+  # If you prefer end-to-end TLS into the pod, set `tlsSecret` to a cert-manager
+  # Certificate secret for keycloak.ongc.local and remove http.httpEnabled.
+  # ---------------------------------------------------------------------------
+  http:
+    httpEnabled: true
+    httpPort: 8080
+    httpsPort: 8443
+  # cert-manager-managed serving certificate for in-cluster TLS (optional but
+  # provided so the manifest is complete and apply-ready when end-to-end TLS is
+  # desired). The Ingress agent references the public cert separately.
+  # tlsSecret: crmf-keycloak-tls
+
+  # Trust the reverse proxy's forwarded headers (X-Forwarded-Proto/Host).
+  proxy:
+    headers: xforwarded
+
+  # ---------------------------------------------------------------------------
+  # Database — points at the CNPG cluster from 01-keycloak-db.yaml.
+  # ---------------------------------------------------------------------------
+  db:
+    vendor: postgres
+    host: crmf-keycloak-db-rw
+    port: 5432
+    database: keycloak
+    usernameSecret:
+      name: crmf-keycloak-db-app
+      key: username
+    passwordSecret:
+      name: crmf-keycloak-db-app
+      key: password
+    poolMinSize: 5
+    poolMaxSize: 20
+
+  # ---------------------------------------------------------------------------
+  # Resources (per server pod).
+  # ---------------------------------------------------------------------------
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+
+  # ---------------------------------------------------------------------------
+  # Extra server options. Health + metrics enabled so a ServiceMonitor (owned by
+  # the observability agent) can scrape /metrics on the management port.
+  # ---------------------------------------------------------------------------
+  additionalOptions:
+    - name: health-enabled
+      value: "true"
+    - name: metrics-enabled
+      value: "true"
+    # Cache stack tuned for Kubernetes (operator default is kubernetes/jdbc-ping
+    # depending on version; set explicitly for clarity).
+    - name: cache
+      value: "ispn"
+    - name: cache-stack
+      value: "kubernetes"

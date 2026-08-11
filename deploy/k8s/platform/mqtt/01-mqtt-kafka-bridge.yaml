@@ -1,0 +1,200 @@
+# =============================================================================
+# CRMF Ingestion Backbone — MQTT -> Kafka Bridge  [SCAFFOLDED]
+# Proposal §6.3/§6.4: device publishes over MQTT-TLS must land on the same
+# canonical Kafka topic "telemetry.ingest" as the HTTP /ingest path.
+#
+# !!! SCAFFOLD — this documents the bridge contract. Two viable implementations
+# !!! are described; pick one for production and remove the scaffold guard.
+#
+# OPTION A (PREFERRED) — EMQX rule-engine "data bridge" to Kafka.
+#   Define entirely inside EMQX (no extra pod). A rule selects messages on
+#   topic 'rigs/+/telemetry/#' and forwards them to Kafka. Rough shape of the
+#   EMQX bridge + rule (configure via dashboard / EMQX API / HOCON):
+#
+#     bridges.kafka_producer.to_telemetry {
+#       bootstrap_hosts = "crmf-kafka-kafka-bootstrap.crmf.svc:9093"
+#       authentication { mechanism = scram_sha_512
+#                        username = "crmf-stream"  password = "<from secret>" }
+#       ssl { enable = true }
+#       kafka {
+#         topic = "telemetry.ingest"
+#         message { key = "${clientid}"            # rigId -> partition key
+#                   value = "${payload}" }
+#         partition_strategy = key_dispatch
+#       }
+#     }
+#     rules.forward_telemetry {
+#       sql = "SELECT clientid, topic, payload FROM \"rigs/+/telemetry/#\""
+#       actions = ["bridge:kafka_producer:to_telemetry"]
+#     }
+#
+#   Events are forwarded by a second rule on 'rigs/+/events/#' -> events.* .
+#   With Option A the Deployment below is NOT needed (replicas stay 0).
+#
+# OPTION B — standalone bridge Deployment (this manifest). A small MQTT-client
+#   service subscribes to EMQX over mqtts and produces to Kafka. Useful if you
+#   want the mapping logic (topic->Kafka-topic, payload normalisation, rigId
+#   extraction) outside the broker. Image crmf/crmf-mqtt-bridge is a placeholder.
+#
+# Either way the bridge authenticates to Kafka as SCRAM user "crmf-stream"
+# (produce rights to telemetry/events). MONITORING-ONLY: traffic is one-way,
+# rig -> broker -> Kafka -> store.
+# =============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crmf-mqtt-bridge
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: mqtt-kafka-bridge
+    app.kubernetes.io/component: ingestion-bridge
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crmf-mqtt-bridge-config
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: mqtt-kafka-bridge
+    app.kubernetes.io/component: ingestion-bridge
+data:
+  # Topic mapping consumed by the Option-B bridge process. MQTT topic filter ->
+  # destination Kafka topic. Kafka record key = rigId parsed from the MQTT
+  # topic segment 'rigs/<rigId>/...'.
+  bridge.yaml: |
+    mqtt:
+      url: "mqtts://crmf-mqtt.crmf.svc.cluster.local:8883"
+      tls:
+        caCert: /tls/ca.crt
+        clientCert: /tls/tls.crt    # bridge's own client identity
+        clientKey: /tls/tls.key
+      subscriptions:
+        - filter: "rigs/+/telemetry/#"
+          qos: 1
+        - filter: "rigs/+/events/#"
+          qos: 1
+    kafka:
+      bootstrapServers: "crmf-kafka-kafka-bootstrap.crmf.svc.cluster.local:9093"
+      securityProtocol: "SASL_SSL"
+      saslMechanism: "SCRAM-SHA-512"
+      username: "crmf-stream"
+      acks: "all"
+      compressionType: "gzip"
+      keyFrom: "mqttTopicSegment:1"     # rigId is segment index 1 of the topic
+    routes:
+      - match: "rigs/+/telemetry/#"
+        topic: "telemetry.ingest"
+      - match: "rigs/+/events/alarm"
+        topic: "events.alarm"
+      - match: "rigs/+/events/connection"
+        topic: "events.connection"
+      - match: "rigs/+/events/activity"
+        topic: "events.activity"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crmf-mqtt-bridge
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: mqtt-kafka-bridge
+    app.kubernetes.io/component: ingestion-bridge
+  annotations:
+    crmf.ongc.local/status: "scaffold"
+    crmf.ongc.local/note: >-
+      Option-B standalone MQTT->Kafka bridge. Prefer Option A (EMQX rule-engine
+      data bridge, no extra pod). If using Option B, build crmf/crmf-mqtt-bridge
+      and set replicas>=1.
+spec:
+  # SCAFFOLD GUARD: 0 replicas. Option A needs no pod; Option B sets this >=1.
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mqtt-kafka-bridge
+      app.kubernetes.io/component: ingestion-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: crmf
+        app.kubernetes.io/managed-by: kubectl
+        app.kubernetes.io/name: mqtt-kafka-bridge
+        app.kubernetes.io/component: ingestion-bridge
+    spec:
+      serviceAccountName: crmf-mqtt-bridge
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bridge
+          # SCAFFOLD: replace with harbor.ongc.local/crmf/crmf-mqtt-bridge:<tag>.
+          image: harbor.ongc.local/crmf/crmf-mqtt-bridge:scaffold
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9402
+              protocol: TCP
+          env:
+            - name: BRIDGE_CONFIG
+              value: /etc/crmf/bridge.yaml
+            # Kafka SCRAM password from the User-Operator-managed Secret.
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: crmf-stream
+                  key: password
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/crmf
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: metrics
+            initialDelaySeconds: 20
+            periodSeconds: 15
+      volumes:
+        - name: config
+          configMap:
+            name: crmf-mqtt-bridge-config
+        - name: tls
+          secret:
+            secretName: crmf-emqx-tls     # reuse CA + a client cert for the bridge
+            optional: true
+        - name: tmp
+          emptyDir: {}

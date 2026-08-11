@@ -1,0 +1,222 @@
+# =============================================================================
+# CRMF — Phase 2: cluster operators
+#
+# Helm-installs the operators the CRMF platform depends on, in dependency order:
+#   1. cert-manager        (TLS for ingress + webhooks; needed before issuers)
+#   2. ingress-nginx       (NGINX Ingress Controller — spec ingress class)
+#   3. external-secrets    (pull app secrets from Vault, optional)
+#   4. CloudNativePG       (TimescaleDB cluster crmf-timescaledb)
+#   5. Strimzi             (Kafka for the optional KAFKA_ENABLED path)
+#   6. Keycloak operator   (OIDC issuer for backend JWT validation)
+#   7. kube-prometheus-stack (Prometheus Operator -> ServiceMonitor/PrometheusRule)
+#   8. MinIO operator      (S3 object store for CNPG backups)
+#
+# Runs from the control host against the fetched kubeconfig using the
+# kubernetes.core collection (helm + k8s modules). Requires on the control host:
+#   pip install kubernetes; ansible-galaxy collection install kubernetes.core
+#   helm v3 binary on PATH.
+# =============================================================================
+
+- name: Install CRMF cluster operators
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    kubeconfig: "{{ kubeconfig_local_path }}"
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig_local_path }}"
+  tasks:
+
+    # ---- Helm repositories --------------------------------------------------
+    - name: Add helm repositories
+      kubernetes.core.helm_repository:
+        name: "{{ item.name }}"
+        repo_url: "{{ item.url }}"
+      loop: "{{ helm_repos }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ---- 1. cert-manager ----------------------------------------------------
+    - name: Install cert-manager
+      kubernetes.core.helm:
+        name: cert-manager
+        chart_ref: "{{ operators.cert_manager.chart }}"
+        chart_version: "{{ operators.cert_manager.version }}"
+        release_namespace: "{{ operators.cert_manager.namespace }}"
+        create_namespace: true
+        kubeconfig: "{{ kubeconfig }}"
+        wait: true
+        timeout: "10m0s"
+        values:
+          crds:
+            enabled: true
+          startupapicheck:
+            enabled: true
+
+    - name: Create cluster-issuer ({{ cert_manager_cluster_issuer }})
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: "{{ cert_manager_cluster_issuer }}"
+            labels:
+              app.kubernetes.io/part-of: crmf
+              app.kubernetes.io/managed-by: ansible
+          spec:
+            acme:
+              email: "{{ acme_email }}"
+              server: "https://acme-v02.api.letsencrypt.org/directory"
+              privateKeySecretRef:
+                name: "{{ cert_manager_cluster_issuer }}-account-key"
+              solvers:
+                - http01:
+                    ingress:
+                      ingressClassName: nginx
+
+    # ---- 2. ingress-nginx ---------------------------------------------------
+    - name: Install ingress-nginx
+      kubernetes.core.helm:
+        name: ingress-nginx
+        chart_ref: "{{ operators.ingress_nginx.chart }}"
+        chart_version: "{{ operators.ingress_nginx.version }}"
+        release_namespace: "{{ operators.ingress_nginx.namespace }}"
+        create_namespace: true
+        kubeconfig: "{{ kubeconfig }}"
+        wait: true
+        timeout: "10m0s"
+        values:
+          controller:
+            ingressClassResource:
+              name: nginx
+              default: true
+            metrics:
+              enabled: true
+              serviceMonitor:
+                enabled: false   # enabled after prometheus-operator CRDs exist
+            config:
+              # store-and-forward /ingest bodies can be large.
+              proxy-body-size: "64m"
+            allowSnippetAnnotations: false
+
+    # ---- 3. external-secrets (optional) ------------------------------------
+    - name: Install external-secrets
+      kubernetes.core.helm:
+        name: external-secrets
+        chart_ref: "{{ operators.external_secrets.chart }}"
+        chart_version: "{{ operators.external_secrets.version }}"
+        release_namespace: "{{ operators.external_secrets.namespace }}"
+        create_namespace: true
+        kubeconfig: "{{ kubeconfig }}"
+        wait: true
+        timeout: "10m0s"
+        values:
+          installCRDs: true
+      when: external_secrets_enabled | default(false) | bool
+
+    # ---- 4. CloudNativePG ---------------------------------------------------
+    - name: Install CloudNativePG operator
+      kubernetes.core.helm:
+        name: cloudnative-pg
+        chart_ref: "{{ operators.cloudnative_pg.chart }}"
+        chart_version: "{{ operators.cloudnative_pg.version }}"
+        release_namespace: "{{ operators.cloudnative_pg.namespace }}"
+        create_namespace: true
+        kubeconfig: "{{ kubeconfig }}"
+        wait: true
+        timeout: "10m0s"
+
+    # ---- 5. Strimzi (Kafka) -------------------------------------------------
+    - name: Install Strimzi Kafka operator
+      kubernetes.core.helm:
+        name: strimzi-kafka-operator
+        chart_ref: "{{ operators.strimzi.chart }}"
+        chart_version: "{{ operators.strimzi.version }}"
+        release_namespace: "{{ operators.strimzi.namespace }}"
+        create_namespace: true
+        kubeconfig: "{{ kubeconfig }}"
+        wait: true
+        timeout: "10m0s"
+        values:
+          watchAnyNamespace: false
+          watchNamespaces:
+            - "{{ crmf_namespace }}"
+      when: kafka_enabled | default(true) | bool
+
+    # ---- 6. Keycloak operator (upstream manifests) --------------------------
+    - name: Ensure keycloak namespace exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ keycloak_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: crmf
+              app.kubernetes.io/managed-by: ansible
+      when: oidc_enabled | default(true) | bool
+
+    - name: Install Keycloak operator CRDs
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ keycloak_namespace }}"
+        src: "https://raw.githubusercontent.com/keycloak/keycloak-k8s-resources/{{ keycloak_operator_version }}/kubernetes/keycloaks.k8s.keycloak.org-v1.yml"
+      when: oidc_enabled | default(true) | bool
+
+    - name: Install Keycloak realm-import CRD
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ keycloak_namespace }}"
+        src: "https://raw.githubusercontent.com/keycloak/keycloak-k8s-resources/{{ keycloak_operator_version }}/kubernetes/keycloakrealmimports.k8s.keycloak.org-v1.yml"
+      when: oidc_enabled | default(true) | bool
+
+    - name: Install Keycloak operator
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ keycloak_namespace }}"
+        src: "https://raw.githubusercontent.com/keycloak/keycloak-k8s-resources/{{ keycloak_operator_version }}/kubernetes/kubernetes.yml"
+      when: oidc_enabled | default(true) | bool
+
+    # ---- 7. kube-prometheus-stack ------------------------------------------
+    - name: Install kube-prometheus-stack
+      kubernetes.core.helm:
+        name: kube-prometheus-stack
+        chart_ref: "{{ operators.kube_prometheus_stack.chart }}"
+        chart_version: "{{ operators.kube_prometheus_stack.version }}"
+        release_namespace: "{{ operators.kube_prometheus_stack.namespace }}"
+        create_namespace: true
+        kubeconfig: "{{ kubeconfig }}"
+        wait: true
+        timeout: "15m0s"
+        values:
+          prometheus:
+            prometheusSpec:
+              # discover ServiceMonitors/PrometheusRules cluster-wide (crmf ns).
+              serviceMonitorSelectorNilUsesHelmValues: false
+              ruleSelectorNilUsesHelmValues: false
+              podMonitorSelectorNilUsesHelmValues: false
+          grafana:
+            enabled: true
+
+    # ---- 8. MinIO operator (CNPG backup target) -----------------------------
+    - name: Install MinIO operator
+      kubernetes.core.helm:
+        name: minio-operator
+        chart_ref: "{{ operators.minio_operator.chart }}"
+        chart_version: "{{ operators.minio_operator.version }}"
+        release_namespace: "{{ operators.minio_operator.namespace }}"
+        create_namespace: true
+        kubeconfig: "{{ kubeconfig }}"
+        wait: true
+        timeout: "10m0s"
+      when: minio_enabled | default(true) | bool
+
+    - name: Operators install complete
+      ansible.builtin.debug:
+        msg: >-
+          Operators installed: cert-manager, ingress-nginx, CloudNativePG, Strimzi,
+          Keycloak, kube-prometheus-stack, MinIO
+          {{ '(+ external-secrets)' if (external_secrets_enabled | default(false) | bool) else '' }}.

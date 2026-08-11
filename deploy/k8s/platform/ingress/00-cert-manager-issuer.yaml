@@ -1,0 +1,50 @@
+---
+# cert-manager ClusterIssuer used by the app Ingress TLS (host crmf.ongc.local).
+# Named "letsencrypt-or-ongc-ca" to match the shared spec's Ingress cluster-issuer reference.
+#
+# This file defines TWO issuers and one is wired by default:
+#   1. letsencrypt-or-ongc-ca  -> ACME (Let's Encrypt) via HTTP-01 over the nginx ingress class.
+#   2. ongc-internal-ca        -> signs from the ONGC internal CA (offline/air-gapped sites).
+#
+# For an internal-only deployment (no public ACME reachability), repoint the Ingress'
+# cert-manager.io/cluster-issuer annotation to "ongc-internal-ca" and provide the CA
+# keypair in the Secret referenced below.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-or-ongc-ca
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: letsencrypt-or-ongc-ca
+    app.kubernetes.io/component: cert-issuer
+spec:
+  acme:
+    # ACME directory — public Let's Encrypt production. Swap to the staging URL
+    # (https://acme-staging-v02.api.letsencrypt.org/directory) while testing to avoid rate limits.
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: crmf-ops@ongc.local
+    privateKeySecretRef:
+      name: letsencrypt-or-ongc-ca-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+---
+# ONGC internal CA issuer for air-gapped / internal-only deployments.
+# Requires a Secret "ongc-ca-keypair" (tls.crt + tls.key of the ONGC internal CA) in the
+# cert-manager namespace. Created out-of-band by the PKI team:
+#   kubectl -n cert-manager create secret tls ongc-ca-keypair \
+#     --cert=ongc-ca.crt --key=ongc-ca.key
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: ongc-internal-ca
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: ongc-internal-ca
+    app.kubernetes.io/component: cert-issuer
+spec:
+  ca:
+    secretName: ongc-ca-keypair

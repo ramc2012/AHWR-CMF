@@ -1,0 +1,177 @@
+# =============================================================================
+# CRMF Ansible — shared variables (EXAMPLE)
+#
+# Copy to deploy/ansible/group_vars/all.yml and edit for your site. Secrets here
+# are EXAMPLE defaults only — in production, source them from ansible-vault or
+# (preferred) leave the cluster to pull them via external-secrets from Vault.
+#
+# These variables drive: RKE2 bootstrap, operator helm-installs, platform CR
+# rendering, and the CRMF app chart install. Names MUST match the shared spec
+# (namespace "crmf", services crmf-backend / crmf-frontend, CNPG cluster
+# crmf-timescaledb, etc.).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Cluster identity / kubeconfig
+# ---------------------------------------------------------------------------
+crmf_cluster_name: "crmf-prod"
+crmf_namespace: "crmf"
+# Where the playbooks drop the admin kubeconfig fetched from the first server,
+# rewritten to use the control-plane VIP/hostname. Used by the helm/k8s modules.
+kubeconfig_path: "/etc/rancher/rke2/rke2.yaml"
+kubeconfig_local_path: "{{ playbook_dir }}/../.artifacts/crmf.kubeconfig"
+
+# ---------------------------------------------------------------------------
+# RKE2 (proposal §6.4 — RKE2 distribution)
+# ---------------------------------------------------------------------------
+rke2_version: "v1.30.4+rke2r1"
+rke2_channel: "stable"
+# Fixed registration address clients use to reach the server control-plane.
+# Set to a VIP (kube-vip/HAProxy) or the first server's address.
+rke2_tls_san:
+  - "crmf-cp.ongc.local"
+  - "10.20.0.10"
+rke2_api_endpoint: "crmf-cp.ongc.local"
+# Token shared by all server+agent nodes to join the cluster. CHANGE THIS.
+rke2_join_token: "CHANGE-ME-rke2-shared-join-token"
+# CNI: rke2 default is canal; use cilium for NetworkPolicy + observability.
+rke2_cni: "cilium"
+# Disable the bundled ingress so we install ingress-nginx ourselves (spec).
+rke2_disable:
+  - "rke2-ingress-nginx"
+# Air-gapped Harbor mirror for system images (optional).
+rke2_system_default_registry: ""
+
+# ---------------------------------------------------------------------------
+# Registry — Harbor (proposal §6.4)
+# ---------------------------------------------------------------------------
+harbor_registry: "harbor.ongc.local"
+harbor_project: "crmf"
+# Robot account used by RKE2 nodes / imagePullSecret to pull crmf images.
+harbor_robot_user: "robot$crmf-pull"
+harbor_robot_password: "CHANGE-ME-harbor-robot-token"
+# imagePullSecret name created in the crmf namespace.
+crmf_image_pull_secret: "harbor-crmf-pull"
+
+# ---------------------------------------------------------------------------
+# Application images / chart
+# ---------------------------------------------------------------------------
+crmf_chart_path: "{{ playbook_dir }}/../../helm/crmf"
+crmf_chart_values: "{{ crmf_chart_path }}/values-prod.yaml"
+crmf_release_name: "crmf"
+crmf_platform_dir: "{{ playbook_dir }}/../../k8s/platform"
+image_backend_repo: "crmf/crmf-backend"
+image_frontend_repo: "crmf/crmf-frontend"
+# Default deploy tag; CI normally overrides with the commit sha.
+image_tag: "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Public hostname / TLS
+# ---------------------------------------------------------------------------
+crmf_host: "crmf.ongc.local"
+cert_manager_cluster_issuer: "letsencrypt-or-ongc-ca"
+# ACME contact (letsencrypt) or set to use the ONGC internal CA issuer.
+acme_email: "crmf-platform@ongc.local"
+
+# ---------------------------------------------------------------------------
+# Operator versions + helm repos (installed by 20-operators.yml)
+# ---------------------------------------------------------------------------
+helm_repos:
+  - name: jetstack
+    url: "https://charts.jetstack.io"
+  - name: cnpg
+    url: "https://cloudnative-pg.github.io/charts"
+  - name: strimzi
+    url: "https://strimzi.io/charts/"
+  - name: prometheus-community
+    url: "https://prometheus-community.github.io/helm-charts"
+  - name: external-secrets
+    url: "https://charts.external-secrets.io"
+  - name: minio-operator
+    url: "https://operator.min.io"
+  - name: ingress-nginx
+    url: "https://kubernetes.github.io/ingress-nginx"
+
+operators:
+  cert_manager:
+    namespace: "cert-manager"
+    chart: "jetstack/cert-manager"
+    version: "v1.15.3"
+  cloudnative_pg:
+    namespace: "cnpg-system"
+    chart: "cnpg/cloudnative-pg"
+    version: "0.22.0"
+  strimzi:
+    namespace: "kafka"
+    chart: "strimzi/strimzi-kafka-operator"
+    version: "0.43.0"
+  external_secrets:
+    namespace: "external-secrets"
+    chart: "external-secrets/external-secrets"
+    version: "0.10.4"
+  kube_prometheus_stack:
+    namespace: "monitoring"
+    chart: "prometheus-community/kube-prometheus-stack"
+    version: "62.6.0"
+  minio_operator:
+    namespace: "minio-operator"
+    chart: "minio-operator/operator"
+    version: "5.0.15"
+  ingress_nginx:
+    namespace: "ingress-nginx"
+    chart: "ingress-nginx/ingress-nginx"
+    version: "4.11.2"
+
+# Keycloak operator is installed from upstream manifests (no maintained helm
+# chart); version pins the manifest bundle applied in 20-operators.yml.
+keycloak_operator_version: "25.0.4"
+keycloak_namespace: "keycloak"
+
+# ---------------------------------------------------------------------------
+# Platform data services (referenced by platform CRs / app chart)
+# ---------------------------------------------------------------------------
+# CloudNativePG cluster (spec: name crmf-timescaledb, RW svc crmf-timescaledb-rw)
+cnpg_cluster_name: "crmf-timescaledb"
+cnpg_instances: 3
+cnpg_storage_size: "200Gi"
+cnpg_storage_class: "longhorn"
+pg_database: "crmf"
+pg_user: "crmf"
+
+# Kafka (Strimzi) — used by the backend's optional KAFKA_ENABLED path.
+# Strimzi cluster "crmf-kafka" in ns "crmf" -> bootstrap svc "crmf-kafka-kafka-bootstrap";
+# :9093 is the TLS+SCRAM listener (matches values.yaml KAFKA_BROKERS/KAFKA_SSL).
+kafka_enabled: true
+kafka_brokers: "crmf-kafka-kafka-bootstrap.crmf.svc.cluster.local:9093"
+
+# OIDC / Keycloak — backend JWT validation. Source of truth = realm "ongc"
+# (keycloak/02-realm.yaml); audience is the bearer-only client "crmf-api".
+oidc_enabled: true
+oidc_issuer: "https://keycloak.ongc.local/realms/ongc"
+oidc_jwks_uri: "https://keycloak.ongc.local/realms/ongc/protocol/openid-connect/certs"
+oidc_audience: "crmf-api"
+
+# MinIO — S3-compatible object store for CNPG backups / WAL archive.
+# The bundled in-cluster "minio" Service serves plain HTTP on :9000 (#6), matching the
+# CNPG barmanObjectStore endpointURL and the MLflow / bucket-init clients. Only switch to
+# https://minio.ongc.local:9000 if you front MinIO with a real TLS Ingress + DNS for that
+# host. The bucket must match the CNPG barmanObjectStore + the bucket-init Job.
+minio_enabled: true
+minio_endpoint: "http://minio:9000"
+minio_backup_bucket: "crmf-backups"
+
+# ---------------------------------------------------------------------------
+# Application secrets (EXAMPLE — replace / move to vault or external-secrets)
+# Rendered into Secret "crmf-secrets" by the app chart values.
+# ---------------------------------------------------------------------------
+crmf_secrets:
+  PGPASSWORD: "CHANGE-ME-pg-password"
+  JWT_SECRET: "CHANGE-ME-jwt-secret"
+  INGEST_TOKEN: "CHANGE-ME-rig-edge-ingest-token"
+  ADMIN_PASSWORD: "CHANGE-ME-admin-password"
+
+# external-secrets backend (Vault) — used instead of inline crmf_secrets when set.
+external_secrets_enabled: false
+vault_address: "https://vault.ongc.local:8200"
+vault_kv_mount: "secret"
+vault_secret_path: "crmf/prod"

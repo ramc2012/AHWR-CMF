@@ -1,0 +1,88 @@
+# OPTIONAL live data so the portal isn't empty — the SAME demo fleet-sim the compose
+# stack uses, here as an in-cluster Deployment posting gzip batches to the backend
+# Service (crmf-backend:6000) over the real /ingest contract. In a real deployment this
+# is replaced by the 3 physical rig-edge sync agents. Delete it to see a "no rigs yet"
+# portal. The namespace enforces PodSecurity "restricted", so the pod sets the required
+# non-root / drop-ALL / seccomp securityContext.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crmf-fleet-sim
+  namespace: crmf
+  labels:
+    app.kubernetes.io/name: crmf-fleet-sim
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/component: demo-data
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: crmf-fleet-sim
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: crmf-fleet-sim
+        app.kubernetes.io/part-of: crmf
+        app.kubernetes.io/component: demo-data
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fleet-sim
+          image: harbor.ongc.local/crmf/fleet-sim:1.0.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CENTRAL_URL
+              value: "http://crmf-backend:6000"     # in-cluster backend Service
+            - name: INGEST_TOKEN
+              value: "crmf-demo-ingest-token"        # must match values-local secrets.INGEST_TOKEN
+            - name: ACTIVE_RIGS
+              value: "6"                              # light load for a laptop (compose uses 14)
+            - name: BATCH_SECONDS
+              value: "10"
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+---
+# The chart's default-deny NetworkPolicy (enforced here — recent kindnet DOES enforce
+# NetworkPolicy) allows backend ingress only from ingress-nginx + Prometheus. A real rig
+# edge POSTs to /ingest THROUGH the ingress, so it's already covered; this in-cluster
+# demo fleet-sim posts straight to the backend Service, so it needs an explicit allow.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-fleet-sim-to-backend
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/component: demo-data
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: crmf
+      app.kubernetes.io/instance: crmf
+      app.kubernetes.io/component: backend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: crmf-fleet-sim
+      ports:
+        - protocol: TCP
+          port: 6000

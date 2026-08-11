@@ -1,0 +1,149 @@
+---
+# In-house ETP 2.0 + WITSML 1.4.1 server — exposes CRMF historian over Energistics
+# standards to external clients (read/monitoring-only; no writes back to rigs).
+# Placeholder image crmf/crmf-etp-witsml — point at the real Harbor tag at rollout.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crmf-etp-witsml
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: etp-witsml
+    app.kubernetes.io/component: standards
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crmf-etp-witsml-config
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: etp-witsml
+    app.kubernetes.io/component: standards
+data:
+  # Historian wiring (same TimescaleDB the rest of CRMF reads).
+  PGHOST: "crmf-timescaledb-rw"
+  PGPORT: "5432"
+  PGDATABASE: "crmf"
+  PGUSER: "crmf"
+  HTTP_PORT: "8080"
+  ETP_PORT: "8443"
+  WITSML_VERSION: "1.4.1.1"
+  ETP_VERSION: "2.0"
+  READ_ONLY: "true"          # disable WMLS_AddToStore/WMLS_DeleteFromStore
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crmf-etp-witsml
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: etp-witsml
+    app.kubernetes.io/component: standards
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: etp-witsml
+    app.kubernetes.io/component: standards
+  ports:
+    - name: http              # WITSML 1.4.1 SOAP/WS endpoint
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+    - name: etp               # ETP 2.0 websocket endpoint
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crmf-etp-witsml
+  namespace: crmf
+  labels:
+    app.kubernetes.io/part-of: crmf
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/name: etp-witsml
+    app.kubernetes.io/component: standards
+spec:
+  # PHASE-2 SCAFFOLD (#18): the image harbor.ongc.local/crmf/crmf-etp-witsml:0.1.0 is a
+  # PLACEHOLDER that does not exist in Harbor — running it at replicas>=1 would
+  # ImagePullBackOff on apply. Pinned to 0 to match the other honest scaffolds
+  # (kafka/03-stream-processor.yaml, mqtt/01-mqtt-kafka-bridge.yaml). Set to 1 only once a
+  # real ETP/WITSML server image is built and mirrored to Harbor.
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: etp-witsml
+      app.kubernetes.io/component: standards
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: crmf
+        app.kubernetes.io/managed-by: kubectl
+        app.kubernetes.io/name: etp-witsml
+        app.kubernetes.io/component: standards
+    spec:
+      serviceAccountName: crmf-etp-witsml
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: etp-witsml
+          image: harbor.ongc.local/crmf/crmf-etp-witsml:0.1.0
+          envFrom:
+            - configMapRef:
+                name: crmf-etp-witsml-config
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: crmf-secrets
+                  key: PGPASSWORD
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: etp
+              containerPort: 8443
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "768Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

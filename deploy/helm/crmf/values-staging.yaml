@@ -1,0 +1,79 @@
+# Staging overlay for the CRMF application chart (#17).
+# Apply with:  helm upgrade --install crmf ./crmf -n crmf -f values-staging.yaml
+#
+# Why this exists: values-prod.yaml sets externalSecret.enabled=true, which means the
+# chart does NOT render templates/secret.yaml and instead relies on an out-of-band
+# crmf-secrets Secret provisioned by the External Secrets Operator / Vault. The staging
+# cluster has neither ESO/Vault nor a guaranteed platform DB, so deploying with
+# values-prod made backend pods crashloop on the missing Secret and the --atomic --wait
+# upgrade timed out and rolled back — a guaranteed red pipeline.
+#
+# This overlay makes staging self-contained:
+#   * externalSecret.enabled=false  -> the chart RENDERS crmf-secrets from demo values
+#     below (no ESO/Vault dependency in staging).
+#   * config.PGHOST points at whatever DB staging provisions (default: the in-cluster
+#     CNPG primary RW service, same as prod). If staging has no DB, the CI job tolerates a
+#     not-ready backend (see .gitlab-ci.yml: staging drops --atomic and uses a soft rollout
+#     check) so the pipeline reports status instead of atomic-rolling-back.
+#
+# These are NON-PRODUCTION demo secrets. Never reuse them in prod.
+
+image:
+  registry: harbor.ongc.local
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+  pullSecrets:
+    - name: harbor-pull-secret
+
+backend:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+frontend:
+  replicaCount: 1
+
+ingress:
+  enabled: true
+  className: nginx
+  host: crmf.staging.ongc.local
+  proxyBodySize: "64m"
+  proxyReadTimeout: "3600"
+  proxySendTimeout: "3600"
+  tls:
+    enabled: true
+    secretName: crmf-staging-tls
+    clusterIssuer: letsencrypt-or-ongc-ca
+
+autoscaling:
+  enabled: false
+
+podDisruptionBudget:
+  enabled: false
+
+networkPolicy:
+  enabled: true
+
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack
+
+# Staging renders its own Secret from the demo values below (no ESO/Vault).
+externalSecret:
+  enabled: false
+
+# Fail-closed ingest auth is preserved in staging: a non-empty demo INGEST_TOKEN ships,
+# so /ingest still authenticates (it does NOT fall back to open-ingest). Matches the
+# docker-compose demo default so the same fleet-sim token works.
+secrets:
+  PGPASSWORD: "staging-pg-password"
+  JWT_SECRET: "staging-only-jwt-secret-change-me"
+  INGEST_TOKEN: "crmf-demo-ingest-token"
+  ADMIN_PASSWORD: "staging-admin-password"
+  KAFKA_SASL_PASSWORD: "staging-kafka-password"
