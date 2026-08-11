@@ -25,6 +25,39 @@ const WELL_STATUS_COLOR = {
 const WELL_STATUSES = ['active', 'planned', 'drilling', 'completed', 'producing', 'workover', 'suspended', 'abandoned'];
 const WELL_TYPES = ['production', 'injection', 'exploration', 'appraisal', 'workover'];
 
+// Current OPERATION on the well — what the attached rig is doing right now
+// (edge activity engine codes; also streamed by the fleet sim). This is the
+// primary categorisation axis of the page; lifecycle status is secondary.
+const OPERATION_META = {
+    RIH:        { label: 'Running in',     color: '#27cfe6' },
+    POOH:       { label: 'Pulling out',    color: '#ff9d2e' },
+    MAKE_UP:    { label: 'Make-up',        color: '#a9ef34' },
+    BREAK_OUT:  { label: 'Break-out',      color: '#ffc24b' },
+    CIRCULATE:  { label: 'Circulation',    color: '#46a6ff' },
+    SWAB:       { label: 'Swabbing',       color: '#9a8bff' },
+    FISHING:    { label: 'Fishing',        color: '#b47aff' },
+    MILLING:    { label: 'Milling',        color: '#f472b6' },
+    CDR:        { label: 'CDR',            color: '#22d3ee' },
+    WASH:       { label: 'Wash / cleanout', color: '#38bdf8' },
+    PERFORATION:{ label: 'Perforation',    color: '#fb7185' },
+    RIG_UP:     { label: 'Rig up',         color: '#23dd86' },
+    RIG_DOWN:   { label: 'Rig down',       color: '#23dd86' },
+    IDLE:       { label: 'Idle',           color: '#7c8aa0' },
+    WAIT:       { label: 'Waiting (NPT)',  color: '#ff4a60' },
+};
+// Tile order: the operations that matter most to a workover fleet first.
+const OPERATION_TILES = ['RIH', 'POOH', 'MAKE_UP', 'BREAK_OUT', 'CIRCULATE', 'MILLING', 'FISHING', 'CDR', 'SWAB', 'WASH', 'PERFORATION', 'WAIT'];
+const opKey = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+
+function OperationChip({ op, size = 'small' }) {
+    const meta = OPERATION_META[opKey(op)];
+    if (!meta) return null;
+    return (
+        <Chip size={size} label={meta.label.toUpperCase()}
+            sx={{ bgcolor: meta.color + '22', color: meta.color, border: `1px solid ${meta.color}55`, fontWeight: 700, letterSpacing: 0.4 }} />
+    );
+}
+
 function WellStatusChip({ status, size = 'small' }) {
     const c = WELL_STATUS_COLOR[status] || '#64748b';
     const label = (status || 'unknown').toUpperCase();
@@ -75,6 +108,7 @@ function WellTile({ well, canAdmin, onOpen, onDelete }) {
             </Stack>
 
             <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap alignItems="center">
+                <OperationChip op={well.currentOperation} />
                 {(well.serviceType || well.wellType) && <Chip size="small" variant="outlined" label={well.serviceType || well.wellType} />}
                 <WellStatusChip status={well.status} />
             </Stack>
@@ -115,6 +149,7 @@ export default function Wells() {
     const [unit, setUnit] = useState('all');
     const [status, setStatus] = useState('all');
     const [type, setType] = useState('all');
+    const [op, setOp] = useState('all');
     const [q, setQ] = useState('');
 
     const [addOpen, setAddOpen] = useState(false);
@@ -140,22 +175,30 @@ export default function Wells() {
         if (unit !== 'all' && (r.assetUnit || r.field) !== unit) return false;
         if (status !== 'all' && r.status !== status) return false;
         if (type !== 'all' && r.wellType !== type) return false;
+        if (op !== 'all' && (op === 'none' ? !!r.currentOperation : opKey(r.currentOperation) !== op)) return false;
         if (q && !(`${r.name} ${r.uwi || ''} ${r.wellId} ${r.assetUnit || r.field || ''} ${r.currentRigId || ''}`.toLowerCase().includes(q.toLowerCase()))) return false;
         return true;
-    }), [rows, unit, status, type, q]);
+    }), [rows, unit, status, type, op, q]);
 
     // KPI counts span the full (unfiltered) set so the row stays a stable fleet
-    // summary. Every lifecycle status lands in exactly one bucket: previously
-    // active/drilling/completed/suspended wells counted toward TOTAL only, so
-    // the tiles never summed to the total and rig-started wells (status
-    // 'active'/'workover') were invisible in the WORKOVER tile.
+    // summary. PRIMARY axis: current OPERATION — what is being done on each well
+    // right now (running in, pulling out, milling, CDR, ...). Wells with no rig
+    // on them have no operation; they land in the OFF-JOB bucket and are
+    // summarised by lifecycle in the secondary line under the tiles.
     const counts = useMemo(() => {
-        const c = { total: rows.length, producing: 0, workover: 0, completed: 0, planned: 0, suspended: 0, abandoned: 0 };
+        const ops = {};
+        let onJob = 0;
+        const lifecycle = { producing: 0, workover: 0, completed: 0, planned: 0, suspended: 0, abandoned: 0 };
         rows.forEach((r) => {
+            if (r.currentOperation) {
+                onJob += 1;
+                const k = opKey(r.currentOperation);
+                ops[k] = (ops[k] || 0) + 1;
+            }
             const s = r.status === 'active' || r.status === 'drilling' ? 'workover' : r.status;
-            if (c[s] != null) c[s] += 1;
+            if (lifecycle[s] != null) lifecycle[s] += 1;
         });
-        return c;
+        return { total: rows.length, onJob, offJob: rows.length - onJob, ops, lifecycle };
     }, [rows]);
 
     const addWell = async () => {
@@ -197,15 +240,42 @@ export default function Wells() {
                 {canAdmin && <Button variant="contained" startIcon={<Add />} onClick={() => { setDraft(BLANK_DRAFT); setAddOpen(true); }}>Add well</Button>}
             </Stack>
 
-            {/* KPI row — fleet-wide well counts by lifecycle stage. */}
-            <Stack direction="row" spacing={2} mb={2} flexWrap="wrap" useFlexGap>
-                <KpiCard label="Total wells" value={counts.total} />
-                <KpiCard label="Producing" value={counts.producing} color={WELL_STATUS_COLOR.producing} />
-                <KpiCard label="In workover" value={counts.workover} color={WELL_STATUS_COLOR.workover} />
-                <KpiCard label="Planned" value={counts.planned} color={WELL_STATUS_COLOR.planned} />
-                <KpiCard label="Completed" value={counts.completed} color={WELL_STATUS_COLOR.completed} />
-                <KpiCard label="Suspended" value={counts.suspended} color={WELL_STATUS_COLOR.suspended} />
-                <KpiCard label="Abandoned" value={counts.abandoned} color={WELL_STATUS_COLOR.abandoned} />
+            {/* KPI row — fleet-wide counts by CURRENT OPERATION (what each rig is
+                doing on its well right now). A tile shows when its operation is
+                live anywhere in the fleet; clicking it filters the list. */}
+            <Stack direction="row" spacing={2} mb={1} flexWrap="wrap" useFlexGap>
+                <Box onClick={() => setOp('all')} sx={{ cursor: 'pointer' }}>
+                    <KpiCard label="Wells on job" value={counts.onJob} color="#22c55e" />
+                </Box>
+                {OPERATION_TILES.filter((k) => counts.ops[k]).map((k) => (
+                    <Box key={k} onClick={() => setOp(op === k ? 'all' : k)} sx={{ cursor: 'pointer', opacity: op === 'all' || op === k ? 1 : 0.5 }}>
+                        <KpiCard label={OPERATION_META[k].label} value={counts.ops[k]} color={OPERATION_META[k].color} />
+                    </Box>
+                ))}
+                {Object.keys(counts.ops).filter((k) => !OPERATION_TILES.includes(k) && !['RIG_UP', 'RIG_DOWN', 'IDLE'].includes(k)).map((k) => (
+                    <Box key={k} onClick={() => setOp(op === k ? 'all' : k)} sx={{ cursor: 'pointer', opacity: op === 'all' || op === k ? 1 : 0.5 }}>
+                        <KpiCard label={OPERATION_META[k]?.label || k} value={counts.ops[k]} color={OPERATION_META[k]?.color || '#7c8aa0'} />
+                    </Box>
+                ))}
+                {(counts.ops.RIG_UP || counts.ops.RIG_DOWN || counts.ops.IDLE) ? (
+                    <KpiCard label="Rig up/down · idle" value={(counts.ops.RIG_UP || 0) + (counts.ops.RIG_DOWN || 0) + (counts.ops.IDLE || 0)} color="#7c8aa0" />
+                ) : null}
+                <Box onClick={() => setOp(op === 'none' ? 'all' : 'none')} sx={{ cursor: 'pointer', opacity: op === 'all' || op === 'none' ? 1 : 0.5 }}>
+                    <KpiCard label="Off job" value={counts.offJob} color="#64748b" />
+                </Box>
+            </Stack>
+            {/* Secondary line — lifecycle summary of the registry. */}
+            <Stack direction="row" spacing={1.5} mb={2} flexWrap="wrap" useFlexGap alignItems="center">
+                <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 700, letterSpacing: 0.5 }}>
+                    LIFECYCLE · {counts.total} wells
+                </Typography>
+                {['producing', 'workover', 'planned', 'completed', 'suspended', 'abandoned'].map((s) => (
+                    counts.lifecycle[s] ? (
+                        <Typography key={s} variant="caption" sx={{ color: WELL_STATUS_COLOR[s] || 'text.secondary', fontWeight: 700 }}>
+                            {counts.lifecycle[s]} {s}
+                        </Typography>
+                    ) : null
+                ))}
             </Stack>
 
             {err && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setErr('')}>{err}</Alert>}
@@ -235,6 +305,16 @@ export default function Wells() {
                             <Select labelId="well-type-label" label="Type" value={type} onChange={(e) => setType(e.target.value)}>
                                 <MenuItem value="all">All types</MenuItem>
                                 {WELL_TYPES.map((t) => <MenuItem key={t} value={t}>{t}</MenuItem>)}
+                            </Select>
+                        </FormControl>
+                        <FormControl size="small" sx={{ minWidth: 160 }}>
+                            <InputLabel id="well-op-label">Operation</InputLabel>
+                            <Select labelId="well-op-label" label="Operation" value={op} onChange={(e) => setOp(e.target.value)}>
+                                <MenuItem value="all">All operations</MenuItem>
+                                {Object.keys(OPERATION_META).map((k) => (
+                                    <MenuItem key={k} value={k}>{OPERATION_META[k].label}</MenuItem>
+                                ))}
+                                <MenuItem value="none">Off job (no rig)</MenuItem>
                             </Select>
                         </FormControl>
                     </Stack>

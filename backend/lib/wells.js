@@ -68,11 +68,17 @@ async function getWells({ assetUnit, status, q } = {}) {
         where.push(`(lower(w.name) LIKE $${i} OR lower(w.well_id) LIKE $${i} OR lower(COALESCE(w.uwi,'')) LIKE $${i} OR lower(COALESCE(w.field,'')) LIKE $${i})`);
     }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    // current_operation: what is being DONE on the well right now — the attached
+    // rig's live activity code (RIH / POOH / MILLING / CDR / ...), present only
+    // while a rig is actually on the well. This is the operational axis the
+    // Wells page categorises by; lifecycle status is the well's own state.
     const { rows } = await query(
         `SELECT w.well_id, w.name, w.uwi, w.well_type, w.service_type, w.status, w.asset_unit, w.field,
                 w.total_depth, w.current_rig_id, w.spud_date,
+                CASE WHEN w.current_rig_id IS NOT NULL THEN r.active_activity END AS current_operation,
                 EXISTS (SELECT 1 FROM well_runs wr WHERE wr.well_id = w.well_id AND wr.ended_at IS NULL) AS active_run
-         FROM wells w ${clause}
+         FROM wells w
+         LEFT JOIN rigs r ON r.rig_id = w.current_rig_id ${clause}
          ORDER BY w.well_id`, vals);
     return rows.map((r) => ({
         wellId: r.well_id,
@@ -85,6 +91,7 @@ async function getWells({ assetUnit, status, q } = {}) {
         field: r.field,
         totalDepth: r.total_depth,
         currentRigId: r.current_rig_id,
+        currentOperation: r.current_operation || null,
         spudDate: r.spud_date,
         activeRun: r.active_run === true,
     }));
@@ -354,9 +361,12 @@ async function trackRunInTxn(client, rigId, job) {
         `INSERT INTO well_runs (well_id, rig_id, job_no, started_at) VALUES ($1,$2,$3,now())
          ON CONFLICT (rig_id) WHERE ended_at IS NULL DO NOTHING`,
         [wellId, rigId, jobName]);
-    // Point the well at this rig.
+    // Point the well at this rig — and put it IN WORKOVER: a rig actively
+    // running on a well overrides any resting state (completed / producing /
+    // suspended); without this, a rig returning to a previously-completed well
+    // showed a live operation chip against a 'completed' status.
     await client.query(
-        'UPDATE wells SET current_rig_id = $2, updated_at = now() WHERE well_id = $1',
+        `UPDATE wells SET current_rig_id = $2, status = 'workover', updated_at = now() WHERE well_id = $1`,
         [wellId, rigId]);
 }
 
