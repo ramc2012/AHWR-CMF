@@ -4,19 +4,24 @@
 #
 #   Quickstart:
 #       docker compose up -d --build
-#   Portal:   http://localhost:${FRONTEND_PORT:-8090}   (admin / Admin123)
+#   Portal:   http://localhost:${FRONTEND_PORT:-8090}
+#             sign in as admin with ADMIN_PASSWORD from .env (no default)
 #
 # Real rig-edge sync agents POST store-and-forward batches to this backend's
 # /ingest endpoint over the ONGC WAN.
 #
-# MONITORING-ONLY: nothing in this stack writes back to any rig or PLC.
+# NO CONTROL PATH: this stack can never write a PLC tag or actuate equipment on
+# any rig. The only downstream channel is read-only operator TEXT messages
+# (central -> rig HMI, acknowledged by the operator); everything else is inbound
+# telemetry. Monitoring + one-way operator messaging, never remote control.
 # =====================================================================
 services:
-  # Canonical central store (proposal Â§6.4): TimescaleDB / PostgreSQL.
-  # Pin to a specific TimescaleDB release for production (e.g. 2.17.2-pg16);
-  # the moving `latest` tag is used here for local evaluation.
+  # Canonical central store (proposal §6.4): TimescaleDB / PostgreSQL.
   timescaledb:
-    image: ${TIMESCALE_IMAGE:-timescale/timescaledb:latest-pg15}
+    # Pinned (was the moving `latest-pg15` tag): reproducible + volume-compatible
+    # with the PG15 data dir. Bump deliberately, staying on -pg15 (a -pg16 image
+    # will refuse an existing pg15 volume).
+    image: ${TIMESCALE_IMAGE:-timescale/timescaledb:2.28.3-pg15}
     container_name: crmf_timescaledb
     restart: unless-stopped
     environment:
