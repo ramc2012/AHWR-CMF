@@ -383,6 +383,9 @@ function buildApiRouter() {
     r.get('/rigs/:id/activity', wrap((req) =>
         activity.getActivity(req.params.id, Number(req.query.hours) || 24)));
     r.get('/rigs/:id/messages', wrap((req) => messages.list(req.params.id, req.query.limit)));
+    // Fleet-wide message feed for the Fleet Overview message centre (authenticated
+    // like every /api route; listAll caps the limit at 500 server-side).
+    r.get('/messages', wrap((req) => messages.listAll(req.query.limit)));
     r.post('/rigs/:id/messages', requireRoleAudited('operator'), wrap(async (req) => {
         const row = await messages.create(req.params.id, req.body, req.user);
         emitRigMessage(row);

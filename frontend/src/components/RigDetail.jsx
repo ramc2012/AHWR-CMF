@@ -19,11 +19,12 @@ import OperationsPanel from './rig/panels/OperationsPanel';
 import RigAlarmsPanel from './rig/panels/RigAlarmsPanel';
 import RigReportPanel from './rig/panels/RigReportPanel';
 import RigMaintenancePanel from './rig/panels/RigMaintenancePanel';
+import CentralRigConsoleOverview from './rig/CentralRigConsoleOverview';
 
 // Per-rig AHWR-50-TWIN style pages. These pages stay inside the central rig route;
 // the fleet dashboard and other central modules keep their CRMF shell.
 const HMI_TABS = [
-    { key: 'overview', label: 'Overview', el: OverviewTab },
+    { key: 'overview', label: 'Overview', el: CentralRigConsoleOverview },
     { key: 'edr', label: 'EDR', el: TrendsPanel },
     { key: 'equipment', label: 'Equipment', el: EquipmentPanel },
     { key: 'efficiency', label: 'Efficiency', el: EfficiencyPanel },
@@ -448,7 +449,14 @@ export default function RigDetail() {
             <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
             <RigDataProvider rigId={id}>
                 <ErrorBoundary key={HMI_TABS[tab].key} label="This panel">
-                    {React.createElement(HMI_TABS[tab].el, { rigId: id, rig })}
+                    {React.createElement(HMI_TABS[tab].el, {
+                        rigId: id,
+                        rig,
+                        onTabChange: (key) => {
+                            const nextTab = HMI_TABS.findIndex((item) => item.key === key);
+                            if (nextTab >= 0) setTab(nextTab);
+                        },
+                    })}
                 </ErrorBoundary>
             </RigDataProvider>
             </Box>
@@ -617,39 +625,120 @@ const hookLoad = dw.hook_load ?? 0;
     const torque = htd.torque ?? dr.torque ?? 0;
     const spp = (Number(mp.pressure) || 0) * 14.5038;
     const spm = mp.spm ?? 0;
+    const blockPosition = dw.block_position ?? dr.bit_depth ?? 0;
+    const activity = live?._activity || {};
 
     return (
         <Box sx={{ bgcolor: '#0b1220', minHeight: '100%', p: 1.25, overflowX: 'hidden', overflowY: 'auto' }}>
             <Box sx={{
                 width: '100%',
                 display: 'grid',
-                gridTemplateColumns: { xs: '1fr', lg: '18% minmax(0, 27%) minmax(0, 27%) minmax(0, 28%)' },
-                gap: 1.0,
+                gridTemplateColumns: { xs: '1fr', xl: '150px minmax(980px, 1.35fr) minmax(560px, .8fr)' },
+                gap: 1.2,
                 alignItems: 'stretch',
             }}>
-                <TwinPanel sx={{ height: { xs: 'auto', lg: 'min(50vh, 475px)' }, display: 'flex', flexDirection: 'column' }}>
-                    <Typography align="center" fontWeight={900} color="primary.main" sx={{ letterSpacing: 2.2, mb: -0.3, mt: -0.8, fontSize: 13, lineHeight: 1 }}>ACS</Typography>
-                    <AcsDerrick blockHeight={dw.block_position ?? dr.bit_depth ?? 0} crownSaver={acs.crownsaver} floorSaver={acs.floorsaver} />
-                    <StatusBar label="SLIPS" value={cwk.status != null ? fmtNum(cwk.status, 0) : '--'} />
+                <TwinPanel sx={{ minHeight: 690, display: 'flex', flexDirection: 'column', p: 1.2, bgcolor: '#1b2940' }}>
+                    <Typography sx={{ color: '#8797b0', fontSize: 11, fontWeight: 900, letterSpacing: 2, mb: 1.4 }}>STRING & ACTIVITY</Typography>
+                    <Box sx={{ border: '1px solid #33445f', borderRadius: 1, p: 1.2, mb: 1 }}>
+                        <Typography sx={{ color: '#8797b0', fontSize: 9, fontWeight: 900 }}>CURRENT ACTIVITY</Typography>
+                        <Typography sx={{ color: '#fff', fontSize: 19, fontWeight: 900 }}>{activity.label || rig?.activeActivity || 'IDLE'}</Typography>
+                        <Typography sx={{ color: '#8797b0', fontSize: 8, fontWeight: 800 }}>auto</Typography>
+                    </Box>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0.8, mb: 1 }}>
+                        <TwinTinyMetric label="STRING" value={dr.bit_depth ?? 0} unit="m" color="#ff9d2e" />
+                        <TwinTinyMetric label="TOTAL" value={dr.hole_depth ?? 0} unit="m" color="#f4f8ff" />
+                    </Box>
+                    <TwinStringDepth bitDepth={dr.bit_depth ?? 0} holeDepth={dr.hole_depth ?? 0} sx={{ flex: 1, minHeight: 360 }} />
+                    <Box sx={{ border: '1px solid #33445f', borderRadius: 1, p: 1.1, mt: 1 }}>
+                        <Typography sx={{ color: '#8797b0', fontSize: 9, fontWeight: 900, mb: 0.7 }}>CONNECTIONS</Typography>
+                        <Stack direction="row" justifyContent="space-between">
+                            <Typography sx={{ color: '#8797b0', fontSize: 9, fontWeight: 900 }}>TORQUE TURN</Typography>
+                            <Typography sx={{ color: '#ffc24b', fontSize: 9, fontWeight: 900 }}>LAST MAKE-UP</Typography>
+                        </Stack>
+                        <Stack direction="row" justifyContent="space-between" mt={0.3}>
+                            <Typography sx={{ color: '#fff', fontSize: 12, fontWeight: 900 }}>IDLE</Typography>
+                            <Typography sx={{ color: '#23dd86', fontSize: 12, fontWeight: 900 }}>{fmtNum(pct.last_makeup_torque ?? 0, 0)} daN-m</Typography>
+                        </Stack>
+                    </Box>
                 </TwinPanel>
 
-                <TwinPanel sx={{ height: { xs: 'auto', lg: 'min(50vh, 475px)' }, display: 'flex', flexDirection: 'column' }}>
-                    <TwinGauge label="WOH" value={hookLoad} unit="ton" subLabel="WOB" subValue={wob} subUnit="ton" max={100} majorStep={20} minorStep={4} color="#3ea6ff" />
-                    <TrendStrip color="#3ea6ff" points={overviewTrends.woh} max={100} />
+                <TwinPanel sx={{ minHeight: 690, p: 1.2, bgcolor: '#1b2940' }}>
+                    <Typography sx={{ color: '#8797b0', fontSize: 12, fontWeight: 900, letterSpacing: 2, mb: 1.2 }}>WORKOVER RIG & EQUIPMENT</Typography>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: '160px minmax(520px, 1fr) 160px', gap: 1.2, alignItems: 'stretch', height: 'calc(100% - 28px)' }}>
+                        <Stack spacing={1.1} justifyContent="space-between">
+                            <TwinEquipCard title="CAT ENG" status={catLabel('status', eng.status)} statusColor="#23dd86" rows={[
+                                ['LOAD', `${fmtNum(eng.load ?? 0, 0)} %`, '#46a6ff'],
+                                ['RPM', `${fmtNum(eng.rpm ?? 0, 0)}`, '#46a6ff'],
+                                ['COOLANT', `${fmtNum(eng.coolant_temp ?? 0, 0)} degC`, '#46a6ff'],
+                                ['OIL PRESS', `${fmtNum(eng.oil_pressure ?? 0, 1)} bar`, '#ff9d2e'],
+                            ]} />
+                            <TwinEquipCard title="HPU" status={hpuLabel('status', hpu.status)} statusColor="#ffc24b" rows={[
+                                ['DISCHARGE', `${fmtNum(hpu.discharge_pressure ?? hpu.dis_press ?? hpu.pressure ?? 0, 0)} bar`, '#23dd86'],
+                                ['OIL TEMP', `${fmtNum(hpu.oil_temp ?? hpu.temperature ?? 0, 1)} degC`, '#23dd86'],
+                                ['OIL LEVEL', `${fmtNum(hpu.oil_level ?? 0, 0)} %`, '#23dd86'],
+                                ['FILTERS', hpu.filter_status != null ? hpuLabel('filter', hpu.filter_status) : '7/8', '#23dd86'],
+                            ]} />
+                            <TwinEquipCard title="HTD" status={htdLabel('status', htd.status)} statusColor="#27cfe6" rows={[
+                                ['RPM', `${fmtNum(htdRpm, 0)}`, '#9a8bff'],
+                                ['TORQUE', `${fmtNum(torque, 0)} daN-m`, '#9a8bff'],
+                                ['GEAR', htdLabel('gearSelection', htd.gear_selection ?? htd.gear_status), '#9a8bff'],
+                                ['ELEVATOR', htdLabel('elevator', htd.elevator_status), '#9a8bff'],
+                            ]} />
+                            <TwinEquipCard title="PCT" status={pctLabel('status', pct.status)} statusColor="#8797b0" rows={[
+                                ['MAKE-UP', `${fmtNum(pct.makeup_torque ?? 0, 0)} daN-m`, '#27cfe6'],
+                                ['LAST', `${fmtNum(pct.last_makeup_torque ?? 0, 0)} daN-m`, '#27cfe6'],
+                                ['DOLLY', pctLabel('dollyWorkPark', pct.dolly_status, 'IN PARK'), '#27cfe6'],
+                                ['UP CLAMP', `${fmtNum(pct.clamp_up_pressure ?? 0, 1)} bar`, '#27cfe6'],
+                            ]} />
+                        </Stack>
+                        <TwinWorkoverMast blockPosition={blockPosition} pct={pct} htd={htd} cwk={cwk} live={!!live} />
+                        <Stack spacing={1.1} justifyContent="space-between">
+                            <TwinEquipCard title="ACS" status={headerLabel('acs', acs.status, '---')} statusColor="#8797b0" danger rows={[
+                                ['CROWNSAVER', `${fmtNum(acs.crownsaver ?? 0, 0)}mm`, '#ff4a60'],
+                                ['FLOORSAVER', `${fmtNum(acs.floorsaver ?? 0, 0)}mm`, '#ff4a60'],
+                                ['BOTTOMSAVER', `${fmtNum(acs.bottomsaver ?? 0, 0)}mm`, '#ff4a60'],
+                                ['BLOCK POS', `${fmtNum(blockPosition, 0)}mm`, '#ff4a60'],
+                            ]} />
+                            <TwinEquipCard title="CIRC PUMP" status={Number(spm) > 0 ? 'PUMPING' : 'STOPPED'} statusColor={Number(spm) > 0 ? '#23dd86' : '#64748b'} rows={[
+                                ['PRESS', `${fmtNum(spp, 0)} psi`, '#a9ef34'],
+                                ['RATE', `${fmtNum(spm, 0)} spm`, '#a9ef34'],
+                                ['TRIP TANK', `${fmtNum(live?.fluid?.trip_tank ?? 0, 1)} m3`, '#a9ef34'],
+                                ['GAIN/LOSS', `${fmtNum(live?.fluid?.tank_gain_loss ?? 0, 0)} m3`, '#a9ef34'],
+                            ]} />
+                            <TwinEquipCard title="CATWALK" status={Number(cwk.status) === 1 ? 'PARKED' : '---'} statusColor={Number(cwk.status) === 1 ? '#23dd86' : '#64748b'} rows={[
+                                ['CARRIER', cwk.carrier_status != null ? String(cwk.carrier_status) : '---', '#ffc24b'],
+                                ['CLAMP', cwk.clamp_status != null ? String(cwk.clamp_status) : '---', '#f4f8ff'],
+                                ['CLAMP P', `${fmtNum(cwk.clamp_pressure ?? 0, 0)} bar`, '#ffc24b'],
+                                ['CLAMP F', `${fmtNum(cwk.clamp_force ?? 0, 0)} daN`, '#ffc24b'],
+                            ]} />
+                            <TwinEquipCard title="WELL CONTROL" status={live?.well_control?.available ? 'OK' : 'NO BOP SOURCE'} statusColor={live?.well_control?.available ? '#23dd86' : '#ff4a60'} danger rows={[
+                                ['TUBING P', `${fmtNum(live?.wellhead?.tubing_pressure ?? 0, 0)} bar`, '#f4f8ff'],
+                                ['CASING P', `${fmtNum(live?.wellhead?.casing_pressure ?? 0, 0)} bar`, '#f4f8ff'],
+                                ['ACCUM', `${fmtNum(live?.well_control?.accumulator_pressure ?? 0, 0)} psi`, '#f4f8ff'],
+                                ['ANNULAR', `${fmtNum(live?.well_control?.annular_pressure ?? 0, 0)} psi`, '#f4f8ff'],
+                            ]} />
+                        </Stack>
+                    </Box>
                 </TwinPanel>
 
-                <TwinPanel sx={{ height: { xs: 'auto', lg: 'min(50vh, 475px)' }, display: 'flex', flexDirection: 'column' }}>
-                    <TwinGauge label="HTD" value={htdRpm} unit="RPM" subLabel="TORQUE" subValue={torque} subUnit="daN-m" subDecimals={0} max={200} majorStep={40} minorStep={8} color="#4ade80" />
-                    <TrendStrip color="#4ade80" points={overviewTrends.htd} max={200} />
-                </TwinPanel>
-
-                <TwinPanel sx={{ height: { xs: 'auto', lg: 'min(50vh, 475px)' }, display: 'flex', flexDirection: 'column' }}>
-                    <TwinGauge label="SPP" value={spp} unit="psi" decimals={0} subLabel="SPM" subValue={spm} max={5000} majorStep={1000} minorStep={200} color="#fbbf24" />
-                    <Box sx={{ mt: 1, display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 0.75, width: '100%' }}>
-                        <MiniReadout label="TOTAL STROKES" value={mp.total_strokes ?? 0} />
-                        <MiniReadout label="ROP" value={dr.rop ?? 0} unit="m/hr" />
-                        <MiniReadout label="FLOW IN" value={mp.flow_in ?? 0} unit="L/min" />
-                        <MiniReadout label="FLOW OUT" value={mp.flow_out ?? 0} unit="%" />
+                <TwinPanel sx={{ minHeight: 690, p: 1.1, display: 'flex', flexDirection: 'column', bgcolor: '#1b2940' }}>
+                    <Typography sx={{ color: '#8797b0', fontSize: 12, fontWeight: 900, letterSpacing: 2, mb: 1.2 }}>PRIMARY INSTRUMENTS</Typography>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 1.0, minHeight: 260 }}>
+                        <Box sx={{ minHeight: 230, display: 'flex', flexDirection: 'column' }}>
+                            <TwinGauge label="HOOK LOAD" value={hookLoad} unit="t" subLabel="WOB" subValue={wob} subUnit="t" max={100} majorStep={20} minorStep={4} color="#23dd86" />
+                        </Box>
+                        <Box sx={{ minHeight: 230, display: 'flex', flexDirection: 'column' }}>
+                            <TwinGauge label="HTD" value={htdRpm} unit="rpm" subLabel="TORQUE" subValue={torque} subUnit="daN-m" subDecimals={0} max={180} majorStep={36} minorStep={6} color="#23dd86" />
+                        </Box>
+                        <Box sx={{ minHeight: 230, display: 'flex', flexDirection: 'column' }}>
+                            <TwinGauge label="SPP" value={spp} unit="psi" decimals={0} subLabel="RATE" subValue={spm} subUnit="spm" max={3000} majorStep={600} minorStep={100} color="#23dd86" />
+                        </Box>
+                    </Box>
+                    <Box sx={{ flex: 1, mt: 1.2, border: '1px solid rgba(62,166,255,.18)', borderRadius: 1, p: 1, bgcolor: '#07111e' }}>
+                        <Typography sx={{ color: '#f4f8ff', fontSize: 12, fontWeight: 900, letterSpacing: 2, mb: 1 }}>LAST 12H TRENDS</Typography>
+                        <TrendStrip color="#ff9d2e" points={overviewTrends.woh} max={100} label="HOOK LOAD" compact />
+                        <TrendStrip color="#27cfe6" points={overviewTrends.htd} max={200} label="HTD RPM" compact />
+                        <TrendStrip color="#ffc24b" points={overviewTrends.catLoad} max={100} label="GENSET LOAD" compact />
                     </Box>
                 </TwinPanel>
             </Box>
@@ -733,6 +822,123 @@ const hookLoad = dw.hook_load ?? 0;
         </Box>
     );
 }
+function TwinTinyMetric({ label, value, unit, color }) {
+    return (
+        <Box sx={{ bgcolor: '#07111e', border: '1px solid rgba(62,166,255,.18)', borderRadius: 0.75, px: 0.75, py: 0.65, minHeight: 48, display: 'grid', alignContent: 'center' }}>
+            <Typography sx={{ color: '#8797b0', fontSize: 8, fontWeight: 900, lineHeight: 1 }}>{label}</Typography>
+            <Typography sx={{ color, fontSize: 16, fontWeight: 900, lineHeight: 1.15 }}>{fmtNum(value, 0)}<Typography component="span" sx={{ color: '#b8c6dc', fontSize: 10, ml: 0.4 }}>{unit}</Typography></Typography>
+        </Box>
+    );
+}
+
+function TwinStringDepth({ bitDepth, holeDepth, sx }) {
+    const bit = Math.max(0, Number(bitDepth) || 0);
+    const total = Math.max(bit, Number(holeDepth) || 0, 1);
+    const pct = Math.max(8, Math.min(92, (bit / total) * 88));
+    return (
+        <Box sx={{ height: 345, border: '1px solid #33445f', borderRadius: 1, position: 'relative', overflow: 'hidden', bgcolor: '#172236', ...sx }}>
+            <Box sx={{ position: 'absolute', inset: 0, backgroundImage: 'repeating-linear-gradient(0deg, transparent 0 86px, rgba(148,163,184,.08) 87px)' }} />
+            <Box sx={{ position: 'absolute', top: 18, bottom: 22, left: '44%', width: 2, bgcolor: '#46a6ff', opacity: 0.75 }} />
+            <Box sx={{ position: 'absolute', top: 18, bottom: 22, left: '57%', width: 2, bgcolor: '#46a6ff', opacity: 0.75 }} />
+            <Box sx={{ position: 'absolute', left: 11, right: 11, top: `${pct}%`, height: 3, bgcolor: '#ff9d2e' }} />
+            <Box sx={{ position: 'absolute', top: `calc(${pct}% - 4px)`, right: 8, width: 10, height: 10, borderRadius: '50%', bgcolor: '#ff9d2e', boxShadow: '0 0 8px #ff9d2e' }} />
+            <Typography sx={{ position: 'absolute', top: 13, left: 11, color: '#8797b0', fontSize: 8, fontWeight: 900 }}>SURFACE 0m</Typography>
+            {[0.25, 0.5, 0.75].map((line) => (
+                <Typography key={line} sx={{ position: 'absolute', top: `calc(${line * 100}% - 7px)`, right: 5, color: '#8797b0', fontSize: 8, fontWeight: 700 }}>{fmtNum(total * line, 0)}m</Typography>
+            ))}
+            <Typography sx={{ position: 'absolute', top: `calc(${pct}% - 13px)`, left: 11, color: '#ff9d2e', fontSize: 9, fontWeight: 900 }}>PIPE {fmtNum(bit, 0)}m</Typography>
+        </Box>
+    );
+}
+
+function TwinEquipCard({ title, status, statusColor = '#8797b0', rows = [], danger }) {
+    return (
+        <Box sx={{
+            border: '1px solid rgba(62,166,255,.24)',
+            borderLeft: `4px solid ${danger ? '#ff4a60' : statusColor}`,
+            borderRadius: 1,
+            bgcolor: '#07111e',
+            p: 1,
+            minHeight: 118,
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
+        }}>
+            <Stack direction="row" alignItems="center" justifyContent="space-between" mb={0.5}>
+                <Typography sx={{ color: '#f4f8ff', fontSize: 14, fontWeight: 900, lineHeight: 1 }}>{title}</Typography>
+                <Stack direction="row" alignItems="center" spacing={0.45}>
+                    <Box sx={{ width: 7, height: 7, borderRadius: '50%', bgcolor: statusColor }} />
+                    <Typography sx={{ color: statusColor, fontSize: 9, fontWeight: 900 }}>{status}</Typography>
+                </Stack>
+            </Stack>
+            <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0.55 }}>
+                {rows.map(([label, value, color]) => (
+                    <Box key={label} sx={{ minWidth: 0 }}>
+                        <Typography sx={{ color: '#b8c6dc', fontSize: 8, fontWeight: 900, lineHeight: 1.2 }}>{label}</Typography>
+                        <Typography sx={{ color: color || '#f4f8ff', fontSize: 12, fontWeight: 900, lineHeight: 1.2 }} noWrap>{value}</Typography>
+                    </Box>
+                ))}
+            </Box>
+        </Box>
+    );
+}
+
+function TwinWorkoverMast({ blockPosition, pct, htd, cwk, live }) {
+    const numeric = Math.max(0, Number(blockPosition) || 0);
+    const y = 320 - Math.min(1, numeric / 15000) * 230;
+    const dolly = pctLabel('dollyWorkPark', pct?.dolly_status, 'NO DATA');
+    const elevator = htdLabel('elevator', htd?.elevator_status, 'NO DATA');
+    return (
+        <Box sx={{ minHeight: 620, position: 'relative', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
+            <svg viewBox="0 0 390 540" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+                <defs>
+                    <filter id="twinMastGlow" x="-30%" y="-30%" width="160%" height="160%">
+                        <feGaussianBlur stdDeviation="4" result="blur" />
+                        <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+                    </filter>
+                </defs>
+                <polygon points="195,54 116,453 274,453" fill="#0f172a" opacity="0.18" stroke="#46a6ff" strokeWidth="1.2" strokeDasharray="9 9" />
+                <text x="160" y="74" textAnchor="end" fill="#8797b0" fontSize="11" fontWeight="900">CROWN</text>
+                <rect x="170" y="42" width="50" height="20" rx="4" fill="#33445f" stroke="#8797b0" strokeWidth="2" />
+                <circle cx="184" cy="52" r="5" fill="#8797b0" />
+                <circle cx="207" cy="52" r="5" fill="#8797b0" />
+                <line x1="185" y1="62" x2="130" y2="430" stroke="#33445f" strokeWidth="5" />
+                <line x1="205" y1="62" x2="260" y2="430" stroke="#33445f" strokeWidth="5" />
+                <line x1="195" y1="62" x2="195" y2="430" stroke="#1f2937" strokeWidth="6" />
+                <line x1="184" y1="56" x2="184" y2={y - 45} stroke="#22ff66" strokeWidth="2" />
+                <line x1="207" y1="56" x2="207" y2={y - 45} stroke="#22ff66" strokeWidth="2" />
+                <line x1="150" y1="120" x2="60" y2="470" stroke="#33445f" strokeDasharray="8 8" opacity="0.55" />
+                <line x1="240" y1="120" x2="330" y2="470" stroke="#33445f" strokeDasharray="8 8" opacity="0.55" />
+                <text x="260" y="256" fill="#8797b0" fontSize="13" fontWeight="900">TELESCOPING</text>
+                <rect x="170" y={y} width="50" height="18" rx="3" fill="#475569" stroke="#b8c6dc" strokeWidth="2" />
+                <rect x="164" y={y - 45} width="62" height="32" rx="4" fill="#0b2738" stroke="#27cfe6" strokeWidth="3" filter="url(#twinMastGlow)" />
+                <text x="195" y={y - 24} textAnchor="middle" fill="#27cfe6" fontSize="12" fontWeight="900">HTD</text>
+                <rect x="158" y={y - 5} width="74" height="22" rx="5" fill="#111827" stroke="#ffc24b" strokeWidth="3" />
+                <text x="195" y={y + 10} textAnchor="middle" fill="#ffc24b" fontSize="10" fontWeight="900">ELEVATOR</text>
+                <text x="142" y={y + 5} textAnchor="end" fill="#ff9d2e" fontSize="11" fontWeight="900">{fmtNum(numeric, 0)} mm</text>
+                <rect x="125" y="360" width="140" height="20" rx="4" fill="#33445f" stroke="#8797b0" strokeWidth="2" />
+                <rect x="120" y="430" width="150" height="18" rx="3" fill="#33445f" />
+                <line x1="95" y1="448" x2="310" y2="448" stroke="#33445f" strokeWidth="4" />
+                <path d="M65 440 L120 417 L145 417 L145 440 Z" fill="none" stroke="#8797b0" strokeWidth="4" />
+                <rect x="92" y="421" width="48" height="9" rx="2" fill="#263956" stroke="#8797b0" strokeWidth="2" />
+                <text x="112" y="414" fill="#8797b0" fontSize="9" fontWeight="900">CARRIER</text>
+                <text x="116" y="445" fill="#8797b0" fontSize="8" fontWeight="900">SLIDE</text>
+                <rect x="255" y="360" width="62" height="24" rx="4" fill="#111827" stroke="#ffc24b" strokeWidth="4" filter="url(#twinMastGlow)" />
+                <text x="286" y="376" textAnchor="middle" fill="#ffc24b" fontSize="11" fontWeight="900">PCT</text>
+                <rect x="150" y="395" width="82" height="24" rx="3" fill="#111827" stroke="#ffc24b" />
+                <text x="191" y="411" textAnchor="middle" fill="#ffc24b" fontSize="11" fontWeight="900">{dolly}</text>
+                <rect x="158" y="377" width="74" height="28" rx="4" fill="#263956" stroke="#8797b0" strokeWidth="3" />
+                <text x="195" y="390" textAnchor="middle" fill="#8797b0" fontSize="8" fontWeight="900">ELEVATOR</text>
+                <text x="195" y="401" textAnchor="middle" fill="#8797b0" fontSize="8" fontWeight="900">{elevator}</text>
+                <line x1="195" y1={y + 17} x2="195" y2="430" stroke="#27cfe6" strokeWidth="5" opacity={live ? 0.75 : 0.25} strokeDasharray="8 7" />
+                <text x="195" y="416" textAnchor="middle" fill="#27cfe6" opacity="0.35" fontSize="13" fontWeight="900">NO DATA</text>
+                <text x="195" y="505" textAnchor="middle" fill="#8797b0" fontSize="10" fontWeight="900" letterSpacing="2">WORKOVER MAST - ACS ENVELOPE</text>
+                <text x="70" y="456" fill="#8797b0" fontSize="9" fontWeight="900">CATWALK {cwk?.status != null ? cwk.status : '--'}</text>
+            </svg>
+        </Box>
+    );
+}
+
 function TwinPanel({ children, sx }) {
     return <Paper sx={{ p: 1.0, borderRadius: 1.5, bgcolor: '#111827', borderColor: 'rgba(62,166,255,0.24)', overflow: 'hidden', ...sx }}>{children}</Paper>;
 }

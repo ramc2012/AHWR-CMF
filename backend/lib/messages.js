@@ -37,6 +37,11 @@ async function list(rigId, limit = 100) {
     return (await query(`SELECT ${publicCols} FROM rig_messages WHERE target_rig_id = $1 ORDER BY sent_at DESC LIMIT $2`, [rigId, n])).rows;
 }
 
+async function listAll(limit = 100) {
+    const n = Math.min(Math.max(Number(limit) || 100, 1), 500);
+    return (await query(`SELECT ${publicCols} FROM rig_messages ORDER BY sent_at DESC LIMIT $1`, [n])).rows;
+}
+
 async function create(rigId, body, user) {
     const rig = await getRig(rigId);
     const message = {
@@ -98,4 +103,4 @@ async function retry(messageId, rigId) {
     return rows[0];
 }
 
-module.exports = { list, create, pendingForRig, markDelivered, acknowledge, retry };
+module.exports = { list, listAll, create, pendingForRig, markDelivered, acknowledge, retry };

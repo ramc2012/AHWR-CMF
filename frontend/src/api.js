@@ -55,6 +55,7 @@ export const api = {
     rigLive: (id) => axios.get(`/api/rigs/${id}/live`).then((r) => r.data),
     rigHistoryMulti: (id, metrics, minutes, maxPoints) => axios.get(`/api/rigs/${id}/history-multi`, { params: { metrics: Array.isArray(metrics) ? metrics.join(',') : metrics, minutes, maxPoints } }).then((r) => r.data),
     rigAlarms: (id, limit) => axios.get(`/api/rigs/${id}/alarms`, { params: { limit } }).then((r) => r.data),
+    allRigMessages: (limit) => axios.get('/api/messages', { params: { limit } }).then((r) => r.data),
     rigMessages: (id, limit) => axios.get(`/api/rigs/${id}/messages`, { params: { limit } }).then((r) => r.data),
     sendRigMessage: (id, body) => axios.post(`/api/rigs/${id}/messages`, body).then((r) => r.data),
     retryRigMessage: (id, messageId) => axios.post(`/api/rigs/${id}/messages/${messageId}/retry`).then((r) => r.data),
