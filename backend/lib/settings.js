@@ -27,7 +27,10 @@ const DEFAULTS = {
     etp20_read_only: true,
     etp20_server_enabled: true,
     etp20_server_path: '/etp',
-    etp20_server_token: process.env.INGEST_TOKEN || 'AHWR-ETP-2026',
+    // No baked-in default: a published token would leave the ETP endpoint
+    // effectively open. Empty + no INGEST_TOKEN => the upgrade gate fails
+    // closed (per-rig device tokens still work; see etp20Server).
+    etp20_server_token: process.env.INGEST_TOKEN || '',
 };
 const BOUNDS = {
     retention_days: [1, 36500],
@@ -142,15 +145,19 @@ async function seedDefaults() {
              VALUES ($1, $2::jsonb, 'system')
              ON CONFLICT (key) DO NOTHING`,
             [KEY, JSON.stringify(DEFAULTS)]);
+        // Backfill ONLY keys that are absent from the stored row (added in
+        // later versions). The previous unconditional merge force-overwrote
+        // etp20_server_token with the env/hardcoded value at EVERY boot,
+        // silently clobbering an admin-set token.
         await query(
             `UPDATE app_settings
-                SET value = value || $2::jsonb, updated_by = 'system', updated_at = now()
-              WHERE key = $1`,
+                SET value = $2::jsonb || value, updated_by = updated_by, updated_at = updated_at
+              WHERE key = $1 AND NOT value ?& $3::text[]`,
             [KEY, JSON.stringify({
                 etp20_server_enabled: true,
                 etp20_server_path: '/etp',
-                etp20_server_token: process.env.INGEST_TOKEN || 'AHWR-ETP-2026',
-            })]);
+                etp20_server_token: process.env.INGEST_TOKEN || '',
+            }), ['etp20_server_enabled', 'etp20_server_path', 'etp20_server_token']]);
         const s = await getSettings({ revealSecrets: true });
         if (typeof fleet.setOfflineSec === 'function') fleet.setOfflineSec(s.offline_sec);
     } catch (e) {

@@ -12,6 +12,7 @@ const fleet = require('./fleet');
 const rigview = require('./rigview');
 const { ingestBatch } = require('./ingest');
 const { safeEqual } = require('./secrets');
+const { query } = require('./db');
 
 let wss = null;
 let config = {};
@@ -144,11 +145,17 @@ function normalizeMetricName(name) {
     if (raw.includes('.') && !raw.includes(' ')) return raw;
     const compact = raw.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
     const aliases = {
+        // The edge ETP publisher (backend/lib/etp.js CHANNELS) sends 7 mnemonics;
+        // every one of them must translate, or the raw mnemonic leaks into
+        // telemetry as its own metric (seen live: 'TUBP'/'CASP' rows beside
+        // 'wellhead.tubing_pressure' from the sync path for the same rig).
         BPOS: 'drawworks.block_position',
         HKLD: 'drawworks.hook_load',
         WOB: 'drilling.wob',
         DMEA: 'drilling.hole_depth',
         SPPA: 'mudpump.pressure',
+        TUBP: 'wellhead.tubing_pressure',
+        CASP: 'wellhead.casing_pressure',
         DRAWWORKS_ROPE_WEAR: 'drawworks.rope_wear',
         AHWR_PDW_ACT_PRESSURE: 'hpu.pdw_pump_press',
         AHWR_PDW_CALIBARTION_STATUS_0_UNKNONE_1_ON_2_OFF_3_DISABLE: 'acs.calibration_status',
@@ -539,14 +546,32 @@ function attach(server, nextConfig = {}) {
     const path = normalizePath(config.etp20_server_path);
     wss = new WebSocket.Server({ noServer: true });
     upgradeHandler = (req, socket, head) => {
-        try {
+        (async () => {
             const url = requestUrl(req);
             if (url.pathname !== path && url.pathname !== '/') return;
+            const token = tokenFrom(req);
+            const deviceId = String(url.searchParams.get('deviceId') || url.searchParams.get('rigId')
+                || req.headers['x-device-id'] || req.headers['x-rig-id'] || '').trim();
+
+            // Two ways in, mirroring ingest.authorize():
+            //  1. the rig named in X-Device-Id presents ITS OWN provisioned
+            //     device_token (authoritative for that rig);
+            //  2. the shared server/ingest token (integration clients, and rigs
+            //     not yet provisioned).
             // No baked-in default: a published fallback token is equivalent to an
             // open endpoint. Fail closed when nothing is configured.
-            const expected = String(config.etp20_server_token || process.env.INGEST_TOKEN || '');
-            const token = tokenFrom(req);
-            if (!expected || !token || !safeEqual(token, expected)) {
+            let authorized = false;
+            if (token && deviceId) {
+                const { rows } = await query(
+                    'SELECT device_token FROM rigs WHERE rig_id = $1', [deviceId]).catch(() => ({ rows: [] }));
+                const perRig = rows[0] && rows[0].device_token;
+                if (perRig) authorized = safeEqual(token, perRig);
+            }
+            if (!authorized && token) {
+                const shared = String(config.etp20_server_token || process.env.INGEST_TOKEN || '');
+                if (shared) authorized = safeEqual(token, shared);
+            }
+            if (!authorized) {
                 status.rejectedCount += 1;
                 socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
                 socket.destroy();
@@ -557,14 +582,14 @@ function attach(server, nextConfig = {}) {
                 // forwards this to ingest.authorize(), so it must not be
                 // back-filled with a server-side secret.
                 ws.etpToken = token;
-                ws.etpDeviceId = url.searchParams.get('deviceId') || url.searchParams.get('rigId') || req.headers['x-device-id'] || req.headers['x-rig-id'] || '';
+                ws.etpDeviceId = deviceId;
                 if (url.pathname === '/') setStatus({ lastMessageSummary: 'Accepted ETP client on / alias; preferred path is /etp' });
                 wss.emit('connection', ws, req);
             });
-        } catch (e) {
+        })().catch((e) => {
             setStatus({ lastError: e.message });
             try { socket.destroy(); } catch { /* ignore */ }
-        }
+        });
     };
     server.on('upgrade', upgradeHandler);
     attachedServer = server;
