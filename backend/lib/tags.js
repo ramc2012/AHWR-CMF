@@ -187,6 +187,24 @@ const TAGS = [
     { metric: 'cat_engine.status',          label: 'Engine status',       unit: '',       group: 'Engine & power',   expected: false, key: false },
     { metric: 'cat_engine.run_hours',       label: 'Engine run hours',    unit: 'h',      group: 'Engine & power',   expected: false, key: false },
     { metric: 'cat_engine.total_hours',     label: 'Engine total hours',  unit: 'h',      group: 'Engine & power',   expected: false, key: false },
+
+    // ---------------------------------------------------------------
+    // OPC UA demo nodes — NOT rig signals.
+    //
+    // The edge demo profile runs an OPC UA server simulator (opc-plc) and a
+    // dedicated Telegraf lane, which proves the OPC UA ingest path end-to-end.
+    // Those synthetic nodes flow through the same sync agent and therefore reach
+    // central. They are mapped here (rather than left unmapped) so the config
+    // registry shows them for what they are instead of silently accepting
+    // unknown metrics — but they are never `expected` and never `key`, so they
+    // cannot affect any rig's data-completeness score.
+    // A production edge does not run the demo profile and will not send these.
+    // ---------------------------------------------------------------
+    { metric: 'opcua_demo.dip',             label: 'OPC UA demo: dip',          unit: '', group: 'OPC UA demo', expected: false, key: false },
+    { metric: 'opcua_demo.spike',           label: 'OPC UA demo: spike',        unit: '', group: 'OPC UA demo', expected: false, key: false },
+    { metric: 'opcua_demo.random_uint',     label: 'OPC UA demo: random uint',  unit: '', group: 'OPC UA demo', expected: false, key: false },
+    { metric: 'opcua_demo.fast_counter',    label: 'OPC UA demo: fast counter', unit: '', group: 'OPC UA demo', expected: false, key: false },
+    { metric: 'opcua_demo.slow_counter',    label: 'OPC UA demo: slow counter', unit: '', group: 'OPC UA demo', expected: false, key: false },
 ];
 
 // Back-compat for pre-consolidation edges that still emit the old BOP namespace.

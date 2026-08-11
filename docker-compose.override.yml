@@ -1,0 +1,21 @@
+# Attaches the central backend to the shared `ahwr-wan` network, which stands in
+# for the ONGC WAN linking the 50 rig-edge nodes to the central facility.
+#
+# Without this the edge and central stacks sit on separate per-project bridge
+# networks and cannot reach each other by service name, so a real edge->central
+# sync can only be demonstrated via published host ports.
+#
+#   docker network create ahwr-wan     # once
+#
+# Edge nodes then reach central at http://crmf_backend:6000 (see the edge's own
+# override). Only the backend joins: the DB and portal stay on the private
+# project network.
+services:
+  crmf-backend:
+    networks:
+      - default
+      - ahwr-wan
+
+networks:
+  ahwr-wan:
+    external: true

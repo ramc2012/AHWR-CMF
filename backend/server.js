@@ -112,18 +112,32 @@ io.on('connection', (socket) => {
             .then((rows) => { if (rows.length) socket.emit('central_messages:batch', rows); })
             .catch((e) => console.warn('[messages] pending delivery failed:', e.message));
 
-        socket.on('edge_message_delivered', async (payload = {}) => {
+        // Both handlers reply through the optional Socket.IO ack callback so the
+        // edge learns whether its update actually landed. Without it the edge can
+        // only guess from socket.connected, which stays true for up to a ping
+        // timeout after the link drops — so an ack emitted into that window is
+        // silently lost, and the edge can never tell. The callback is optional:
+        // older edges that emit without one still work unchanged.
+        socket.on('edge_message_delivered', async (payload = {}, cb) => {
             try {
                 const row = await messages.markDelivered(payload.messageId, socket.edgeRigId);
                 if (row) io.emit('rig_message_update', row);
-            } catch (e) { console.warn('[messages] delivery ack failed:', e.message); }
+                if (typeof cb === 'function') cb({ ok: Boolean(row), messageId: payload.messageId, status: row && row.status });
+            } catch (e) {
+                console.warn('[messages] delivery ack failed:', e.message);
+                if (typeof cb === 'function') cb({ ok: false, error: e.message });
+            }
         });
 
-        socket.on('edge_message_ack', async (payload = {}) => {
+        socket.on('edge_message_ack', async (payload = {}, cb) => {
             try {
                 const row = await messages.acknowledge(payload.messageId, socket.edgeRigId, payload.acknowledgedBy);
                 if (row) io.emit('rig_message_update', row);
-            } catch (e) { console.warn('[messages] acknowledge failed:', e.message); }
+                if (typeof cb === 'function') cb({ ok: Boolean(row), messageId: payload.messageId, status: row && row.status });
+            } catch (e) {
+                console.warn('[messages] acknowledge failed:', e.message);
+                if (typeof cb === 'function') cb({ ok: false, error: e.message });
+            }
         });
         return;
     }

@@ -26,6 +26,13 @@ const ALLOW_OPEN_INGEST =
 // without a schema change to rig_latest.
 const TS_KEY = '__ts';
 
+// How far BELOW the stored high-water mark an incoming seq must fall before it is
+// read as "the sender restarted its counter" rather than "this is a replayed
+// batch". Buffered replays after a WAN outage step back by at most the buffer
+// depth (SYNC_BUFFER_DAYS at SYNC_BATCH_SECONDS ~= 130k batches at the 15d/10s
+// default), while a true reset drops to 1 from wherever the rig had reached.
+const SEQ_RESET_GAP = Number(process.env.INGEST_SEQ_RESET_GAP || 500000);
+
 // Coerce an untrusted timestamp to a canonical ISO instant, or null if unusable
 // (audit #11/#32). Accepts ISO strings and epoch-ms numbers; compares numerically.
 function coerceTsIso(raw) {
@@ -555,13 +562,30 @@ async function ingestBatch({ rigId, token, schemaVersion }, batch) {
             registered = !!r._new;
         }
 
-        // Replay idempotency fast-path (audit #4): reject batches whose seq is not
+        // Replay idempotency fast-path (audit #4): skip batches whose seq is not
         // newer than the last accepted seq, read in this same transaction. A null
         // incoming seq is treated as always-accept (legacy/uncounted senders).
+        //
+        // This is only a FAST PATH — correctness against true replays comes from
+        // the unique index on (rig_id, metric, ts) + ON CONFLICT DO NOTHING, which
+        // makes re-delivery harmless regardless of seq. So a backward seq jump must
+        // not be trusted blindly: an edge that loses sync_state.json (reinstall,
+        // offline volume transfer, or a rig_id previously driven by a different
+        // sender) legitimately restarts its counter at 1. Treating that as a replay
+        // silently blackholes the rig forever — the edge keeps getting ok:true with
+        // 0 points and reports a healthy link while nothing is stored.
+        //
+        // So: a SMALL backward step is a genuine replay; a LARGE backward jump is a
+        // sender reset, which we accept and re-baseline onto the new counter.
         const lastSeq = rig && rig.last_seq != null ? Number(rig.last_seq) : null;
-        if (seq != null && lastSeq != null && seq <= lastSeq && !hasWellLifecycleEvent) {
+        const backwards = seq != null && lastSeq != null && seq <= lastSeq;
+        const senderReset = backwards && (lastSeq - seq) >= SEQ_RESET_GAP;
+        if (backwards && !senderReset && !hasWellLifecycleEvent) {
             await client.query('ROLLBACK').catch(() => {});
             return { ok: true, rigId, points: 0, events: 0, seq, duplicate: true };
+        }
+        if (senderReset) {
+            console.warn(`[ingest] ${rigId}: sequence reset detected (incoming ${seq} << last ${lastSeq}); re-baselining`);
         }
 
         points = await insertTelemetry(client, rigId, channels);
@@ -634,7 +658,12 @@ async function ingestBatch({ rigId, token, schemaVersion }, batch) {
             sets.push(`metric_count = $${++i}`); vals.push(presentMetrics.length);
             sets.push(`status = $${++i}`); vals.push(health.status);
         }
-        const newLastSeq = seq != null ? (lastSeq != null ? Math.max(seq, lastSeq) : seq) : (lastSeq != null ? lastSeq : null);
+        // On a detected sender reset, adopt the NEW counter instead of keeping the
+        // old high-water mark — otherwise max() pins last_seq at the stale value and
+        // every subsequent batch from the restarted edge is dropped as a replay.
+        const newLastSeq = seq == null
+            ? lastSeq
+            : (senderReset || lastSeq == null ? seq : Math.max(seq, lastSeq));
         if (newLastSeq != null) { sets.push(`last_seq = $${++i}`); vals.push(newLastSeq); }
         if (batch.schemaVersion) { sets.push(`schema_version = $${++i}`); vals.push(batch.schemaVersion); }
         if (alarmCounts) {
