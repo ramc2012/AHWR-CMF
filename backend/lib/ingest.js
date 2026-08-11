@@ -509,7 +509,51 @@ function normalizeChannelMetrics(channels) {
     });
 }
 
-async function ingestBatch({ rigId, token, schemaVersion }, batch) {
+// Stamp a fixed instant onto every channel/event that lacks a usable timestamp.
+//
+// This MUST happen before the transaction runs, and the same instant must be
+// reused by every retry attempt. The write path falls back to
+// `coerceTsIso(x.ts) || new Date().toISOString()` in six places, and `ts` is part
+// of the dedup keys — telemetry (rig_id, metric, ts) and events
+// (rig_id, ts, type, payload). If the clock were read per attempt, a retried
+// transaction would compute DIFFERENT keys, ON CONFLICT DO NOTHING would find no
+// conflict, and the same physical reading would be stored twice. Freezing the
+// fallback here is what makes the transaction genuinely replay-safe.
+function freezeTimestamps(channels, events, nowIso) {
+    const frozenChannels = channels.map((snap) =>
+        (snap && !coerceTsIso(snap.ts)) ? { ...snap, ts: nowIso } : snap);
+    const frozenEvents = events.map((ev) =>
+        (ev && !coerceTsIso(ev.ts)) ? { ...ev, ts: nowIso } : ev);
+    return { frozenChannels, frozenEvents };
+}
+
+// Transient serialization failures Postgres expects the client to retry.
+const RETRYABLE_SQLSTATES = new Set([
+    '40P01',  // deadlock_detected
+    '40001',  // serialization_failure
+]);
+const INGEST_ATTEMPTS = Math.max(1, Number(process.env.INGEST_TXN_ATTEMPTS || 3));
+
+// Retry wrapper. A 40P01 victim currently surfaces as a 500 to the edge, which
+// then treats the batch as a transient failure and re-sends it whole — so the
+// work happens anyway, just a round-trip later and with a scary log line. Doing
+// the retry here is cheaper and keeps the ack honest. Safe because every write in
+// the transaction is ON CONFLICT-idempotent, the timestamps are frozen above, and
+// all side effects (notifications) are dispatched by the caller AFTER commit.
+async function ingestBatch(ctx, batch) {
+    const nowIso = new Date().toISOString();
+    let last;
+    for (let attempt = 1; attempt <= INGEST_ATTEMPTS; attempt++) {
+        last = await ingestBatchOnce(ctx, batch, nowIso);
+        if (last.ok || !RETRYABLE_SQLSTATES.has(last.sqlState)) return last;
+        console.warn(`[ingest] ${last.rigId || 'unknown'}: ${last.sqlState} on attempt ${attempt}/${INGEST_ATTEMPTS}; retrying`);
+        // Jittered backoff so the two victims of a cycle don't collide again.
+        await new Promise((r) => setTimeout(r, 15 * attempt + Math.random() * 25));
+    }
+    return last;
+}
+
+async function ingestBatchOnce({ rigId, token, schemaVersion }, batch, nowIso) {
     rigId = batch.deviceId || rigId;
     if (!rigId) return { ok: false, code: 400, error: 'missing deviceId' };
 
@@ -517,9 +561,12 @@ async function ingestBatch({ rigId, token, schemaVersion }, batch) {
     // raw untrusted value into the BIGINT last_seq column.
     const seq = Number.isSafeInteger(Number(batch.seq)) ? Number(batch.seq) : null;
 
-    const channels = normalizeChannelMetrics(
-        Array.isArray(batch.channels) ? batch.channels : []);
-    let events = Array.isArray(batch.events) ? batch.events : [];
+    const frozen = freezeTimestamps(
+        normalizeChannelMetrics(Array.isArray(batch.channels) ? batch.channels : []),
+        Array.isArray(batch.events) ? batch.events : [],
+        nowIso);
+    const channels = frozen.frozenChannels;
+    let events = frozen.frozenEvents;
     const wellPayload = findWellPayloadInBatch(batch, channels);
     const normalizedSnapshotWell = wellPayload ? normalizeWellPayload(wellPayload) : null;
     const hasIncomingWellLifecycleEvent = events.some((ev) => ev && ['well.created', 'well.updated', 'well.started', 'well.completed'].includes(ev.type));
@@ -527,7 +574,9 @@ async function ingestBatch({ rigId, token, schemaVersion }, batch) {
         events = [
             ...events,
             {
-                ts: normalizedSnapshotWell.startedAt || batch.createdAt || new Date().toISOString(),
+                // nowIso, not a fresh clock read — this synthesized event is part of
+                // the events dedup key and must be identical on every retry attempt.
+                ts: normalizedSnapshotWell.startedAt || batch.createdAt || nowIso,
                 type: normalizedSnapshotWell.status === 'completed' ? 'well.completed' : 'well.started',
                 payload: { ...wellPayload, ...normalizedSnapshotWell },
             },
@@ -539,6 +588,7 @@ async function ingestBatch({ rigId, token, schemaVersion }, batch) {
     let points = 0;
     let registered = false;
     let alarmTransition = null;   // rising-edge info for the notification dispatcher
+    let mergedMetrics = null;     // rig_latest key set after this batch merged in
     let activeJob = null;         // job/well this batch is working (for well-run tracking)
     try {
         await client.query('BEGIN');
@@ -602,16 +652,22 @@ async function ingestBatch({ rigId, token, schemaVersion }, batch) {
             // available from the very first batch (audit #22); on conflict, merge
             // both the values and the __ts map so a frozen tag keeps its old ts.
             const insertValues = { ...snap.values, [TS_KEY]: tsMap };
-            await client.query(
+            // RETURNING the merged row so completeness can be scored from the rig's
+            // ACTUAL current state rather than from whatever happened to be in this
+            // one batch (see mergedMetrics below).
+            const up = await client.query(
                 `INSERT INTO rig_latest (rig_id, ts, values)
                  VALUES ($1, $2, $3::jsonb)
                  ON CONFLICT (rig_id) DO UPDATE
                    SET ts = EXCLUDED.ts,
                        values = (rig_latest.values || EXCLUDED.values)
                                  || jsonb_build_object($4::text,
-                                      COALESCE(rig_latest.values->$4, '{}'::jsonb) || $5::jsonb)`,
+                                      COALESCE(rig_latest.values->$4, '{}'::jsonb) || $5::jsonb)
+                 RETURNING values`,
                 [rigId, snapTsIso, JSON.stringify(insertValues), TS_KEY, JSON.stringify(tsMap)]
             );
+            const merged = up.rows[0] && up.rows[0].values;
+            if (merged) mergedMetrics = Object.keys(merged).filter((k) => k !== TS_KEY);
         }
 
         const processed = await processEvents(client, rigId, events);
@@ -643,7 +699,14 @@ async function ingestBatch({ rigId, token, schemaVersion }, batch) {
         // Dashboard freshness is central receive freshness, so a PLC/edge timestamp
         // offset does not make the central live page appear 5-10 seconds behind.
         const latestTs = receivedTs;
-        const presentMetrics = snap ? Object.keys(snap.values) : [];
+        // Score completeness against the rig's MERGED current state, not this single
+        // batch. Scoring per-batch meant any narrower publisher for the same rig
+        // redefined its health: a 7-channel ETP frame arriving between 119-metric
+        // sync batches dropped the rig to metric_count=7 / health=59 / "degraded",
+        // then the next sync batch restored it — flapping purely on which sender
+        // committed last. It also punished any edge that legitimately splits its
+        // metrics across batches. rig_latest is the authoritative current state.
+        const presentMetrics = mergedMetrics || (snap ? Object.keys(snap.values) : []);
         const health = computeHealth({ latestTs, presentMetrics });
 
         // Compose rollup update. Telemetry health/count changes only when this
@@ -696,7 +759,9 @@ async function ingestBatch({ rigId, token, schemaVersion }, batch) {
         await client.query('ROLLBACK').catch(() => {});
         // Surface a tagged error so server.js can log full detail server-side and
         // return a generic message to the untrusted caller (audit #11).
-        return { ok: false, code: 500, error: 'ingest failed', detail: e.message };
+        // sqlState lets the retry wrapper distinguish a transient serialization
+        // failure (40P01/40001 — worth another attempt) from a real fault.
+        return { ok: false, code: 500, error: 'ingest failed', detail: e.message, sqlState: e.code, rigId };
     } finally {
         client.release();
     }

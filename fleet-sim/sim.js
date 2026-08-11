@@ -71,11 +71,25 @@ function jobAt(rig, t) {
 }
 
 // Per-rig runtime state.
+// Rig ids that a REAL rig-edge twin is already streaming. The simulator must
+// never publish as one of them: central authorises per rig_id, so two senders
+// under one id both succeed and interleave their data. In practice the edge
+// counts seq from 1 while the sim derives it from the clock, so each side keeps
+// tripping central's sequence-reset detection and re-baselining the other —
+// observed at ~6 resets/minute, with both senders' rows landing under one rig.
+// Comma-separated; empty (the default) preserves the previous behaviour.
+const EXCLUDED = new Set(
+    String(process.env.SIM_EXCLUDE_RIGS || '')
+        .split(',').map((s) => s.trim()).filter(Boolean)
+);
+
 const rigs = [];
 for (let n = 1; n <= ACTIVE; n++) {
+    const rigId = `AHWR-50-${n}`;
+    if (EXCLUDED.has(rigId)) continue;
     const wells = wellSetFor(n);
     rigs.push({
-        id: `AHWR-50-${n}`,
+        id: rigId,
         offset: (n * 7) % CYCLE_LEN,         // desync the cycles
         seq: 1,
         batch: { channels: [], events: [] },
@@ -277,5 +291,8 @@ function tick() {
     }
 }
 
-console.log(`CRMF fleet-sim: streaming ${ACTIVE} rigs -> ${CENTRAL_URL}/ingest every ${BATCH_SECONDS}s (1 Hz channels)`);
+console.log(`CRMF fleet-sim: streaming ${rigs.length} rigs -> ${CENTRAL_URL}/ingest every ${BATCH_SECONDS}s (1 Hz channels)`);
+if (EXCLUDED.size) {
+    console.log(`fleet-sim: NOT simulating ${[...EXCLUDED].join(', ')} (real edge attached)`);
+}
 setInterval(tick, 1000);

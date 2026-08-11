@@ -363,7 +363,16 @@ function normalizeBatch(ws, msg) {
 
     if (Array.isArray(body.channels)) {
         return {
-            seq: body.seq ?? msg.seq ?? Date.now(),
+            // NO synthesized seq. `seq` is the sync agent's store-and-forward replay
+            // lane: a monotonic per-rig counter that central uses as a high-water
+            // mark. ETP is a live stream with no replay buffer and its publishers
+            // send no seq, so defaulting to Date.now() minted a SECOND, clock-based
+            // seq domain for the same rig. A rig running both paths then alternated
+            // (sync 227 -> etp 1786443343699 -> sync 228 ...), tripping the
+            // sequence-reset detector on literally every sync batch and thrashing
+            // last_seq. ingestBatch treats a null seq as always-accept and leaves
+            // last_seq untouched, which is exactly right for a live stream.
+            seq: body.seq ?? msg.seq ?? null,
             deviceId: rigId,
             schemaVersion: body.schemaVersion || msg.schemaVersion || 'etp20-json',
             createdAt: body.createdAt || msg.createdAt || new Date().toISOString(),
@@ -375,7 +384,7 @@ function normalizeBatch(ws, msg) {
     const values = body.values || msg.values;
     if (values && typeof values === 'object') {
         return {
-            seq: body.seq ?? msg.seq ?? Date.now(),
+            seq: body.seq ?? msg.seq ?? null,   // never mint a clock seq — see above
             deviceId: rigId,
             schemaVersion: body.schemaVersion || msg.schemaVersion || 'etp20-json',
             createdAt: body.createdAt || msg.createdAt || new Date().toISOString(),
@@ -401,7 +410,9 @@ function normalizeBatch(ws, msg) {
     const channels = Array.from(byTs.entries()).map(([ts, vals]) => ({ ts, values: vals }));
     if (!channels.length) { setStatus({ lastNoIngestReason: 'no numeric mapped rows (' + rows.length + ' rows received)', lastRowsPreview: JSON.stringify(rows.slice(0, 8)).slice(0, 1800) }); return null; }
     return {
-        seq: body.seq ?? msg.seq ?? Date.now(),
+        // ChannelData frames from the edge ETP publisher land here. Same rule: no
+        // clock-derived seq (this was the path actually producing the thrash).
+        seq: body.seq ?? msg.seq ?? null,
         deviceId: rigId,
         schemaVersion: body.schemaVersion || msg.schemaVersion || 'etp20-channelstreaming',
         createdAt: body.createdAt || msg.createdAt || new Date().toISOString(),

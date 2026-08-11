@@ -163,6 +163,9 @@ services:
       # Absent on a fresh volume => every rig falls back to INGEST_TOKEN, which is
       # exactly the unprovisioned-onboarding path.
       - RIG_TOKENS_FILE=/provisioning/rig-tokens.json
+      # Rig ids with a REAL edge attached — the sim must not publish as them,
+      # or two senders interleave under one rig_id (see fleet-sim/sim.js).
+      - SIM_EXCLUDE_RIGS=${SIM_EXCLUDE_RIGS:-}
     volumes:
       - crmf_provisioning:/provisioning:ro
     depends_on:
