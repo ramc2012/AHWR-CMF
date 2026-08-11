@@ -44,6 +44,20 @@ const ingestDuration = new client.Histogram({
     buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
     registers: [registry],
 });
+// Sequence-counter restarts per rig. One is routine (edge reinstall / volume
+// transfer); a climbing rate on one rig means two senders share its identity.
+const seqResets = new client.Counter({
+    name: 'crmf_ingest_seq_resets_total',
+    help: 'Sender sequence-counter resets accepted (re-baselined), per rig.',
+    labelNames: ['rig_id'],
+    registers: [registry],
+});
+const seqConflicts = new client.Counter({
+    name: 'crmf_ingest_seq_conflicts_total',
+    help: 'Detected seq-domain conflict episodes (repeated resets in a short window), per rig.',
+    labelNames: ['rig_id'],
+    registers: [registry],
+});
 
 // --- Fleet rollup gauges (proposal §6.1 fleet overview) -----------------------
 const fleetRigs = new client.Gauge({
@@ -95,9 +109,14 @@ function setFleetGauges(summary) {
     } catch { /* ignore */ }
 }
 
+const incSeqReset = (rigId) => { try { seqResets.inc({ rig_id: rigId }); } catch { /* metrics must never throw */ } };
+const incSeqConflict = (rigId) => { try { seqConflicts.inc({ rig_id: rigId }); } catch { /* metrics must never throw */ } };
+
 module.exports = {
     registry,
     observeIngest,
     incIngestError,
     setFleetGauges,
+    incSeqReset,
+    incSeqConflict,
 };

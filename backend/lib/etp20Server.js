@@ -327,7 +327,15 @@ function eventListWithWellName(ws, body = {}, msg = {}) {
     const events = Array.isArray(body.events) ? [...body.events] : (Array.isArray(msg.events) ? [...msg.events] : []);
     const wellPayload = pickWellPayload(body, msg, msg.body, body.batch, msg.batch) || {};
     const wellName = pickWellName(ws, body, msg, msg.body, body.batch, msg.batch);
-    if (wellName) {
+    // Synthesize the activity/well.started pair ONLY when the well CHANGES on this
+    // connection (or on the first frame after connect — one re-announce per
+    // session is harmless and self-heals a missed change). Emitting them on every
+    // frame re-ran the whole non-idempotent well lifecycle (locks on wells +
+    // well_runs) once per stream interval, permanently disabled the replay
+    // fast-path (lifecycle events bypass it by design), and grew the events table
+    // by one 'ACTIVE WELL' row per frame — ~17k rows/rig/day of pure noise.
+    if (wellName && ws.etpLastAnnouncedWell !== wellName) {
+        ws.etpLastAnnouncedWell = wellName;
         const ts = body.ts || msg.ts || new Date().toISOString();
         const alreadyStarted = events.some((ev) => ev && ev.type === 'well.started');
         events.push({ ts, type: 'activity', payload: { label: 'ACTIVE WELL', job: wellName, wellName, ...wellPayload } });

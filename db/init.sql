@@ -470,6 +470,40 @@ ALTER TABLE well_runs
     ADD COLUMN IF NOT EXISTS npt_sec        DOUBLE PRECISION;
 
 -- ---------------------------------------------------------------------
+-- Ingest-concurrency hardening (fleet-scale review).
+-- ---------------------------------------------------------------------
+-- Sender attribution: which transport wrote a telemetry row ('sync' HTTP
+-- store-and-forward, 'etp' live stream, ...). Nullable, not part of the dedup
+-- key; exists so two publishers under one rig_id are separable after the fact.
+ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS source TEXT;
+
+-- Sender epoch: identifies the incarnation of a rig's seq counter (minted by
+-- the edge when its sync state is created). last_seq comparisons are scoped to
+-- it, replacing the backward-jump-magnitude heuristic with a deterministic
+-- answer. seq_conflict_at flags a detected multi-sender / seq-domain conflict
+-- for the fleet API (fleet.js selects r.*, so it surfaces without a UI change).
+ALTER TABLE rigs ADD COLUMN IF NOT EXISTS sender_epoch    TEXT;
+ALTER TABLE rigs ADD COLUMN IF NOT EXISTS seq_conflict_at TIMESTAMPTZ;
+
+-- INVARIANT: at most one open run per rig. Its absence let two writers each
+-- open a run for the same rig, and forced every writer into wide sweep UPDATEs
+-- whose lock footprints collided (the observed 40P01 deadlocks). Close any
+-- duplicates (keep the newest) before creating the index, so init re-runs and
+-- migrated volumes both converge.
+UPDATE well_runs SET ended_at = COALESCE(ended_at, now())
+ WHERE ended_at IS NULL AND id NOT IN (
+    SELECT DISTINCT ON (rig_id) id FROM well_runs
+     WHERE ended_at IS NULL ORDER BY rig_id, started_at DESC, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS well_runs_one_open_per_rig
+    ON well_runs (rig_id) WHERE ended_at IS NULL;
+
+-- Both predicates are hit (and their rows locked) on every batch that touches a
+-- well; unindexed they were seq scans that locked rows in heap order.
+CREATE INDEX IF NOT EXISTS wells_name_idx ON wells (name);
+CREATE INDEX IF NOT EXISTS wells_current_rig_idx
+    ON wells (current_rig_id) WHERE current_rig_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------
 -- Least-privilege application role (audit #2).
 -- The bootstrap/owner role (crmf, a superuser) creates the schema, but the
 -- running application SHOULD connect as crmf_app in production. crmf_app is a

@@ -250,70 +250,106 @@ async function deleteWell(id, actor) {
 // and maintains the open well_run so PAST runs accrue for offline EDR replay.
 // Idempotent + NON-THROWING: failures here must never break ingest.
 // ---------------------------------------------------------------------
-async function trackRun(rigId, job, nowMs) {
+// Core well-run tracking, running on the CALLER's transaction client.
+//
+// Ingest calls this INSIDE its batch transaction (under the rigs row lock it
+// takes as its first statement). It used to be a separate fire-and-forget
+// transaction spawned after the ack, which locked well_runs -> wells — the
+// OPPOSITE order to ingest's startWellForRig (wells -> well_runs) — and the two
+// overlapped for the same rig by construction: the primary 40P01 deadlock. It
+// also raced ingest's own view of active_job and could fork duplicate open runs
+// (now additionally excluded by the partial unique index one-open-run-per-rig).
+//
+// Lock hierarchy (must match ingest.js lockWellsForRig):
+//   rigs (already held by the caller) -> wells in ascending well_id -> well_runs.
+// THROWS on failure — the ingest caller wraps it in a SAVEPOINT so a tracking
+// failure rolls back only the tracking, never the batch.
+async function trackRunInTxn(client, rigId, job) {
     if (!rigId || !job) return;
     const jobName = String(job).trim();
     if (!jobName) return;
 
+    // Resolve the well whose name matches the job. ORDER BY well_id: wells.name
+    // has no unique constraint, and an unordered LIMIT 1 let this path bind to a
+    // DIFFERENT row than startWellForRig's by-id resolution — the two writers
+    // then rotated the rig between two wells forever.
+    let well = (await client.query(
+        'SELECT well_id FROM wells WHERE name = $1 ORDER BY well_id LIMIT 1', [jobName])).rows[0];
+
+    // Pre-lock the target (if it exists) and every well this rig currently holds,
+    // in PK order, BEFORE any write (same hierarchy as ingest.lockWellsForRig).
+    await client.query(
+        `SELECT well_id FROM wells
+          WHERE well_id = $2 OR current_rig_id = $1
+          ORDER BY well_id
+          FOR NO KEY UPDATE`,
+        [rigId, well ? well.well_id : jobName]);
+
+    if (!well) {
+        // Auto-INSERT a minimal workover well, copying asset/field/coords from the rig.
+        const rigRow = (await client.query(
+            'SELECT asset_unit, field, latitude, longitude FROM rigs WHERE rig_id = $1', [rigId])).rows[0] || {};
+        await client.query(
+            `INSERT INTO wells (well_id, name, well_type, status, asset_unit, field, latitude, longitude, current_rig_id)
+             VALUES ($1,$1,'workover','workover',$2,$3,$4,$5,$6)
+             ON CONFLICT (well_id) DO NOTHING`,
+            [jobName, rigRow.asset_unit || null, rigRow.field || null,
+             rigRow.latitude ?? null, rigRow.longitude ?? null, rigId]);
+        well = { well_id: jobName };
+    }
+    const wellId = well.well_id;
+
+    // Current open run for this rig (if any). Row-locked: it is about to be
+    // closed or updated, and the lock keeps a concurrent writer honest.
+    const open = (await client.query(
+        `SELECT id, well_id, job_no FROM well_runs
+          WHERE rig_id = $1 AND ended_at IS NULL
+          ORDER BY started_at DESC LIMIT 1
+          FOR NO KEY UPDATE`,
+        [rigId])).rows[0];
+
+    if (open && open.well_id === wellId) {
+        if (!open.job_no) {
+            await client.query('UPDATE well_runs SET job_no = $2 WHERE id = $1', [open.id, jobName]);
+        }
+        return;
+    }
+
+    if (open) {
+        // The rig moved to a DIFFERENT well/job: close the stale run and clear the
+        // stale well's current_rig_id (only if it still points at this rig).
+        await client.query('UPDATE well_runs SET ended_at = now() WHERE id = $1', [open.id]);
+        if (open.well_id && open.well_id !== wellId) {
+            await client.query(
+                'UPDATE wells SET current_rig_id = NULL, updated_at = now() WHERE well_id = $1 AND current_rig_id = $2',
+                [open.well_id, rigId]);
+        }
+    }
+
+    // Open a fresh run for the new well/job. The partial unique index
+    // (one open run per rig) is the backstop against forked history.
+    await client.query(
+        `INSERT INTO well_runs (well_id, rig_id, job_no, started_at) VALUES ($1,$2,$3,now())
+         ON CONFLICT (rig_id) WHERE ended_at IS NULL DO NOTHING`,
+        [wellId, rigId, jobName]);
+    // Point the well at this rig.
+    await client.query(
+        'UPDATE wells SET current_rig_id = $2, updated_at = now() WHERE well_id = $1',
+        [wellId, rigId]);
+}
+
+// Standalone wrapper for callers outside an existing transaction. No longer used
+// by the ingest path (which calls trackRunInTxn on its own client); kept for API
+// compatibility. Non-throwing, as before.
+async function trackRun(rigId, job, _nowMs) {
+    if (!rigId || !job) return;
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-
-        // Resolve (or auto-create) the well whose name matches the job. The well_id
-        // equals the job name (the sim/edge name a rig's well as its job).
-        let well = (await client.query(
-            'SELECT well_id FROM wells WHERE name = $1 LIMIT 1', [jobName])).rows[0];
-        if (!well) {
-            // Auto-INSERT a minimal workover well, copying asset/field/coords from the rig.
-            const rigRow = (await client.query(
-                'SELECT asset_unit, field, latitude, longitude FROM rigs WHERE rig_id = $1', [rigId])).rows[0] || {};
-            await client.query(
-                `INSERT INTO wells (well_id, name, well_type, status, asset_unit, field, latitude, longitude, current_rig_id)
-                 VALUES ($1,$1,'workover','workover',$2,$3,$4,$5,$6)
-                 ON CONFLICT (well_id) DO NOTHING`,
-                [jobName, rigRow.asset_unit || null, rigRow.field || null,
-                 rigRow.latitude ?? null, rigRow.longitude ?? null, rigId]);
-            well = { well_id: jobName };
-        }
-        const wellId = well.well_id;
-
-        // Current open run for this rig (if any).
-        const open = (await client.query(
-            'SELECT id, well_id, job_no FROM well_runs WHERE rig_id = $1 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1',
-            [rigId])).rows[0];
-
-        if (open && open.well_id === wellId) {
-            if (!open.job_no) {
-                await client.query('UPDATE well_runs SET job_no = $2 WHERE id = $1', [open.id, jobName]);
-            }
-            await client.query('COMMIT');
-            return;
-        }
-
-        if (open) {
-            // The rig moved to a DIFFERENT well/job: close the stale run and clear the
-            // stale well's current_rig_id (only if it still points at this rig).
-            await client.query('UPDATE well_runs SET ended_at = now() WHERE id = $1', [open.id]);
-            if (open.well_id && open.well_id !== wellId) {
-                await client.query(
-                    'UPDATE wells SET current_rig_id = NULL, updated_at = now() WHERE well_id = $1 AND current_rig_id = $2',
-                    [open.well_id, rigId]);
-            }
-        }
-
-        // Open a fresh run for the new well/job.
-        await client.query(
-            'INSERT INTO well_runs (well_id, rig_id, job_no, started_at) VALUES ($1,$2,$3,now())',
-            [wellId, rigId, jobName]);
-        // Point the well at this rig.
-        await client.query(
-            'UPDATE wells SET current_rig_id = $2, updated_at = now() WHERE well_id = $1',
-            [wellId, rigId]);
-
+        await trackRunInTxn(client, rigId, job);
         await client.query('COMMIT');
     } catch (e) {
         await client.query('ROLLBACK').catch(() => {});
-        // Non-throwing: log and swallow so ingest is never affected.
         console.error('[wells.trackRun] error:', e.message);
     } finally {
         client.release();
@@ -321,6 +357,6 @@ async function trackRun(rigId, job, nowMs) {
 }
 
 module.exports = {
-    getWells, getWell, getRuns, addWell, updateWell, deleteWell, trackRun,
+    getWells, getWell, getRuns, addWell, updateWell, deleteWell, trackRun, trackRunInTxn,
     WELL_STATUSES, WELL_TYPES,
 };

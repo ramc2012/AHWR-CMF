@@ -11,8 +11,15 @@ const pool = new Pool({
     user: process.env.PGUSER || 'crmf',
     password: process.env.PGPASSWORD || 'crmf',
     database: process.env.PGDATABASE || 'crmf',
-    max: Number(process.env.PG_POOL_MAX || 10),
+    // 50 rigs at 10s batches means bursts of ~5 concurrent ingest transactions
+    // plus portal/fleet queries; 10 connections queued unboundedly under load.
+    max: Number(process.env.PG_POOL_MAX || 20),
     idleTimeoutMillis: 30000,
+    // Bound the wait for a pooled client. Without this, pool exhaustion queued
+    // requests forever instead of shedding load — a stalled DB turned into an
+    // unbounded backlog of open HTTP requests rather than fast 5xx retries
+    // (the edge's store-and-forward treats a 5xx as transient and re-sends).
+    connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 10000),
 });
 
 pool.on('error', (err) => console.error('PG pool error:', err.message));
@@ -90,6 +97,24 @@ async function ensureAppMigrations() {
           ADD COLUMN IF NOT EXISTS productive_sec DOUBLE PRECISION,
           ADD COLUMN IF NOT EXISTS npt_sec DOUBLE PRECISION
     `);
+    // Ingest-concurrency hardening (same DDL as init.sql; owner-run setups
+    // self-migrate here, crmf_app deployments get it from init.sql / manual DDL).
+    await tryDdl(`ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS source TEXT`);
+    await tryDdl(`ALTER TABLE rigs ADD COLUMN IF NOT EXISTS sender_epoch TEXT`);
+    await tryDdl(`ALTER TABLE rigs ADD COLUMN IF NOT EXISTS seq_conflict_at TIMESTAMPTZ`);
+    // Close duplicate open runs (keep the newest per rig) BEFORE the unique
+    // index: plain DML, so it runs under either role, and it prevents the index
+    // build from failing with 23505 on a volume that accumulated duplicates.
+    await pool.query(`
+        UPDATE well_runs SET ended_at = COALESCE(ended_at, now())
+         WHERE ended_at IS NULL AND id NOT IN (
+            SELECT DISTINCT ON (rig_id) id FROM well_runs
+             WHERE ended_at IS NULL ORDER BY rig_id, started_at DESC, id DESC)`);
+    await tryDdl(`CREATE UNIQUE INDEX IF NOT EXISTS well_runs_one_open_per_rig
+        ON well_runs (rig_id) WHERE ended_at IS NULL`);
+    await tryDdl(`CREATE INDEX IF NOT EXISTS wells_name_idx ON wells (name)`);
+    await tryDdl(`CREATE INDEX IF NOT EXISTS wells_current_rig_idx
+        ON wells (current_rig_id) WHERE current_rig_id IS NOT NULL`);
     await assertSchemaObject('rig_messages');
     // --- data backfills below: ordinary DML, within crmf_app's grants ---
     await pool.query(`

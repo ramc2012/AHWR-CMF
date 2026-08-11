@@ -61,6 +61,9 @@ function liveize(row) {
         lastDataAt: row.last_data_at,
         activeJob: row.active_job,
         activeActivity: row.active_activity,
+        // Non-null while central is detecting repeated sequence resets for this
+        // rig — i.e. two senders are likely publishing under its identity.
+        seqConflictAt: row.seq_conflict_at || null,
         alarm: {
             active: row.alarm_active, unack: row.alarm_unack,
             p1: row.alarm_p1, p2: row.alarm_p2, p3: row.alarm_p3,

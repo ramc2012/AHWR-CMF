@@ -188,13 +188,12 @@ app.post('/ingest', ingestLimiter, express.raw({ type: '*/*', limit: '64mb' }), 
 
         metrics.observeIngest({ ok: true, durationSec: elapsedSec(), points: result.points, events: result.events });
 
-        // Track the well-run this batch belongs to (proposal §6.1 well drill-down /
-        // offline EDR replay). The job is the activity payload's job, or the rig's
-        // active_job. Non-blocking + swallow errors: well tracking must never affect
-        // the ingest ack. MONITORING-ONLY: this only records which well a rig worked.
-        if (result.activeJob) {
-            wells.trackRun(result.rigId, result.activeJob, Date.now()).catch(() => {});
-        }
+        // Well-run tracking now happens INSIDE the ingest transaction
+        // (ingest.js -> wells.trackRunInTxn, under the rigs row lock). The
+        // fire-and-forget wells.trackRun(...) that used to run here locked
+        // wells/well_runs in the opposite order to the ingest transaction and
+        // overlapped it for the same rig — the primary 40P01 deadlock — and its
+        // detached view of active_job could flip-flop runs between wells.
 
         // Fan out to Kafka (no-op unless KAFKA_ENABLED; never throws into this path).
         kafka.publishBatch(result.rigId, batch);
@@ -223,7 +222,10 @@ app.post('/ingest', ingestLimiter, express.raw({ type: '*/*', limit: '64mb' }), 
             io.emit('alarm_update', { rigId: result.rigId });
         }
 
-        res.json({ ack: true, seq: result.seq, receivedPoints: result.points, receivedEvents: result.events, duplicate: result.duplicate || undefined });
+        // receivedPoints is what the database ACTUALLY stored (insert rowCount),
+        // not what the batch carried — reporting attempted-as-stored hid silent
+        // loss. The attempted count rides alongside for the edge's accounting.
+        res.json({ ack: true, seq: result.seq, receivedPoints: result.points, receivedPointsAttempted: result.pointsAttempted, receivedEvents: result.events, duplicate: result.duplicate || undefined });
     } catch (e) {
         metrics.observeIngest({ ok: false, durationSec: elapsedSec() });
         console.error('[ingest] unexpected error:', e.message);
