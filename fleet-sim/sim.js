@@ -17,6 +17,22 @@ const zlib = require('zlib');
 const CENTRAL_URL = process.env.CENTRAL_URL || 'http://crmf-backend:6000';
 const TOKEN = process.env.INGEST_TOKEN || '';
 const ACTIVE = Number(process.env.ACTIVE_RIGS || 14);
+// Optional per-rig credentials, mirroring a real provisioned fleet where each of
+// the 50 rigs holds its own device token. JSON map { "AHWR-50-3": "<token>" },
+// as emitted by backend/scripts/provision-rigs.js --json. Falls back to the
+// shared INGEST_TOKEN per rig when absent.
+const RIG_TOKENS = (() => {
+    const f = process.env.RIG_TOKENS_FILE;
+    if (!f) return {};
+    try {
+        const map = JSON.parse(require('fs').readFileSync(f, 'utf8'));
+        console.log(`fleet-sim: loaded per-rig tokens for ${Object.keys(map).length} rig(s) from ${f}`);
+        return map;
+    } catch (e) {
+        console.warn(`fleet-sim: could not read RIG_TOKENS_FILE ${f}: ${e.message} — using the shared token`);
+        return {};
+    }
+})();
 const BATCH_SECONDS = Number(process.env.BATCH_SECONDS || 10);
 
 const osc = (t, base, amp, period, phase = 0) => base + amp * Math.sin((2 * Math.PI * (t + phase)) / period);
@@ -120,9 +136,13 @@ function snapshot(rig, t) {
         'fluid.tank_gain_loss': tankGL,
         'fluid.total_tank_volume': r(osc(t, 220, 8, 400)),
         'fluid.trip_tank': r(osc(t, 18, 2, 200)),
-        'wellcontrol.accumulator_pressure': r(osc(t, 2950, 80, 300)),
-        'wellcontrol.annular_pressure': r(osc(t, 1400, 120, 120)),
-        'wellcontrol.manifold_pressure': r(osc(t, 1200, 100, 110)),
+        // The edge attaches this honesty flag alongside the BOP group: 1 = the rig
+        // really has BOP data mapped. Simulated rigs report 1; a rig with no BOP
+        // field map sends 0 and central must not read the pressures as "safe".
+        'well_control.available': 1,
+        'well_control.accumulator_pressure': r(osc(t, 2950, 80, 300)),
+        'well_control.annular_pressure': r(osc(t, 1400, 120, 120)),
+        'well_control.manifold_pressure': r(osc(t, 1200, 100, 110)),
         'safety.esd_active': esd,
         'safety.lockout_active': lockout,
         'cat_engine.rpm': r(osc(t, 1200, 120, 45)),
@@ -160,9 +180,9 @@ function snapshot(rig, t) {
         'cwk.status': 1, 'cwk.clamp_status': 4, 'cwk.clamp_pressure': r(osc(t, 85, 10, 70)), 'cwk.clamp_force': r(osc(t, 500, 40, 70)),
         'acs.status': 1, 'acs.crownsaver': r(osc(t, 2200, 200, 60)), 'acs.floorsaver': r(osc(t, 1800, 150, 60)),
         'acs.bottomsaver': r(osc(t, 1500, 120, 60)), 'acs.upper_tag': 2400, 'acs.lower_tag': 200,
-        'wellcontrol.annular_open': 0, 'wellcontrol.annular_close': 1,
-        'wellcontrol.pipe_ram_open': 0, 'wellcontrol.pipe_ram_close': 1,
-        'wellcontrol.blind_ram_open': 0, 'wellcontrol.blind_ram_close': 1, 'wellcontrol.shear_ram_open': 0,
+        'well_control.annular_open': 0, 'well_control.annular_close': 1,
+        'well_control.pipe_ram_open': 0, 'well_control.pipe_ram_close': 1,
+        'well_control.blind_ram_open': 0, 'well_control.blind_ram_close': 1, 'well_control.shear_ram_open': 0,
     };
 
     // Degraded rig: drop many EXPECTED tags so its completeness (and health score)
@@ -170,7 +190,7 @@ function snapshot(rig, t) {
     if (rig.degraded) {
         for (const k of ['mudpump.flow_in', 'mudpump.pressure', 'mudpump.spm', 'wellhead.casing_pressure',
             'wellhead.wellhead_pressure', 'drilling.bit_depth', 'drilling.wob', 'drilling.rop', 'htd.torque',
-            'hpu.oil_level', 'hpu.aux_pressure', 'wellcontrol.annular_pressure', 'cat_engine.coolant_temp',
+            'hpu.oil_level', 'hpu.aux_pressure', 'well_control.annular_pressure', 'cat_engine.coolant_temp',
             'cat_engine.oil_pressure', 'fluid.total_tank_volume']) delete v[k];
     }
 
@@ -213,7 +233,10 @@ function post(rig, batch) {
         'Content-Type': 'application/json', 'Content-Encoding': 'gzip',
         'X-Device-Id': rig.id, 'X-Schema-Version': '1.0', 'Content-Length': body.length,
     };
-    if (TOKEN) headers.Authorization = `Bearer ${TOKEN}`;
+    // A provisioned rig authenticates with ITS OWN token; the shared INGEST_TOKEN
+    // is only the fallback for rigs not yet provisioned (see ingest.authorize()).
+    const rigToken = RIG_TOKENS[rig.id] || TOKEN;
+    if (rigToken) headers.Authorization = `Bearer ${rigToken}`;
     const req = lib.request(u, { method: 'POST', headers, timeout: 8000 }, (res) => {
         res.resume();
         if (res.statusCode >= 300) console.warn(`${rig.id}: ingest HTTP ${res.statusCode}`);

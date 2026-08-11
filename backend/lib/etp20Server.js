@@ -11,6 +11,7 @@ const WebSocket = require('ws');
 const fleet = require('./fleet');
 const rigview = require('./rigview');
 const { ingestBatch } = require('./ingest');
+const { safeEqual } = require('./secrets');
 
 let wss = null;
 let config = {};
@@ -405,8 +406,13 @@ function normalizeBatch(ws, msg) {
 async function ingestEtpMessage(ws, msg) {
     const batch = normalizeBatch(ws, msg);
     if (!batch) return false;
-    const effectiveToken = process.env.INGEST_TOKEN || 'AHWR-ETP-2026' || ws.etpToken;
-    setStatus({ lastAuthDebug: 'rig=' + (batch.deviceId || '') + ' tokenLen=' + String(effectiveToken || '').length + ' envLen=' + String(process.env.INGEST_TOKEN || '').length + ' matchEnv=' + (effectiveToken === process.env.INGEST_TOKEN) });
+    // Pass through the token the CLIENT actually presented on the WS upgrade.
+    // Previously this substituted the server's own INGEST_TOKEN, which made
+    // ingest.authorize() short-circuit to true for every batch — any client that
+    // cleared the upgrade gate could then write telemetry as ANY rigId, including
+    // rigs with their own provisioned device_token. Per-rig credentials only mean
+    // something if the presented token is the one that gets checked.
+    const effectiveToken = ws.etpToken || '';
     const result = await ingestBatch({ rigId: batch.deviceId, token: effectiveToken, schemaVersion: batch.schemaVersion }, batch);
     if (!result.ok) {
         status.ingestRejectedCount += 1;
@@ -536,16 +542,21 @@ function attach(server, nextConfig = {}) {
         try {
             const url = requestUrl(req);
             if (url.pathname !== path && url.pathname !== '/') return;
-            const expected = String(config.etp20_server_token || process.env.INGEST_TOKEN || 'AHWR-ETP-2026');
+            // No baked-in default: a published fallback token is equivalent to an
+            // open endpoint. Fail closed when nothing is configured.
+            const expected = String(config.etp20_server_token || process.env.INGEST_TOKEN || '');
             const token = tokenFrom(req);
-            if (expected && token !== expected) {
+            if (!expected || !token || !safeEqual(token, expected)) {
                 status.rejectedCount += 1;
                 socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
                 socket.destroy();
                 return;
             }
             wss.handleUpgrade(req, socket, head, (ws) => {
-                ws.etpToken = token || process.env.INGEST_TOKEN || config.etp20_server_token || '';
+                // Record exactly what the client presented — ingestEtpMessage
+                // forwards this to ingest.authorize(), so it must not be
+                // back-filled with a server-side secret.
+                ws.etpToken = token;
                 ws.etpDeviceId = url.searchParams.get('deviceId') || url.searchParams.get('rigId') || req.headers['x-device-id'] || req.headers['x-rig-id'] || '';
                 if (url.pathname === '/') setStatus({ lastMessageSummary: 'Accepted ETP client on / alias; preferred path is /etp' });
                 wss.emit('connection', ws, req);

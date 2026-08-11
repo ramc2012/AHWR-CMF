@@ -4,17 +4,21 @@
 // on top in production. Roles: admin | operator | viewer.
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const { safeEqual } = require('./secrets');
 const { query } = require('./db');
 const { verifyOidc } = require('./oidc');
 const ldap = require('./ldap');
 
 // Fail-fast on a weak/placeholder signing secret (audit #13): an unset or
 // well-known secret lets anyone forge an admin HS256 token (full RBAC bypass).
+// Any secret that still looks like a template placeholder is rejected, not just
+// the one literal — .env.example ships `change-me-long-random-jwt-secret`, which
+// the old exact-match guard let straight through.
 const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET || JWT_SECRET === 'change-me-in-production') {
+if (!JWT_SECRET || /change[-_ ]?me/i.test(JWT_SECRET) || JWT_SECRET.length < 32) {
     throw new Error(
-        'JWT_SECRET is unset or uses the insecure placeholder — refusing to start. ' +
-        'Set a strong, unique JWT_SECRET (see .env.example).');
+        'JWT_SECRET is unset, still a placeholder, or shorter than 32 chars — ' +
+        'refusing to start. Generate one with `openssl rand -hex 32` (see .env.example).');
 }
 const TOKEN_TTL = process.env.TOKEN_TTL || '12h';
 const OIDC_ENABLED = process.env.OIDC_ENABLED === 'true';
@@ -124,10 +128,16 @@ function socketAuth(socket, next) {
             const deviceId = String(auth.deviceId || '').trim();
             const token = String(auth.token || '').trim();
             if (!deviceId || !token) return next(new Error('unauthorized'));
-            const shared = process.env.INGEST_TOKEN || 'AHWR-ETP-2026';
             const { rows } = await query('SELECT device_token FROM rigs WHERE rig_id = $1', [deviceId]);
-            const expected = rows[0]?.device_token || shared;
-            if (token !== shared && token !== expected) return next(new Error('unauthorized'));
+            // A provisioned per-rig token is AUTHORITATIVE. The fleet-wide
+            // INGEST_TOKEN must not also unlock a rig that has its own credential,
+            // otherwise per-rig provisioning buys no isolation across 50 rigs and
+            // one leaked shared secret impersonates the whole fleet. The shared
+            // token is only a fallback for rigs not yet provisioned; when neither
+            // is configured we fail closed rather than trusting a baked-in default.
+            const perRig = rows[0] && rows[0].device_token ? String(rows[0].device_token) : '';
+            const expected = perRig || String(process.env.INGEST_TOKEN || '');
+            if (!expected || !safeEqual(token, expected)) return next(new Error('unauthorized'));
             socket.edgeRigId = deviceId;
             socket.clientType = 'edge';
             return next();

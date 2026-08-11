@@ -10,7 +10,8 @@
 // tables, refreshes the last-value cache, and recomputes the per-rig
 // data-quality health score. MONITORING-ONLY: nothing is ever sent back to a rig.
 const { pool, query } = require('./db');
-const { EXPECTED_METRICS } = require('./tags');
+const { EXPECTED_METRICS, WIRE_ALIASES, canonicalMetric } = require('./tags');
+const { safeEqual } = require('./secrets');
 const { computeHealth } = require('./fleet');
 
 const GLOBAL_INGEST_TOKEN = process.env.INGEST_TOKEN || '';
@@ -50,11 +51,17 @@ async function ensureRig(client, rigId, token, schemaVersion) {
     const { rows } = await client.query(
         'SELECT rig_id, device_token, last_seq FROM rigs WHERE rig_id = $1', [rigId]);
     if (rows.length) return { ...rows[0], _new: false };
+    // Never persist the FLEET-WIDE token as this rig's per-rig credential. Doing
+    // so makes every auto-registered rig look provisioned while all 50 in fact
+    // share one secret — and it hides them from `provision-rigs.js`, which skips
+    // rigs that already have a token. Leave it NULL so the rig keeps using the
+    // shared fallback until a real per-rig token is issued.
+    const perRigToken = token && token !== GLOBAL_INGEST_TOKEN ? token : null;
     await client.query(
         `INSERT INTO rigs (rig_id, name, status, device_token, schema_version, field)
          VALUES ($1, $2, 'pending', $3, $4, 'Ankleshwar')
          ON CONFLICT (rig_id) DO NOTHING`,
-        [rigId, rigId, token || null, schemaVersion || null]
+        [rigId, rigId, perRigToken, schemaVersion || null]
     );
     await client.query('INSERT INTO deployment_status (rig_id, gate, commissioning) VALUES ($1, $2, $3) ON CONFLICT (rig_id) DO NOTHING',
         [rigId, 'discovery', 'in_progress']);
@@ -65,8 +72,14 @@ async function ensureRig(client, rigId, token, schemaVersion) {
 // matches a per-rig device_token OR the global INGEST_TOKEN. If neither is
 // configured anywhere, REJECT unless ALLOW_OPEN_INGEST is set (and not prod).
 function authorize(rig, token) {
-    if (GLOBAL_INGEST_TOKEN && token === GLOBAL_INGEST_TOKEN) return true;
-    if (rig && rig.device_token) return token === rig.device_token;
+    // A provisioned per-rig credential is AUTHORITATIVE and the fleet-wide token
+    // no longer satisfies that rig. Checking the shared token first (the previous
+    // behaviour) meant per-rig provisioning bought no isolation: one leaked shared
+    // secret could write telemetry as any of the 50 rigs. The shared token remains
+    // valid only for rigs that have not been provisioned yet, so onboarding still
+    // works. Mirrors auth.socketAuth so both ingress paths agree.
+    if (rig && rig.device_token) return safeEqual(token, rig.device_token);
+    if (GLOBAL_INGEST_TOKEN) return safeEqual(token, GLOBAL_INGEST_TOKEN);
     return ALLOW_OPEN_INGEST; // fail-closed by default; open only when explicitly allowed
 }
 
@@ -75,8 +88,10 @@ function authorize(rig, token) {
 // device_token has been provisioned for an existing rig, that wins; otherwise we
 // fall back to the global INGEST_TOKEN / open-demo policy.
 function authorizeKnown(rig, token) {
-    if (GLOBAL_INGEST_TOKEN && token === GLOBAL_INGEST_TOKEN) return true;
-    if (rig && rig.device_token) return token === rig.device_token;
+    // Same precedence as authorize(): per-rig credential wins, shared token is
+    // only the not-yet-provisioned fallback.
+    if (rig && rig.device_token) return safeEqual(token, rig.device_token);
+    if (GLOBAL_INGEST_TOKEN) return safeEqual(token, GLOBAL_INGEST_TOKEN);
     return ALLOW_OPEN_INGEST;
 }
 
@@ -460,6 +475,33 @@ async function auditProvenance(client, { rigId, token, seq, registered }) {
 }
 
 // Main entry. `rigId`/`token` are extracted from headers/body by the caller.
+// Canonicalise wire metric names before anything downstream sees them, so
+// telemetry rows, rig_latest, the per-tag freshness map and the completeness
+// score all key off ONE spelling. Pre-consolidation edges emit the BOP group as
+// `wellcontrol.*`; the canonical wire name is `well_control.*` (see lib/tags.js).
+// Returns the input untouched when a batch carries no aliased metric, so the
+// common path allocates nothing.
+function normalizeChannelMetrics(channels) {
+    if (!channels.length) return channels;
+    return channels.map((snap) => {
+        const values = snap && snap.values;
+        if (!values || typeof values !== 'object') return snap;
+        let hit = false;
+        for (const k of Object.keys(values)) {
+            if (WIRE_ALIASES[k]) { hit = true; break; }
+        }
+        if (!hit) return snap;
+        const out = {};
+        for (const [k, v] of Object.entries(values)) {
+            // A canonical key already present wins over an aliased duplicate.
+            const c = canonicalMetric(k);
+            if (c in out && c !== k) continue;
+            out[c] = v;
+        }
+        return { ...snap, values: out };
+    });
+}
+
 async function ingestBatch({ rigId, token, schemaVersion }, batch) {
     rigId = batch.deviceId || rigId;
     if (!rigId) return { ok: false, code: 400, error: 'missing deviceId' };
@@ -468,7 +510,8 @@ async function ingestBatch({ rigId, token, schemaVersion }, batch) {
     // raw untrusted value into the BIGINT last_seq column.
     const seq = Number.isSafeInteger(Number(batch.seq)) ? Number(batch.seq) : null;
 
-    const channels = Array.isArray(batch.channels) ? batch.channels : [];
+    const channels = normalizeChannelMetrics(
+        Array.isArray(batch.channels) ? batch.channels : []);
     let events = Array.isArray(batch.events) ? batch.events : [];
     const wellPayload = findWellPayloadInBatch(batch, channels);
     const normalizedSnapshotWell = wellPayload ? normalizeWellPayload(wellPayload) : null;

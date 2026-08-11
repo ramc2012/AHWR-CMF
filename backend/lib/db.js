@@ -19,8 +19,38 @@ pool.on('error', (err) => console.error('PG pool error:', err.message));
 
 const query = (text, params) => pool.query(text, params);
 
+// Schema objects are owned by db/init.sql, which runs as the DB owner at init.
+// The application connects as the least-privilege crmf_app (audit #2) and has no
+// CREATE on schema public, so DDL from here raises 42501 insufficient_privilege.
+// We still attempt it, because a deployment that connects as the owner (or an
+// older volume created before init.sql carried these objects) relies on this
+// self-migration — but a privilege error is EXPECTED and must not crash boot.
+// Anything genuinely wrong (missing table, bad SQL) still throws.
+const INSUFFICIENT_PRIVILEGE = '42501';
+
+async function tryDdl(sql) {
+    try {
+        await pool.query(sql);
+    } catch (e) {
+        if (e && e.code === INSUFFICIENT_PRIVILEGE) return false; // init.sql owns it
+        throw e;
+    }
+    return true;
+}
+
+// Fail fast and clearly if a schema object the app depends on is absent, rather
+// than surfacing it later as a confusing runtime 500 on the first message send.
+async function assertSchemaObject(table) {
+    const { rows } = await pool.query('SELECT to_regclass($1) AS oid', [`public.${table}`]);
+    if (!rows[0] || !rows[0].oid) {
+        throw new Error(
+            `required table "${table}" is missing and this connection cannot create it. ` +
+            'Recreate the volume so db/init.sql runs, or apply init.sql as the DB owner.');
+    }
+}
+
 async function ensureAppMigrations() {
-    await pool.query(`
+    await tryDdl(`
         CREATE TABLE IF NOT EXISTS rig_messages (
             message_id TEXT PRIMARY KEY,
             target_rig_id TEXT NOT NULL REFERENCES rigs(rig_id) ON DELETE CASCADE,
@@ -40,9 +70,9 @@ async function ensureAppMigrations() {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     `);
-    await pool.query(`ALTER TABLE rig_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'General'`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS rig_messages_target_idx ON rig_messages(target_rig_id, sent_at DESC)`);
-    await pool.query(`
+    await tryDdl(`ALTER TABLE rig_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'General'`);
+    await tryDdl(`CREATE INDEX IF NOT EXISTS rig_messages_target_idx ON rig_messages(target_rig_id, sent_at DESC)`);
+    await tryDdl(`
         ALTER TABLE wells
           ADD COLUMN IF NOT EXISTS service_type TEXT,
           ADD COLUMN IF NOT EXISTS country TEXT,
@@ -51,7 +81,7 @@ async function ensureAppMigrations() {
           ADD COLUMN IF NOT EXISTS objective TEXT,
           ADD COLUMN IF NOT EXISTS location TEXT
     `);
-    await pool.query(`
+    await tryDdl(`
         ALTER TABLE well_runs
           ADD COLUMN IF NOT EXISTS service TEXT,
           ADD COLUMN IF NOT EXISTS started_by TEXT,
@@ -60,6 +90,8 @@ async function ensureAppMigrations() {
           ADD COLUMN IF NOT EXISTS productive_sec DOUBLE PRECISION,
           ADD COLUMN IF NOT EXISTS npt_sec DOUBLE PRECISION
     `);
+    await assertSchemaObject('rig_messages');
+    // --- data backfills below: ordinary DML, within crmf_app's grants ---
     await pool.query(`
         UPDATE wells w
         SET current_rig_id = NULL, updated_at = now()

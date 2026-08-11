@@ -317,6 +317,11 @@ function buildApiRouter() {
         }
     };
 
+    // A unique, unguessable per-rig ingest credential. 256 bits of CSPRNG output:
+    // these are bearer tokens for telemetry writes, so they must not be derived
+    // from the rig id or shared across the fleet.
+    const newDeviceToken = () => crypto.randomBytes(32).toString('hex');
+
     // requireRole that also audits 403 denials (audit #14).
     const requireRoleAudited = (min) => (req, res, next) => {
         if (!req.user || !auth.roleMeets(req.user.role, min)) {
@@ -416,9 +421,12 @@ function buildApiRouter() {
         }
         const dup = await query('SELECT 1 FROM rigs WHERE rig_id = $1', [rigId]);
         if (dup.rows.length) throw Object.assign(new Error('rig already exists'), { status: 409 });
-        // Use one fixed shared ingest token for all rigs. This keeps ETP onboarding simple:
-        // every edge uses the same permanent token and identifies itself by deviceId.
-        const deviceToken = process.env.INGEST_TOKEN || 'AHWR-ETP-2026';
+        // Issue a UNIQUE per-rig credential. A single fleet-wide token means one
+        // leaked rig node can impersonate any of the other 49 and inject telemetry
+        // under their identity; per-rig tokens keep a compromise contained to one
+        // rig and make rotation meaningful. Unprovisioned rigs can still onboard
+        // against the fleet-wide INGEST_TOKEN fallback in ingest.authorize().
+        const deviceToken = newDeviceToken();
         await query(
             `INSERT INTO rigs (rig_id, name, section, asset_unit, field, latitude, longitude, device_token, status, schema_version)
              VALUES ($1,$2,'Workover Services',$3,$4,$5,$6,$7,'pending','1.0')`,
@@ -442,15 +450,17 @@ function buildApiRouter() {
             [req.user.username, 'rig.delete', rigId, {}]).catch(() => {});
         return { ok: true };
     }));
-    // Re-apply the fixed shared token. Admin-only + audited. Returns the same
-    // permanent token used by all ETP edge rigs.
+    // Issue a NEW random credential for one rig. Admin-only + audited. Previously
+    // this re-applied the same fleet-wide constant, so "rotate" invalidated nothing
+    // and gave false assurance after a suspected leak.
     r.post('/rigs/:id/rotate-token', requireRoleAudited('admin'), wrap(async (req) => {
         const rigId = req.params.id;
-        const deviceToken = process.env.INGEST_TOKEN || 'AHWR-ETP-2026';
+        const deviceToken = newDeviceToken();
         const { rowCount } = await query('UPDATE rigs SET device_token = $1 WHERE rig_id = $2', [deviceToken, rigId]);
         if (!rowCount) throw Object.assign(new Error('rig not found'), { status: 404 });
         await query('INSERT INTO audit_log (actor, action, target, detail) VALUES ($1,$2,$3,$4)',
-            [req.user.username, 'rig.rotate_token', rigId, { fixedSharedToken: true }]).catch(() => {});
+            [req.user.username, 'rig.rotate_token', rigId, { rotated: true }]).catch(() => {});
+        // Shown once; the edge node must be updated with this DEVICE_TOKEN.
         return { device_token: deviceToken };
     }));
 
@@ -458,15 +468,23 @@ function buildApiRouter() {
         const host = process.env.CENTRAL_HOST || preferredHostFromRequest(req);
         const webPort = process.env.FRONTEND_PORT || '8090';
         const ingestPort = process.env.INGEST_PORT || String(PORT);
-        return {
+        const urls = {
             host,
             addresses: localIpv4Addresses(),
             webUrl: `http://${host}:${webPort}`,
             ingestUrl: `http://${host}:${ingestPort}`,
             etpUrl: `ws://${host}:${ingestPort}/etp`,
-            etpUrlWithToken: `ws://${host}:${ingestPort}/etp?token=${encodeURIComponent(process.env.INGEST_TOKEN || 'AHWR-ETP-2026')}`,
-            token: process.env.INGEST_TOKEN || 'AHWR-ETP-2026',
         };
+        // The fleet-wide ingest token is a write credential for the whole fleet:
+        // anyone holding it can inject telemetry as any rig. This route is only
+        // behind requireAuth, so it previously handed that secret to every signed-in
+        // VIEWER. Admins only, and per-rig tokens are preferred over this anyway.
+        if (auth.roleMeets(req.user && req.user.role, 'admin') && process.env.INGEST_TOKEN) {
+            urls.token = process.env.INGEST_TOKEN;
+            urls.etpUrlWithToken =
+                `ws://${host}:${ingestPort}/etp?token=${encodeURIComponent(process.env.INGEST_TOKEN)}`;
+        }
+        return urls;
     }));
     // ----- Platform settings (proposal section 6.5) - read (auth), write (admin, audited) -----
     r.get('/settings', wrap(() => settings.getSettings()));

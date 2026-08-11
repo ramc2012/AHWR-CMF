@@ -421,6 +421,55 @@ CREATE INDEX IF NOT EXISTS well_runs_well ON well_runs (well_id, started_at DESC
 CREATE INDEX IF NOT EXISTS well_runs_rig_active ON well_runs (rig_id) WHERE ended_at IS NULL;
 
 -- ---------------------------------------------------------------------
+-- Central -> rig operator messaging, and later-added well/run columns.
+--
+-- These objects used to be created at BOOT by backend/lib/db.js
+-- ensureAppMigrations(). That only worked because the backend was connecting as
+-- the schema OWNER: a least-privilege crmf_app has no CREATE on schema public,
+-- so the app crash-looped with "permission denied for schema public" and the
+-- deployment was "fixed" by downgrading PGUSER to the owner — which silently
+-- disabled the append-only audit protection this whole section exists for.
+-- Schema changes belong here, owner-run at init; the app only backfills DATA.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rig_messages (
+    message_id      TEXT PRIMARY KEY,
+    target_rig_id   TEXT NOT NULL REFERENCES rigs(rig_id) ON DELETE CASCADE,
+    target_rig_name TEXT,
+    message_type    TEXT NOT NULL DEFAULT 'General',
+    message_text    TEXT NOT NULL,
+    sender_username TEXT NOT NULL,
+    sender_display  TEXT,
+    sent_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status          TEXT NOT NULL DEFAULT 'sent'
+                    CHECK (status IN ('sent','delivered','acknowledged','failed')),
+    delivered_at    TIMESTAMPTZ,
+    acknowledged_at TIMESTAMPTZ,
+    acknowledged_by TEXT,
+    failed_at       TIMESTAMPTZ,
+    failure_reason  TEXT,
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS rig_messages_target_idx
+    ON rig_messages (target_rig_id, sent_at DESC);
+
+ALTER TABLE wells
+    ADD COLUMN IF NOT EXISTS service_type TEXT,
+    ADD COLUMN IF NOT EXISTS country      TEXT,
+    ADD COLUMN IF NOT EXISTS company_man  TEXT,
+    ADD COLUMN IF NOT EXISTS toolpusher   TEXT,
+    ADD COLUMN IF NOT EXISTS objective    TEXT,
+    ADD COLUMN IF NOT EXISTS location     TEXT;
+
+ALTER TABLE well_runs
+    ADD COLUMN IF NOT EXISTS service        TEXT,
+    ADD COLUMN IF NOT EXISTS started_by     TEXT,
+    ADD COLUMN IF NOT EXISTS joints         INTEGER,
+    ADD COLUMN IF NOT EXISTS depth_delta    DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS productive_sec DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS npt_sec        DOUBLE PRECISION;
+
+-- ---------------------------------------------------------------------
 -- Least-privilege application role (audit #2).
 -- The bootstrap/owner role (crmf, a superuser) creates the schema, but the
 -- running application SHOULD connect as crmf_app in production. crmf_app is a
@@ -448,7 +497,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
     rigs, rig_latest, telemetry, events, connections, tags,
     deployment_status, escalations, decisions, value_metrics,
     maintenance_record, users, notification_channels, notifications,
-    app_settings, user_sessions, wells, well_runs
+    app_settings, user_sessions, wells, well_runs, rig_messages
     TO crmf_app;
 
 -- The continuous aggregate is read-only for the app.

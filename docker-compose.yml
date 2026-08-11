@@ -55,21 +55,32 @@ services:
       - CENTRAL_HOST=${CENTRAL_HOST:-}
       - PGHOST=timescaledb
       - PGPORT=5432
-      # Offline-friendly DB login: use the main database user from .env so transferred volumes start reliably.
-      - PGUSER=${PGUSER:-crmf}
+      # Audit #2 (RESTORED): connect as the LEAST-PRIVILEGE app role crmf_app, NOT the
+      # schema owner (${PGUSER}). crmf_app has DML on operational tables + INSERT-only on
+      # audit_log and CANNOT drop the append-only trigger, so the audit trail is
+      # tamper-evident. Its password is set to ${PGPASSWORD} by db/app-role-password.sh at
+      # DB init. On an OFFLINE-TRANSFERRED volume where crmf_app has no password (the
+      # volume predates that init script), run db/app-role-password.sh once by hand rather
+      # than downgrading the backend to the owner role.
+      - PGUSER=crmf_app
       - PGPASSWORD=${PGPASSWORD:?set PGPASSWORD in .env}
       - PGDATABASE=${PGDATABASE:-crmf}
       - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET in .env}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-Admin123}
+      # No weak default: the portal admin password must be set explicitly in .env.
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
       # Fail-closed ingest auth (#1): /ingest accepts a batch only if the bearer token
-      # matches a per-rig device token OR this global INGEST_TOKEN.
-      - INGEST_TOKEN=${INGEST_TOKEN:-AHWR-ETP-2026}
+      # matches a per-rig device token OR this global INGEST_TOKEN. NO DEFAULT — a
+      # published default token is equivalent to open ingest. At 50 rigs, prefer
+      # per-rig device tokens (see backend/scripts/provision-rigs.js) and leave this unset.
+      - INGEST_TOKEN=${INGEST_TOKEN:-}
       # Open-ingest escape hatch (#1): when no token is configured, /ingest still
       # REJECTS (401) unless ALLOW_OPEN_INGEST=true AND NODE_ENV != production.
       # Left unset here => fail-closed. Never set this in production.
       - ALLOW_OPEN_INGEST=${ALLOW_OPEN_INGEST:-}
-      - FLEET_SIZE=${FLEET_SIZE:-2}
-      - SEED_RIG_NUMBERS=${SEED_RIG_NUMBERS:-3,6}
+      # Full ONGC AHWR fleet (proposal §3: 50 rigs). SEED_RIG_NUMBERS pins the
+      # real commissioned rig numbers; the remainder seed as AHWR-50-<n>.
+      - FLEET_SIZE=${FLEET_SIZE:-50}
+      - SEED_RIG_NUMBERS=${SEED_RIG_NUMBERS:-}
       - CENTRAL_LATENCY_TARGET=${CENTRAL_LATENCY_TARGET:-30}
       - OFFLINE_SEC=${OFFLINE_SEC:-120}
       - CORS_ORIGIN=${CORS_ORIGIN:-}
@@ -91,14 +102,21 @@ services:
       - LDAP_ROLE_OPERATOR=${LDAP_ROLE_OPERATOR:-crmf-operators}
       - LDAP_ROLE_VIEWER=${LDAP_ROLE_VIEWER:-crmf-viewers}
       - LDAP_STARTTLS=${LDAP_STARTTLS:-false}
-      - LDAP_TLS_REJECT_UNAUTHORIZED=${LDAP_TLS_REJECT_UNAUTHORIZED:-false}
+      # Default TRUE: enforce CA validation. Set false ONLY for a self-signed lab DC.
+      - LDAP_TLS_REJECT_UNAUTHORIZED=${LDAP_TLS_REJECT_UNAUTHORIZED:-true}
+    volumes:
+      # Where backend/scripts/provision-rigs.js writes issued per-rig credentials
+      # (--json / --out). Shared with fleet-sim so the demo authenticates as a
+      # genuinely provisioned fleet rather than on one shared secret.
+      - crmf_provisioning:/provisioning
     depends_on:
       timescaledb:
         condition: service_healthy
     # Exposed so real rig-edge sync agents can reach /ingest over the WAN.
     # In production this sits behind the API gateway / MQTT broker on the VPN.
+    # Loopback by default; set INGEST_BIND to the WAN-facing NIC to admit rigs.
     ports:
-      - "${INGEST_PORT:-6000}:6000"
+      - "${INGEST_BIND:-127.0.0.1}:${INGEST_PORT:-6000}:6000"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:6000/healthz"]
       interval: 15s
@@ -106,21 +124,60 @@ services:
       retries: 5
       start_period: 25s
 
-  # Fleet portal (React/Vite/MUI) behind nginx â€” proxies /api and /socket.io.
+  # Fleet portal (React/Vite/MUI) behind nginx — proxies /api and /socket.io.
   crmf-frontend:
     build:
       context: .
       dockerfile: frontend/Dockerfile
     container_name: crmf_frontend
     restart: unless-stopped
+    # Loopback by default; set FRONTEND_BIND to publish on the ops LAN.
     ports:
-      - "${FRONTEND_PORT:-8090}:80"
+      - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8090}:80"
     depends_on:
       crmf-backend:
         condition: service_healthy
 
+  # DEMO ONLY (RESTORED): emulates rig-edge sync agents so the portal is live
+  # end-to-end without physical rigs. Streams batches in the real edge contract,
+  # including the canonical well_control.* BOP namespace. ACTIVE_RIGS defaults to
+  # the full 50-rig fleet so ingest, health scoring and the fleet map are
+  # exercised at production scale.
+  fleet-sim:
+    build: ./fleet-sim
+    container_name: crmf_fleet_sim
+    restart: unless-stopped
+    profiles: ["demo"]
+    environment:
+      - CENTRAL_URL=http://crmf-backend:6000
+      # Must match the backend's INGEST_TOKEN so the demo authenticates (#1).
+      - INGEST_TOKEN=${INGEST_TOKEN:?set INGEST_TOKEN in .env for the demo profile}
+      - ACTIVE_RIGS=${ACTIVE_RIGS:-50}
+      - BATCH_SECONDS=${BATCH_SECONDS:-10}
+      # Per-rig credentials, once provision-rigs.js --json has written them.
+      # Absent on a fresh volume => every rig falls back to INGEST_TOKEN, which is
+      # exactly the unprovisioned-onboarding path.
+      - RIG_TOKENS_FILE=/provisioning/rig-tokens.json
+    volumes:
+      - crmf_provisioning:/provisioning:ro
+    depends_on:
+      crmf-backend:
+        condition: service_healthy
+
+  # DEMO ONLY (RESTORED): webhook receiver standing in for an enterprise endpoint
+  # (Slack/Teams/PagerDuty/SMS gateway). The backend POSTs P1 alarm alerts here.
+  # Inspect with: docker exec crmf_notify_sink wget -qO- localhost:9020/received
+  notify-sink:
+    build: ./notify-sink
+    container_name: crmf_notify_sink
+    restart: unless-stopped
+    profiles: ["demo"]
+    environment:
+      - PORT=9020
+
 volumes:
   crmf_pgdata:
+  crmf_provisioning:
 
 
 
