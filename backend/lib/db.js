@@ -56,6 +56,24 @@ async function assertSchemaObject(table) {
     }
 }
 
+const MIGRATION_REMEDY =
+    'this volume predates the ingest-concurrency migration and the app role cannot apply DDL. ' +
+    'Run the "Ingest-concurrency hardening" section of db/init.sql once as the DB owner ' +
+    '(e.g. docker exec -i <db-container> psql -U <owner> -d <db> < db/init.sql), then restart.';
+
+async function assertColumn(table, column) {
+    const { rows } = await pool.query(
+        `SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`,
+        [table, column]);
+    if (!rows.length) throw new Error(`required column ${table}.${column} is missing — ${MIGRATION_REMEDY}`);
+}
+
+async function assertIndex(indexName) {
+    const { rows } = await pool.query(
+        `SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1`, [indexName]);
+    if (!rows.length) throw new Error(`required index ${indexName} is missing — ${MIGRATION_REMEDY}`);
+}
+
 async function ensureAppMigrations() {
     await tryDdl(`
         CREATE TABLE IF NOT EXISTS rig_messages (
@@ -116,6 +134,14 @@ async function ensureAppMigrations() {
     await tryDdl(`CREATE INDEX IF NOT EXISTS wells_current_rig_idx
         ON wells (current_rig_id) WHERE current_rig_id IS NOT NULL`);
     await assertSchemaObject('rig_messages');
+    // The ingest path SELECTs/UPDATEs these unconditionally and its well_runs
+    // INSERTs name the partial unique index as conflict target — if the tryDdl
+    // calls above were skipped for privilege (crmf_app cannot DDL) on a volume
+    // whose owner-run migration never happened, every batch would fail with a
+    // confusing 42703/42P10 instead. Fail AT BOOT with the remediation.
+    await assertColumn('rigs', 'sender_epoch');
+    await assertColumn('rigs', 'seq_conflict_at');
+    await assertIndex('well_runs_one_open_per_rig');
     // --- data backfills below: ordinary DML, within crmf_app's grants ---
     await pool.query(`
         UPDATE wells w

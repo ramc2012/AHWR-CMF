@@ -109,8 +109,12 @@ function setFleetGauges(summary) {
     } catch { /* ignore */ }
 }
 
-const incSeqReset = (rigId) => { try { seqResets.inc({ rig_id: rigId }); } catch { /* metrics must never throw */ } };
-const incSeqConflict = (rigId) => { try { seqConflicts.inc({ rig_id: rigId }); } catch { /* metrics must never throw */ } };
+// rig_id values reach here from auto-registered device ids — bound the label so
+// a hostile-but-authenticated sender cannot bloat the metrics registry with
+// arbitrarily long label values (cardinality itself is bounded by rig count).
+const rigLabel = (rigId) => String(rigId || 'unknown').slice(0, 64);
+const incSeqReset = (rigId) => { try { seqResets.inc({ rig_id: rigLabel(rigId) }); } catch { /* metrics must never throw */ } };
+const incSeqConflict = (rigId) => { try { seqConflicts.inc({ rig_id: rigLabel(rigId) }); } catch { /* metrics must never throw */ } };
 
 module.exports = {
     registry,

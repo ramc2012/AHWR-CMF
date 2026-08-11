@@ -334,8 +334,12 @@ function eventListWithWellName(ws, body = {}, msg = {}) {
     // well_runs) once per stream interval, permanently disabled the replay
     // fast-path (lifecycle events bypass it by design), and grew the events table
     // by one 'ACTIVE WELL' row per frame — ~17k rows/rig/day of pure noise.
+    // Stage the announcement; the memo is COMMITTED only after ingest reports the
+    // batch durably stored (ingestEtpMessage). Advancing it here meant a transient
+    // ingest failure swallowed the well.started for the life of the connection —
+    // the memo said "announced" while the database never saw it.
     if (wellName && ws.etpLastAnnouncedWell !== wellName) {
-        ws.etpLastAnnouncedWell = wellName;
+        ws.etpPendingWellAnnounce = wellName;
         const ts = body.ts || msg.ts || new Date().toISOString();
         const alreadyStarted = events.some((ev) => ev && ev.type === 'well.started');
         events.push({ ts, type: 'activity', payload: { label: 'ACTIVE WELL', job: wellName, wellName, ...wellPayload } });
@@ -363,7 +367,14 @@ function normalizeBatch(ws, msg) {
     const body = msg.body || msg;
     const batch = body.batch || msg.batch;
     if (batch && (batch.deviceId || batch.rigId) && Array.isArray(batch.channels)) {
-        return { ...batch, deviceId: batch.deviceId || batch.rigId, events: eventListWithWellName(ws, batch, msg) };
+        const out = { ...batch, deviceId: batch.deviceId || batch.rigId, events: eventListWithWellName(ws, batch, msg) };
+        // Strip any client-supplied epoch: sender_epoch names an incarnation of
+        // the SYNC agent's seq counter. Forwarding a WS client's epoch verbatim
+        // let it roll the stored epoch out from under the sync lane, making every
+        // subsequent sync batch a spurious "sender reset" (and, repeated, a false
+        // seq-domain-conflict flag on the rig).
+        delete out.epoch;
+        return out;
     }
 
     const rigId = rigIdFromMessage(ws, body, msg);
@@ -381,6 +392,8 @@ function normalizeBatch(ws, msg) {
             // last_seq. ingestBatch treats a null seq as always-accept and leaves
             // last_seq untouched, which is exactly right for a live stream.
             seq: body.seq ?? msg.seq ?? null,
+            // Deliberately NO epoch field: this explicit whitelist must never
+            // grow one — see the delete out.epoch note in the batch branch above.
             deviceId: rigId,
             schemaVersion: body.schemaVersion || msg.schemaVersion || 'etp20-json',
             createdAt: body.createdAt || msg.createdAt || new Date().toISOString(),
@@ -444,7 +457,16 @@ async function ingestEtpMessage(ws, msg) {
         status.ingestRejectedCount += 1;
         setStatus({ lastError: `ETP ingest rejected for ${batch.deviceId || 'unknown'}: ${result.error || result.code}` });
         send(ws, 'IngestRejected', { rigId: batch.deviceId, error: result.error || 'rejected' });
+        // A staged well announcement did NOT make it to the database; leaving the
+        // memo unset means the next frame re-stages it (self-healing).
+        ws.etpPendingWellAnnounce = null;
         return true;
+    }
+    // The batch (including any staged well.started) is durably committed —
+    // NOW the memo may advance.
+    if (ws.etpPendingWellAnnounce) {
+        ws.etpLastAnnouncedWell = ws.etpPendingWellAnnounce;
+        ws.etpPendingWellAnnounce = null;
     }
     status.ingestCount += 1;
     const metrics = [];

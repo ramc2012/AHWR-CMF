@@ -285,6 +285,17 @@ async function trackRunInTxn(client, rigId, job) {
           FOR NO KEY UPDATE`,
         [rigId, well ? well.well_id : jobName]);
 
+    // The name resolution above ran UNLOCKED (it must — the lock statement needs
+    // its result). A portal deleteWell can commit in that window, leaving `well`
+    // pointing at a row that no longer exists; the well_runs INSERT below would
+    // then die on the FK and (via the caller's savepoint) silently skip tracking
+    // for the batch. Re-verify under the lock and fall through to auto-create.
+    if (well) {
+        const { rows: still } = await client.query(
+            'SELECT well_id FROM wells WHERE well_id = $1', [well.well_id]);
+        if (!still.length) well = null;
+    }
+
     if (!well) {
         // Auto-INSERT a minimal workover well, copying asset/field/coords from the rig.
         const rigRow = (await client.query(

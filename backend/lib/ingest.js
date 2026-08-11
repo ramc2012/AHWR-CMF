@@ -33,7 +33,20 @@ const TS_KEY = '__ts';
 // batch". Buffered replays after a WAN outage step back by at most the buffer
 // depth (SYNC_BUFFER_DAYS at SYNC_BATCH_SECONDS ~= 130k batches at the 15d/10s
 // default), while a true reset drops to 1 from wherever the rig had reached.
-const SEQ_RESET_GAP = Number(process.env.INGEST_SEQ_RESET_GAP || 500000);
+// NaN-proof env parse: Number('10k') is NaN, and NaN poisons Math.max — for
+// INSERT_CHUNK that meant a chunk loop that inserted ZERO rows while acking
+// ok:true (slice(0, NaN) === []). A malformed value falls back to the default.
+function envInt(name, def, min) {
+    const n = Number(process.env[name]);
+    if (!Number.isFinite(n)) return def;
+    return Math.max(min, Math.floor(n));
+}
+
+const SEQ_RESET_GAP = envInt('INGEST_SEQ_RESET_GAP', 500000, 1);
+
+// Snapshot timestamps further ahead of central's clock than this are clamped to
+// arrival time before entering the monotonic rig_latest cache (freeze guard).
+const MAX_FUTURE_SKEW_MS = envInt('INGEST_MAX_FUTURE_SKEW_MS', 60_000, 0);
 
 // ---------------------------------------------------------------------------
 // Seq-conflict detection. ONE legitimate reset (edge reinstall, offline volume
@@ -44,8 +57,8 @@ const SEQ_RESET_GAP = Number(process.env.INGEST_SEQ_RESET_GAP || 500000);
 // is stamped for the fleet API, a COOLED error logs once per window, an
 // audit_log row records the episode, and a Prometheus counter tracks volume.
 // ---------------------------------------------------------------------------
-const SEQ_RESET_WINDOW_MS = Number(process.env.INGEST_SEQ_CONFLICT_WINDOW_MS || 10 * 60_000);
-const SEQ_RESET_EPISODE = Math.max(2, Number(process.env.INGEST_SEQ_CONFLICT_RESETS || 3));
+const SEQ_RESET_WINDOW_MS = envInt('INGEST_SEQ_CONFLICT_WINDOW_MS', 10 * 60_000, 1000);
+const SEQ_RESET_EPISODE = envInt('INGEST_SEQ_CONFLICT_RESETS', 3, 2);
 const seqResetLog = new Map();   // rigId -> { times: number[], lastLoggedAt: number }
 
 function trackSeqReset(rigId) {
@@ -65,6 +78,9 @@ function seqResetsInWindow(rigId) {
     if (!e) return 0;
     const now = Date.now();
     while (e.times.length && now - e.times[0] > SEQ_RESET_WINDOW_MS) e.times.shift();
+    // Evict fully-drained entries so the map is bounded by rigs with RECENT
+    // resets, not by every rig id ever seen by the process.
+    if (!e.times.length && now - e.lastLoggedAt > SEQ_RESET_WINDOW_MS) seqResetLog.delete(rigId);
     return e.times.length;
 }
 
@@ -89,9 +105,21 @@ function tsMillis(raw) {
 // Auto-register an unknown device as a pending rig so onboarding is visible in
 // the governance workspace (proposal §6.1 "adoption progress per rig"). Only
 // called for already-authorized devices (audit #1).
+// Column set every path out of ensureRig must carry: the caller computes the
+// alarm rising-edge from rig.alarm_* and falls back to rig.active_job, so a row
+// missing those fields silently fabricates prev-alarm zeros and loses the job.
+const RIG_ROW_COLS = `rig_id, device_token, last_seq, sender_epoch, seq_conflict_at,
+                    alarm_active, alarm_p1, alarm_highest, active_job`;
+
 async function ensureRig(client, rigId, token, schemaVersion) {
+    // FOR NO KEY UPDATE: ensureRig is reached only when the transaction's opening
+    // locked SELECT found no row, but a concurrent first-contact transaction may
+    // have committed the rig in between. Returning that row UNLOCKED let the rest
+    // of the batch run unserialised — reopening the last_seq/alarm lost-update
+    // TOCTOU — and made the final UPDATE rigs acquire the rigs lock AFTER wells/
+    // well_runs locks, inverting the rigs->wells->well_runs hierarchy (40P01).
     const { rows } = await client.query(
-        'SELECT rig_id, device_token, last_seq, sender_epoch, seq_conflict_at FROM rigs WHERE rig_id = $1', [rigId]);
+        `SELECT ${RIG_ROW_COLS} FROM rigs WHERE rig_id = $1 FOR NO KEY UPDATE`, [rigId]);
     if (rows.length) return { ...rows[0], _new: false };
     // Never persist the FLEET-WIDE token as this rig's per-rig credential. Doing
     // so makes every auto-registered rig look provisioned while all 50 in fact
@@ -116,13 +144,19 @@ async function ensureRig(client, rigId, token, schemaVersion) {
         // (possibly a provisioned device_token). Re-read the real row — the caller
         // MUST re-authorize against it, not against our null-token stand-in.
         const { rows: raced } = await client.query(
-            `SELECT rig_id, device_token, last_seq, sender_epoch, seq_conflict_at
-             FROM rigs WHERE rig_id = $1 FOR NO KEY UPDATE`, [rigId]);
+            `SELECT ${RIG_ROW_COLS} FROM rigs WHERE rig_id = $1 FOR NO KEY UPDATE`, [rigId]);
         if (raced.length) return { ...raced[0], _new: false };
     }
     await client.query('INSERT INTO deployment_status (rig_id, gate, commissioning) VALUES ($1, $2, $3) ON CONFLICT (rig_id) DO NOTHING',
         [rigId, 'discovery', 'in_progress']);
-    return { rig_id: rigId, device_token: perRigToken, last_seq: null, sender_epoch: null, seq_conflict_at: null, _new: isNew };
+    // Fresh registration: zero alarm state and no job is the truth here, not a
+    // fabrication — the row we just inserted has exactly these defaults.
+    return {
+        rig_id: rigId, device_token: perRigToken, last_seq: null,
+        sender_epoch: null, seq_conflict_at: null,
+        alarm_active: 0, alarm_p1: 0, alarm_highest: null, active_job: null,
+        _new: isNew,
+    };
 }
 
 // Fail-closed authorization (audit #1). Accept a batch ONLY if the bearer token
@@ -155,7 +189,7 @@ function authorizeKnown(rig, token) {
 // Rows per INSERT statement. One giant UNNEST over an unbounded replay drain
 // built multi-million-element arrays in a single statement; chunking bounds
 // per-statement memory while staying inside one transaction.
-const INSERT_CHUNK = Math.max(1000, Number(process.env.INGEST_INSERT_CHUNK || 10000));
+const INSERT_CHUNK = envInt('INGEST_INSERT_CHUNK', 10000, 1000);
 
 // Bulk-insert telemetry rows with chunked UNNEST statements. Idempotent on
 // replay via ON CONFLICT DO NOTHING keyed on (rig_id, metric, ts) — the SCHEMA
@@ -643,8 +677,8 @@ const INGEST_ATTEMPTS = Math.max(1, Number(process.env.INGEST_TXN_ATTEMPTS || 3)
 
 // Per-transaction bounds. 3600 channel snapshots = one hour of 1 Hz data in a
 // single batch — an order of magnitude above the sync agent's ~10 s batches.
-const MAX_CHANNELS_PER_BATCH = Math.max(60, Number(process.env.INGEST_MAX_CHANNELS || 3600));
-const MAX_EVENTS_PER_BATCH = Math.max(50, Number(process.env.INGEST_MAX_EVENTS || 2000));
+const MAX_CHANNELS_PER_BATCH = envInt('INGEST_MAX_CHANNELS', 3600, 60);
+const MAX_EVENTS_PER_BATCH = envInt('INGEST_MAX_EVENTS', 2000, 50);
 
 // Retry wrapper. A 40P01 victim currently surfaces as a 500 to the edge, which
 // then treats the batch as a transient failure and re-sends it whole — so the
@@ -654,6 +688,12 @@ const MAX_EVENTS_PER_BATCH = Math.max(50, Number(process.env.INGEST_MAX_EVENTS |
 // all side effects (notifications) are dispatched by the caller AFTER commit.
 async function ingestBatch(ctx, batch) {
     const nowIso = new Date().toISOString();
+    // Prime the telemetry.source capability probe BEFORE any transaction client
+    // is held: awaited inside insertTelemetry it ran mid-transaction, so under
+    // pool exhaustion every in-flight batch stalled connectionTimeoutMillis
+    // holding its rigs row lock while the probe waited for a second connection.
+    // Out here it needs no concurrent client and caches for the process lifetime.
+    await telemetryHasSource().catch(() => {});
     let last;
     for (let attempt = 1; attempt <= INGEST_ATTEMPTS; attempt++) {
         last = await ingestBatchOnce(ctx, batch, nowIso);
@@ -668,6 +708,11 @@ async function ingestBatch(ctx, batch) {
 async function ingestBatchOnce({ rigId, token, schemaVersion }, batch, nowIso) {
     rigId = batch.deviceId || rigId;
     if (!rigId) return { ok: false, code: 400, error: 'missing deviceId' };
+    // Bound the identity: rigId flows into the rigs PK, Prometheus label values,
+    // the in-memory reset tracker, and log lines. The admin /rigs route enforces
+    // a 2-64 char pattern; the wire path must not accept what the UI would not.
+    rigId = String(rigId).trim();
+    if (!rigId || rigId.length > 64) return { ok: false, code: 400, error: 'invalid deviceId' };
 
     // Coerce seq to a safe integer or null up front (audit #11) — never bind a
     // raw untrusted value into the BIGINT last_seq column.
@@ -780,20 +825,38 @@ async function ingestBatchOnce({ rigId, token, schemaVersion }, batch, nowIso) {
         //     blackholes a rig that lost sync_state.json — it keeps getting
         //     ok:true / 0 points while nothing is stored.
         const lastSeq = rig && rig.last_seq != null ? Number(rig.last_seq) : null;
-        const batchEpoch = typeof batch.epoch === 'string' && batch.epoch.trim()
+        // Epoch participation requires a seq: a seq-null batch (ETP live frames,
+        // legacy senders) never joins the seq domain, so any `epoch` it happens to
+        // carry must be ignored — otherwise a WS client could roll the stored
+        // epoch out from under the sync agent and turn its every batch into a
+        // spurious "sender reset".
+        const batchEpoch = seq != null && typeof batch.epoch === 'string' && batch.epoch.trim()
             ? batch.epoch.trim().slice(0, 64) : null;
         const storedEpoch = rig && rig.sender_epoch ? String(rig.sender_epoch) : null;
         let backwards = false;
         let senderReset = false;
         let resetReason = '';
         if (seq != null && lastSeq != null) {
-            if (batchEpoch && storedEpoch) {
-                if (batchEpoch !== storedEpoch) {
+            if (batchEpoch && storedEpoch && batchEpoch === storedEpoch) {
+                backwards = seq <= lastSeq;   // same epoch: strictly monotonic
+            } else if (batchEpoch) {
+                // Epoch changed — or FIRST epoch-carrying batch while the stored
+                // epoch is still NULL (an edge that upgraded to epoch-carrying
+                // sync). The NULL case must land here too: routing it through the
+                // magnitude heuristic dropped the batch as a "duplicate" whenever
+                // the edge had ALSO lost its state (seq restarts at 1, gap below
+                // SEQ_RESET_GAP), and because dropped batches roll back before
+                // UPDATE rigs, the epoch was never adopted — every subsequent
+                // batch repeated the same drop: a permanent blackhole. Accepting
+                // a backward seq under a new epoch is safe: row-level ON CONFLICT
+                // dedup makes a misclassified replay harmless.
+                if (seq <= lastSeq) {
                     senderReset = true;
-                    resetReason = `sender epoch changed (${storedEpoch} -> ${batchEpoch})`;
-                } else {
-                    backwards = seq <= lastSeq;   // same epoch: strictly monotonic
+                    resetReason = storedEpoch
+                        ? `sender epoch changed (${storedEpoch} -> ${batchEpoch})`
+                        : `first epoch-carrying batch with backward seq (edge state loss during upgrade)`;
                 }
+                // Forward seq under a new/first epoch: plain accept; adopted below.
             } else {
                 backwards = seq <= lastSeq;
                 senderReset = backwards && (lastSeq - seq) >= SEQ_RESET_GAP;
@@ -804,25 +867,14 @@ async function ingestBatchOnce({ rigId, token, schemaVersion }, batch, nowIso) {
             await client.query('ROLLBACK').catch(() => {});
             return { ok: true, rigId, points: 0, events: 0, seq, duplicate: true };
         }
-        let seqConflict = false;
-        if (senderReset) {
-            const track = trackSeqReset(rigId);
-            seqConflict = track.conflict;
-            if (track.shouldLog) {
-                // Cooled: once per window, as an ERROR — repeated resets mean two
-                // live senders under one rig_id, which is data corruption, not noise.
-                console.error(`[ingest] ${rigId}: SEQ-DOMAIN CONFLICT — ${track.resets} sequence resets in ${Math.round(SEQ_RESET_WINDOW_MS / 60000)} min (latest: ${resetReason}). Two senders are likely publishing as this rig; their rows are interleaving under one identity.`);
-                metrics.incSeqConflict(rigId);
-                // Audit the episode (fire-and-forget on the POOL, not this client:
-                // must not abort the transaction, and should survive its rollback).
-                pool.query('INSERT INTO audit_log (actor, action, target, detail) VALUES ($1,$2,$3,$4)',
-                    ['ingest', 'ingest.seq_conflict', rigId,
-                        { resetsInWindow: track.resets, reason: resetReason, seq, lastSeq }]).catch(() => {});
-            } else {
-                console.warn(`[ingest] ${rigId}: sequence reset detected (${resetReason}); re-baselining`);
-            }
-            metrics.incSeqReset(rigId);
-        }
+        // Decide the conflict flag WITHOUT mutating the tracker: this attempt may
+        // yet roll back and be retried, and the tracker push must count each real
+        // reset exactly once. With the old in-attempt push, ONE legitimate reset
+        // whose transaction hit 40P01 twice reached the episode threshold all by
+        // itself — a false two-senders corruption flag manufactured by the retry
+        // loop. The push, logs, metrics and audit row all move to AFTER COMMIT.
+        const seqConflict = senderReset
+            && (seqResetsInWindow(rigId) + 1) >= SEQ_RESET_EPISODE;
 
         const source = String(schemaVersion || batch.schemaVersion || '').startsWith('etp20') ? 'etp' : 'sync';
         const insertedCounts = await insertTelemetry(client, rigId, channels, nowIso, source);
@@ -835,7 +887,17 @@ async function ingestBatchOnce({ rigId, token, schemaVersion }, batch, nowIso) {
         if (snap) {
             // Per-tag last-seen map (audit #22): stamp each metric with this
             // snapshot's ts under the reserved __ts key, merged into the cache.
-            const snapTsIso = coerceTsIso(snap.ts) || nowIso;
+            let snapTsIso = coerceTsIso(snap.ts) || nowIso;
+            // Future-skew clamp: the monotonic guard below means one snapshot
+            // stamped far in the future (a rig PC with a wrong clock) would pin
+            // rig_latest.ts there and freeze the live page — every honest later
+            // snapshot rejected as "stale" — until wall-clock catches up. Clamp
+            // anything beyond a small allowance to the arrival instant: the data
+            // is kept, the pin is impossible.
+            if (tsMillis(snapTsIso) > Date.now() + MAX_FUTURE_SKEW_MS) {
+                console.warn(`[ingest] ${rigId}: snapshot ts ${snapTsIso} is ahead of central clock; clamping to arrival time (check the rig PC clock)`);
+                snapTsIso = nowIso;
+            }
             const tsMap = {};
             for (const m of Object.keys(snap.values)) tsMap[m] = snapTsIso;
             // Insert values already carrying the reserved __ts map so per-tag age is
@@ -868,6 +930,32 @@ async function ingestBatchOnce({ rigId, token, schemaVersion }, batch, nowIso) {
                 snapAccepted = true;
                 mergedMetrics = Object.keys(merged).filter((k) => k !== TS_KEY);
             }
+        }
+
+        // TRANSACTION-level ordered well pre-lock. The per-statement pre-locks in
+        // startWellForRig / completeWellForRig guarantee ascending order only
+        // WITHIN one statement; a batch with several lifecycle events (or a
+        // well.created/updated whose upsert locks its row directly) could still
+        // acquire a lower well_id after already holding a higher one, and two
+        // rigs' batches referencing each other's wells then deadlock (AB/BA).
+        // Locking every well id referenced by this batch's lifecycle events PLUS
+        // everything the rig currently holds, once, in a single ordered
+        // statement, makes the per-event locks pure re-acquisitions. Wells that
+        // do not exist yet cannot be pre-locked; concurrent same-PK creators
+        // serialise on the unique index (a wait, not a cycle) — except the rare
+        // case of two batches simultaneously CREATING the same two wells in
+        // opposite order, which the retry wrapper absorbs.
+        const lifecycleWellIds = [...new Set(events
+            .filter((ev) => ev && ['well.created', 'well.updated', 'well.started', 'well.completed'].includes(ev.type))
+            .map((ev) => normalizeWellEvent(ev).wellId)
+            .filter(Boolean))];
+        if (lifecycleWellIds.length) {
+            await client.query(
+                `SELECT well_id FROM wells
+                  WHERE well_id = ANY($2) OR current_rig_id = $1
+                  ORDER BY well_id
+                  FOR NO KEY UPDATE`,
+                [rigId, lifecycleWellIds]);
         }
 
         const processed = await processEvents(client, rigId, events);
@@ -991,6 +1079,24 @@ async function ingestBatchOnce({ rigId, token, schemaVersion }, batch, nowIso) {
         await client.query(`UPDATE rigs SET ${sets.join(', ')} WHERE rig_id = $1`, vals);
 
         await client.query('COMMIT');
+
+        // Seq-reset bookkeeping AFTER commit only — a rolled-back attempt must
+        // count nothing (see the seqConflict decision above).
+        if (senderReset) {
+            const track = trackSeqReset(rigId);
+            metrics.incSeqReset(rigId);
+            if (track.conflict && track.shouldLog) {
+                // Cooled: once per window, as an ERROR — repeated resets mean two
+                // live senders under one rig_id: data corruption, not noise.
+                console.error(`[ingest] ${rigId}: SEQ-DOMAIN CONFLICT — ${track.resets} sequence resets in ${Math.round(SEQ_RESET_WINDOW_MS / 60000)} min (latest: ${resetReason}). Two senders are likely publishing as this rig; their rows are interleaving under one identity.`);
+                metrics.incSeqConflict(rigId);
+                pool.query('INSERT INTO audit_log (actor, action, target, detail) VALUES ($1,$2,$3,$4)',
+                    ['ingest', 'ingest.seq_conflict', rigId,
+                        { resetsInWindow: track.resets, reason: resetReason, seq, lastSeq }]).catch(() => {});
+            } else if (!track.conflict) {
+                console.warn(`[ingest] ${rigId}: sequence reset detected (${resetReason}); re-baselining`);
+            }
+        }
 
         // Provenance audit AFTER commit, on the pool. Inside the transaction, its
         // swallowed catch hid a poisoned transaction: if the INSERT failed, every
