@@ -183,6 +183,36 @@ services:
     environment:
       - PORT=9020
 
+  # Read-only MCP server — agentic AI access to the CRMF fleet over the MCP
+  # streamable-HTTP transport. Mints a VIEWER JWT so central RBAC blocks every
+  # write; exposes only GET-backed fleet tools. MCP_API_KEY is REQUIRED.
+  crmf-mcp:
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
+    container_name: crmf_mcp
+    restart: unless-stopped
+    cpus: 0.25
+    mem_limit: 192m
+    mem_reservation: 48m
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - BACKEND_URL=http://crmf-backend:6000
+      - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET in .env}
+      - MCP_API_KEY=${MCP_API_KEY:?set MCP_API_KEY in .env (>=16 chars); it guards /mcp}
+      - TLS_CERT_FILE=/certs/mcp.crt
+      - TLS_KEY_FILE=/certs/mcp.key
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      # Loopback-only by default. Point AI clients at https://127.0.0.1:8766/mcp ;
+      # set MCP_CENTRAL_BIND to expose on the ops LAN.
+      - "${MCP_CENTRAL_BIND:-127.0.0.1}:${MCP_CENTRAL_PORT:-8766}:3000"
+    depends_on:
+      crmf-backend:
+        condition: service_healthy
+
 volumes:
   crmf_pgdata:
   crmf_provisioning:
