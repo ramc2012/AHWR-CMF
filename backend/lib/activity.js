@@ -14,8 +14,19 @@ const PRODUCTIVE_PHASES = new Set(['RIH', 'POOH', 'CIRCULATE', 'MAKE_UP', 'BREAK
 const NPT_PHASES = new Set(['WAIT', 'IDLE', 'REPAIR', 'STOP']);
 
 const phaseKey = (phase) => String(phase || '').trim().toUpperCase();
-const isProductive = (phase) => PRODUCTIVE_PHASES.has(phaseKey(phase));
-const isNpt = (phase) => NPT_PHASES.has(phaseKey(phase));
+// The EDGE is authoritative: it ships `productive` (and an npt reason) with every
+// activity event, computed from its own code table. Only fall back to the local
+// phase lists when a row predates that (or came from another producer) — the
+// lists do not know the edge's MILLING / CDR / WASH / PERFORATION / FISHING codes
+// and disagree with it on IDLE, which the edge counts as productive.
+const isProductive = (phase, declared) => (
+    declared === true || declared === 'true' ? true
+        : declared === false || declared === 'false' ? false
+            : PRODUCTIVE_PHASES.has(phaseKey(phase)));
+const isNpt = (phase, declared) => (
+    declared === false || declared === 'false' ? true
+        : declared === true || declared === 'true' ? false
+            : NPT_PHASES.has(phaseKey(phase)));
 // code: first 4 chars of the (upper) phase name, matching the edge convention.
 const phaseCode = (phase) => phaseKey(phase).slice(0, 4);
 
@@ -32,8 +43,18 @@ function emptyResult() {
 async function getActivity(rigId, hours = 24) {
     const h = Math.min(Math.max(Number(hours) || 24, 1), 24 * 31);
 
+    // The edge emits { activity, label, productive, npt, source, since } — there is
+    // NO 'phase' key. Reading payload->>'phase' filtered out EVERY row, so this
+    // returned an empty timeline for every rig. Accept the edge's own keys (and
+    // keep 'phase' for any legacy/synthesised producer), and carry the edge's
+    // productive/npt booleans through rather than re-deriving them from a
+    // hardcoded phase list that does not know MILLING/CDR/WASH/PERFORATION.
     const { rows } = await query(
-        `SELECT ts, payload->>'phase' AS phase
+        `SELECT ts,
+                COALESCE(payload->>'activity', payload->>'phase')       AS phase,
+                payload->>'label'                                       AS label,
+                payload->>'productive'                                  AS productive,
+                payload->'npt'->>'reason'                               AS npt_reason
          FROM events
          WHERE rig_id = $1 AND type = 'activity' AND ts > now() - ($2 || ' hours')::interval
          ORDER BY ts ASC`,
@@ -69,7 +90,13 @@ async function getActivity(rigId, hours = 24) {
         }
         // close the previous segment at this row's start
         if (cur) cur.endMs = startMs;
-        cur = { phase, code: phaseCode(phase), startMs, endMs: null };
+        cur = {
+            phase, code: phaseCode(phase), startMs, endMs: null,
+            // Carry the edge's own label + declared classification onto the segment.
+            label: evs[idx].label || phase,
+            declared: evs[idx].productive,
+            nptReason: evs[idx].npt_reason || null,
+        };
         segments.push(cur);
     }
     // last open segment runs to now()
@@ -78,16 +105,22 @@ async function getActivity(rigId, hours = 24) {
     // Finalise per-segment derived fields.
     for (const s of segments) {
         s.durationSec = Math.max(0, Math.round((s.endMs - s.startMs) / 1000));
-        s.productive = isProductive(s.phase);
+        s.productive = isProductive(s.phase, s.declared);
+        s.npt = isNpt(s.phase, s.declared);
     }
 
     // Aggregate byPhase (sum durationSec per phase) + pct of total.
     const totalSec = segments.reduce((a, s) => a + s.durationSec, 0);
     const perPhase = new Map();
-    for (const s of segments) perPhase.set(s.phase, (perPhase.get(s.phase) || 0) + s.durationSec);
+    const phaseLabel = new Map();
+    for (const s of segments) {
+        perPhase.set(s.phase, (perPhase.get(s.phase) || 0) + s.durationSec);
+        if (!phaseLabel.has(s.phase)) phaseLabel.set(s.phase, s.label || s.phase);
+    }
     const byPhase = Array.from(perPhase.entries())
         .map(([phase, durationSec]) => ({
             phase,
+            label: phaseLabel.get(phase) || phase,
             durationSec,
             pct: totalSec > 0 ? Math.round((durationSec / totalSec) * 1000) / 10 : 0,
         }))
@@ -96,8 +129,8 @@ async function getActivity(rigId, hours = 24) {
     // Totals: productive / npt / other seconds + pct.
     let productiveSec = 0; let nptSec = 0; let otherSec = 0;
     for (const s of segments) {
-        if (isProductive(s.phase)) productiveSec += s.durationSec;
-        else if (isNpt(s.phase)) nptSec += s.durationSec;
+        if (s.productive) productiveSec += s.durationSec;
+        else if (s.npt) nptSec += s.durationSec;
         else otherSec += s.durationSec;
     }
     const pct = (n) => (totalSec > 0 ? Math.round((n / totalSec) * 1000) / 10 : 0);
@@ -107,13 +140,23 @@ async function getActivity(rigId, hours = 24) {
     const current = {
         phase: last.phase,
         code: last.code,
+        label: last.label || last.phase,
+        productive: last.productive,
+        npt: last.npt,
+        nptReason: last.nptReason,
         job,
         sinceSec: Math.max(0, Math.round((nowMs - last.startMs) / 1000)),
     };
 
     return {
         current,
-        segments,
+        segments: segments.map((sg) => ({
+            phase: sg.phase, code: sg.code, label: sg.label,
+            start: new Date(sg.startMs).toISOString(),
+            end: new Date(sg.endMs).toISOString(),
+            durationSec: sg.durationSec, productive: sg.productive, npt: sg.npt,
+            nptReason: sg.nptReason,
+        })),
         byPhase,
         totals: {
             productiveSec, nptSec, otherSec, total: totalSec,

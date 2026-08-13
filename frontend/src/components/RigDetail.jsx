@@ -5,7 +5,7 @@ import {
     Tabs, Tab, IconButton, Tooltip, Divider, Menu, MenuItem, ListItemIcon,
     Dialog, DialogTitle, DialogContent, DialogActions, TextField, Chip,
 } from '@mui/material';
-import { ArrowBack, ExpandMore, ExpandLess, Refresh, Palette, Logout, VolumeOff, VolumeUp, GridView, ShowChart, Storage, Speed, Assignment, NotificationsNone, Description, Healing, Settings, ChatBubbleOutline, Send } from '@mui/icons-material';
+import { ArrowBack, ExpandMore, ExpandLess, Refresh, Palette, Logout, VolumeOff, VolumeUp, GridView, ShowChart, Storage, Speed, Assignment, Timeline, NotificationsNone, Description, Healing, Settings, ChatBubbleOutline, Send } from '@mui/icons-material';
 import { api, phaseColor } from '../api';
 import { socket } from '../socket';
 import { StatusChip, HealthBar, PriorityChip, fmtAgo, fmtNum } from './common';
@@ -20,6 +20,7 @@ import RigAlarmsPanel from './rig/panels/RigAlarmsPanel';
 import RigReportPanel from './rig/panels/RigReportPanel';
 import RigMaintenancePanel from './rig/panels/RigMaintenancePanel';
 import CentralRigConsoleOverview from './rig/CentralRigConsoleOverview';
+import RigActivityPanel from './rig/panels/RigActivityPanel';
 
 // Per-rig AHWR-50-TWIN style pages. These pages stay inside the central rig route;
 // the fleet dashboard and other central modules keep their CRMF shell.
@@ -28,6 +29,7 @@ const HMI_TABS = [
     { key: 'edr', label: 'EDR', el: TrendsPanel },
     { key: 'equipment', label: 'Equipment', el: EquipmentPanel },
     { key: 'efficiency', label: 'Efficiency', el: EfficiencyPanel },
+    { key: 'activity', label: 'Activity', el: RigActivityPanel },
     { key: 'operations', label: 'Operations', el: OperationsPanel },
     { key: 'alarms', label: 'Alarms', el: RigAlarmsPanel },
     { key: 'reports', label: 'Reports & Logs', el: RigReportPanel },
@@ -38,6 +40,7 @@ const HMI_MENU_META = {
     edr: { menuLabel: 'EDR', icon: <ShowChart fontSize="small" /> },
     equipment: { menuLabel: 'Equipment', icon: <Storage fontSize="small" /> },
     efficiency: { menuLabel: 'Efficiency', icon: <Speed fontSize="small" /> },
+    activity: { menuLabel: 'Activity', icon: <Timeline fontSize="small" /> },
     operations: { menuLabel: 'Operations', icon: <Assignment fontSize="small" /> },
     alarms: { menuLabel: 'Alarms', icon: <NotificationsNone fontSize="small" /> },
     reports: { menuLabel: 'Reports', icon: <Description fontSize="small" /> },

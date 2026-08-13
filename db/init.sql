@@ -84,7 +84,11 @@ CREATE TABLE IF NOT EXISTS telemetry (
     metric  TEXT             NOT NULL,                 -- "measurement.field"
     value   DOUBLE PRECISION NOT NULL
 );
-SELECT create_hypertable('telemetry', 'ts', if_not_exists => TRUE, chunk_time_interval => INTERVAL '1 day');
+-- 1-HOUR chunks (was 1 day). Compression only ever acts on a CLOSED chunk, so
+-- with day-long chunks a 1-hour compress policy still accrues a full day
+-- (~28 GB at design load) of uncompressed data before the first chunk
+-- becomes eligible. Hour chunks let compression keep pace with ingest.
+SELECT create_hypertable('telemetry', 'ts', if_not_exists => TRUE, chunk_time_interval => INTERVAL '1 hour');
 CREATE INDEX IF NOT EXISTS telemetry_rig_metric_ts ON telemetry (rig_id, metric, ts DESC);
 
 -- Native compression after 7 days (proposal §5.1 "hot storage, compressed").
@@ -93,7 +97,16 @@ ALTER TABLE telemetry SET (
     timescaledb.compress_segmentby = 'rig_id, metric',
     timescaledb.compress_orderby   = 'ts DESC'
 );
-SELECT add_compression_policy('telemetry', INTERVAL '7 days', if_not_exists => TRUE);
+-- CAPACITY NOTE: at the proposal's design load (50 rigs x ~110 tags x 1 Hz) the
+-- raw hypertable grows ~28 GB/DAY uncompressed, so a 7-day compress delay means
+-- ~200 GB of uncompressed hot data before the first chunk is ever compressed —
+-- it filled a 460 GB dev box in two days. Compress after 1 HOUR instead: the
+-- hot window stays queryable, and segmentby (rig_id, metric) + orderby ts gives
+-- ~10-20x on this shape. Override per deployment if a longer raw window is
+-- genuinely needed.
+SELECT add_compression_policy('telemetry',
+    COALESCE(current_setting('ahwr.compress_after', true), '1 hour')::interval,
+    if_not_exists => TRUE);
 
 -- Continuous aggregate: 1-minute rollup (proposal §6.4 "continuous aggregates").
 CREATE MATERIALIZED VIEW IF NOT EXISTS telemetry_1m
@@ -122,13 +135,13 @@ ALTER MATERIALIZED VIEW telemetry_1m SET (timescaledb.materialized_only = false)
 CREATE UNIQUE INDEX IF NOT EXISTS telemetry_rig_metric_ts_uniq
     ON telemetry (rig_id, metric, ts);
 
--- Data-retention policy (audit #3 / proposal §6.5): drop raw telemetry chunks
--- older than 5 years. Compression (above) bounds size in the hot window; this
--- bounds total growth against the fixed PVC. The 1-minute continuous aggregate
--- above is retained for long-range rollups. Cold archival of aged-out chunks to
--- object storage is handled by the deploy layer (TimescaleDB tiered storage /
--- chunk-export-to-S3), decoupled from pgBackRest backup retention.
-SELECT add_retention_policy('telemetry', INTERVAL '5 years', if_not_exists => TRUE);
+-- Raw retention. 5 years of RAW 1 Hz telemetry is ~51 TB at design load, which
+-- no single PVC holds; the 1-minute continuous aggregate above is what actually
+-- carries the long-range history (and is not dropped here). Keep raw bounded and
+-- let the aggregate + cold archival serve anything older.
+SELECT add_retention_policy('telemetry',
+    COALESCE(current_setting('ahwr.raw_retention', true), '3 days')::interval,
+    if_not_exists => TRUE);
 
 -- ---------------------------------------------------------------------
 -- Event stream (alarm / activity / connection events from the edge)
