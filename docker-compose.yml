@@ -159,6 +159,8 @@ services:
       - INGEST_TOKEN=${INGEST_TOKEN:?set INGEST_TOKEN in .env for the demo profile}
       - ACTIVE_RIGS=${ACTIVE_RIGS:-50}
       - BATCH_SECONDS=${BATCH_SECONDS:-10}
+      # DEV: sample every N seconds. Production sets 1 (full-rate).
+      - SAMPLE_EVERY_S=${SAMPLE_EVERY_S:-5}
       # Per-rig credentials, once provision-rigs.js --json has written them.
       # Absent on a fresh volume => every rig falls back to INGEST_TOKEN, which is
       # exactly the unprovisioned-onboarding path.

@@ -36,6 +36,8 @@ const RIG_TOKENS = (() => {
 const BATCH_SECONDS = Number(process.env.BATCH_SECONDS || 10);
 // Seconds between PERSISTED samples (see the tick loop). 1 = full 1 Hz.
 const SAMPLE_EVERY_S = Math.max(1, Number(process.env.SAMPLE_EVERY_S || 5));
+// How often each rig ships a CMMS/maintenance snapshot (real edge: ~60 s).
+const CMMS_SNAPSHOT_SECONDS = Math.max(BATCH_SECONDS, Number(process.env.CMMS_SNAPSHOT_SECONDS || 60));
 
 const osc = (t, base, amp, period, phase = 0) => base + amp * Math.sin((2 * Math.PI * (t + phase)) / period);
 const noise = (a) => (Math.random() - 0.5) * a;
@@ -92,6 +94,7 @@ for (let n = 1; n <= ACTIVE; n++) {
     const wells = wellSetFor(n);
     rigs.push({
         id: rigId,
+        n,                                   // rig index (deterministic CMMS spread)
         offset: (n * 7) % CYCLE_LEN,         // desync the cycles
         seq: 1,
         batch: { channels: [], events: [] },
@@ -289,6 +292,11 @@ function tick() {
         if (rig.sealCountdown <= 0) {
             // Activity event once per batch.
             if (rig._wf) rig.batch.events.push({ ts: new Date().toISOString(), type: 'activity', payload: { phase: rig._wf.phase, job: rig.well } });
+            // CMMS snapshot once a minute per rig (same cadence as the real edge),
+            // staggered by rig index so 50 rigs don't all ship one on the same tick.
+            if ((t + rig.n * 3) % CMMS_SNAPSHOT_SECONDS < BATCH_SECONDS) {
+                rig.batch.events.push({ ts: new Date().toISOString(), type: 'cmms.snapshot', payload: buildCmmsSnapshot(rig, t) });
+            }
             const batch = {
                 seq: SEQ_BASE + (rig.seq++), deviceId: rig.id, schemaVersion: '1.0',
                 createdAt: new Date().toISOString(),
@@ -306,3 +314,138 @@ if (EXCLUDED.size) {
     console.log(`fleet-sim: NOT simulating ${[...EXCLUDED].join(', ')} (real edge attached)`);
 }
 setInterval(tick, 1000);
+
+// ---------------------------------------------------------------------------
+// CMMS snapshot (maintenance) — the real rig edge ships this once a minute via
+// sync.enqueueEvent('cmms.snapshot', ...). Without it the central rig
+// drill-down's Maintenance tab shows "No maintenance snapshot received" for
+// every SIMULATED rig, so the whole CMMS feature was only visible on the one
+// real edge. Shape mirrors edge backend/server.js buildCmmsSnapshot() exactly:
+// { rigName, assets, counts, pm, downtime, workOrders, logbook, instruments,
+//   runHours, cmmsSummary, instrumentSummary, generatedAt }.
+// Values are DERIVED from each rig's own index/telemetry so they are stable
+// per rig and differ across the fleet (not one cloned payload).
+// ---------------------------------------------------------------------------
+const CMMS_ASSETS = [
+    { id: 'engine', name: 'CAT Engine', category: 'Power', base: 4200, interval: 250 },
+    { id: 'hpu', name: 'Hydraulic Power Unit', category: 'Hydraulics', base: 3360, interval: 500 },
+    { id: 'htd', name: 'Top Drive (HTD)', category: 'Rotary', base: 2520, interval: 500 },
+    { id: 'drawworks', name: 'Drawworks', category: 'Hoisting', base: 3855, interval: 250 },
+    { id: 'mudpump', name: 'Mud Pump', category: 'Circulating', base: 3622, interval: 250 },
+];
+const WO_TITLES = ['Engine oil & filter change', 'HPU filter replacement', 'Top drive gearbox inspection',
+    'Drawworks brake adjustment', 'Mud pump liner change', 'Rope slip & cut'];
+const LOG_OPS = ['RIH to 1500 m', 'POOH for bit change', 'Circulating bottoms up', 'Make-up connection',
+    'Rigging up power tong', 'Fishing job in progress'];
+const LOG_MAINT = ['Greased crown block', 'Replaced HPU return filter', 'Checked engine coolant level',
+    'Torqued top drive bolts', 'Calibrated SPP transducer'];
+const INSTR = [
+    { id: 'spp', name: 'Standpipe Pressure Transducer', type: 'Pressure', interval: 180 },
+    { id: 'hookload', name: 'Hookload Load Cell', type: 'Load', interval: 365 },
+    { id: 'h2s', name: 'H2S Detector (rig floor)', type: 'Gas', interval: 90 },
+];
+const isoDaysAgo = (d) => new Date(Date.now() - d * 86400000).toISOString();
+
+function buildCmmsSnapshot(rig, t) {
+    const n = rig.n;                                 // per-rig deterministic spread
+    const runH = (t / 3600);                         // sim uptime contribution
+    const assets = CMMS_ASSETS.map((a, i) => {
+        const hours = Math.round((a.base + n * 37 + i * 11 + runH) * 10) / 10;
+        const sinceService = (hours % a.interval);
+        const dueIn = Math.round(a.interval - sinceService);
+        const status = dueIn < 0 ? 'overdue' : dueIn < 40 ? 'due-soon' : 'ok';
+        // Field names MUST match the real edge's maintenance.getSummary() asset
+        // shape (verified against a live AHWR-50-3 snapshot), or the central
+        // panel renders blanks: nextDueInHours (not nextDueInH), pmStatus with a
+        // HYPHEN ('due-soon'), source (not hoursSource), and health[] as a
+        // {label,value} array (not a readings object).
+        const readings = a.id === 'engine'
+            ? [{ label: 'Coolant °C', value: 78 + (n % 12) }, { label: 'Oil bar', value: 40 + (n % 9) }]
+            : a.id === 'hpu' ? [{ label: 'Oil Temp °C', value: 42 + (n % 10) }, { label: 'Disch bar', value: 180 + (n % 20) }]
+            : a.id === 'htd' ? [{ label: 'RPM', value: 60 + (n % 50) }, { label: 'Torque', value: 600 + (n % 400) }]
+            : a.id === 'drawworks' ? [{ label: 'Hook Load t', value: 70 + (n % 30) }, { label: 'Rope wear', value: r(2 + (n % 3) / 10, 2) }]
+            : [{ label: 'SPP bar', value: 14 + (n % 8) }, { label: 'SPM', value: 5 + (n % 4) }];
+        return {
+            id: a.id, name: a.name, category: a.category, hours,
+            source: a.id === 'drawworks' || a.id === 'mudpump' ? 'derived' : 'measured',
+            nextDueInHours: dueIn, pmStatus: status, status, pmTasks: 1 + (i % 2),
+            openDowntime: a.id === CMMS_ASSETS[n % CMMS_ASSETS.length].id && n % 4 === 0 ? 1 : 0,
+            health: readings,
+        };
+    });
+    const overdue = assets.filter((a) => a.pmStatus === 'overdue').length;
+    const dueSoon = assets.filter((a) => a.pmStatus === 'due-soon').length;
+    const openWOs = 1 + (n % 3);
+    const workOrders = Array.from({ length: openWOs }, (_, i) => ({
+        woNo: `WO-${2000 + n * 10 + i}`,
+        type: i % 2 === 0 ? 'PREVENTIVE' : 'BREAKDOWN',
+        assetId: CMMS_ASSETS[(n + i) % CMMS_ASSETS.length].id,
+        asset: CMMS_ASSETS[(n + i) % CMMS_ASSETS.length].name,
+        title: WO_TITLES[(n + i) % WO_TITLES.length],
+        priority: `P${1 + ((n + i) % 3)}`,
+        status: i === 0 ? 'OPEN' : 'IN_PROGRESS',
+        raisedAt: isoDaysAgo((i + 1) * 2),
+        assignedTo: ['R. Sharma', 'V. Patel', 'A. Kumar'][(n + i) % 3],
+        // Maintenance log references a NOTIFICATION number (SAP-style), not a WO.
+        notificationNo: `NOTIF-${100000 + n * 100 + i}`,
+    }));
+    const logbook = [
+        ...LOG_OPS.slice(0, 3).map((text, i) => ({
+            id: `op-${n}-${i}`, logType: 'OPERATIONS', category: 'Operations',
+            text, at: isoDaysAgo(i * 0.25), by: 'driller', shift: i % 2 ? 'NIGHT' : 'DAY',
+        })),
+        ...LOG_MAINT.slice(0, 2).map((text, i) => ({
+            id: `mt-${n}-${i}`, logType: 'MAINTENANCE', category: 'Maintenance',
+            text, at: isoDaysAgo(i * 0.5 + 0.2), by: 'mechanic', shift: 'DAY',
+            notificationNo: `NOTIF-${100000 + n * 100 + i}`,
+        })),
+    ];
+    const downtime = [{
+        id: `dt-${n}`, assetId: CMMS_ASSETS[n % CMMS_ASSETS.length].id,
+        asset: CMMS_ASSETS[n % CMMS_ASSETS.length].name,
+        reasonCode: ['Equipment Failure', 'Waiting on Parts', 'Weather'][n % 3],
+        start: isoDaysAgo(0.4), end: n % 4 === 0 ? null : isoDaysAgo(0.2),
+        durationMin: n % 4 === 0 ? null : 288, notes: 'Sim-generated downtime record',
+        by: 'toolpusher',
+    }];
+    const instrumentRows = INSTR.map((ins, i) => {
+        const lastCalDays = 30 + ((n + i * 40) % 200);
+        const dueInDays = ins.interval - lastCalDays;
+        return {
+            id: `${ins.id}-${n}`, name: ins.name, type: ins.type,
+            serial: `SN-${1000 + n * 7 + i}`, intervalDays: ins.interval,
+            lastCalDate: isoDaysAgo(lastCalDays), dueInDays,
+            calStatus: dueInDays < 0 ? 'OVERDUE' : dueInDays < 30 ? 'DUE_SOON' : 'VALID',
+        };
+    });
+    // Per-day run hours for the last 7 days, per asset (feeds the Run Hours tab).
+    const runHours = Array.from({ length: 7 }, (_, d) => ({
+        date: isoDaysAgo(d).slice(0, 10),
+        assets: CMMS_ASSETS.reduce((acc, a, i) => {
+            acc[a.id] = Math.round((6 + ((n + d + i) % 14)) * 10) / 10;
+            return acc;
+        }, {}),
+    }));
+    return {
+        rigName: rig.id,
+        assets, counts: { overdue, dueSoon, ok: assets.length - overdue - dueSoon },
+        pm: assets.map((a) => ({
+            assetId: a.id, asset: a.name, task: `${a.name} scheduled service`,
+            intervalH: CMMS_ASSETS.find((x) => x.id === a.id).interval,
+            nextDueInHours: a.nextDueInHours, status: a.pmStatus, pmStatus: a.pmStatus,
+        })),
+        downtime, workOrders, logbook, instruments: instrumentRows, runHours,
+        cmmsSummary: {
+            workOrders: { open: openWOs, breakdownOpen: openWOs > 1 ? 1 : 0, preventiveOpen: 1, p1Open: n % 5 === 0 ? 1 : 0 },
+            overhauls: { active: n % 6 === 0 ? 1 : 0, planned: 1 },
+            logbook: { today: 5, operationsToday: 3, maintenanceToday: 2 },
+        },
+        instrumentSummary: {
+            total: instrumentRows.length,
+            overdue: instrumentRows.filter((i) => i.calStatus === 'OVERDUE').length,
+            dueSoon: instrumentRows.filter((i) => i.calStatus === 'DUE_SOON').length,
+            valid: instrumentRows.filter((i) => i.calStatus === 'VALID').length,
+        },
+        generatedAt: new Date().toISOString(),
+    };
+}
