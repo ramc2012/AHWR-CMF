@@ -519,6 +519,30 @@ function buildApiRouter() {
         return urls;
     }));
     // ----- Platform settings (proposal section 6.5) - read (auth), write (admin, audited) -----
+    // --- Active Directory (Windows domain) settings — admin-only. Persisted in
+    // app_settings (key 'ldap_config'), applied to the ldap module live; env
+    // vars remain the defaults underneath. Bind password is write-only.
+    r.get('/settings/ldap', requireRoleAudited('admin'), wrap(() => ldap.getSafeConfig()));
+    r.put('/settings/ldap', requireRoleAudited('admin'), wrap(async (req) => {
+        const patch = req.body || {};
+        const { rows } = await query("SELECT value FROM app_settings WHERE key = 'ldap_config'");
+        const saved = rows[0] ? rows[0].value : {};
+        const next = { ...saved, ...patch };
+        if (!String(patch.bindPassword || '').trim()) {
+            if (saved.bindPassword) next.bindPassword = saved.bindPassword;
+            else delete next.bindPassword;
+        }
+        await query(
+            `INSERT INTO app_settings (key, value, updated_at, updated_by) VALUES ('ldap_config', $1, now(), $2)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by`,
+            [JSON.stringify(next), req.user.username]);
+        ldap.applyOverrides(next);
+        await query('INSERT INTO audit_log (actor, action, target, detail) VALUES ($1,$2,$3,$4)',
+            [req.user.username, 'settings.ldap', 'auth', { mode: next.mode, url: next.url ? 'set' : 'empty' }]).catch(() => {});
+        return ldap.getSafeConfig();
+    }));
+    r.post('/settings/ldap/test', requireRoleAudited('admin'), wrap(() => ldap.testConnection()));
+
     r.get('/settings', wrap(() => settings.getSettings()));
     r.patch('/settings', requireRoleAudited('admin'),
         wrap(async (req) => {
@@ -705,6 +729,11 @@ let shuttingDown = false;
 async function main() {
     await waitForDb();
     await seedAll();
+    // Apply persisted Active Directory settings (Settings -> AD panel) on boot.
+    try {
+        const { rows } = await query("SELECT value FROM app_settings WHERE key = 'ldap_config'");
+        if (rows[0] && rows[0].value) { ldap.applyOverrides(rows[0].value); console.log('[ldap] persisted configuration applied'); }
+    } catch (e) { console.warn('[ldap] could not load persisted configuration:', e.message); }
     // Seed platform settings defaults (retention/update-rate/offline/latency) and
     // sync the live offline threshold from whatever is persisted (proposal §6.5).
     await settings.seedDefaults();

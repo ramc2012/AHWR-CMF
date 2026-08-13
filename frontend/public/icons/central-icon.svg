@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="CRMF — Centralised Rig Monitoring Facility">
+  <!-- CENTRAL app icon: fleet network — central monitoring hub with radiating rig nodes; emerald/blue on dark navy -->
+  <rect x="1" y="1" width="62" height="62" rx="14" fill="#0d1526" stroke="#22304d" stroke-width="2"/>
+  <!-- spokes -->
+  <g stroke="#34d399" stroke-width="2.4" stroke-linecap="round">
+    <path d="M32 32 32 13"/>
+    <path d="M32 32 48.5 22.5"/>
+    <path d="M32 32 48.5 41.5"/>
+    <path d="M32 32 32 51"/>
+    <path d="M32 32 15.5 41.5"/>
+    <path d="M32 32 15.5 22.5"/>
+  </g>
+  <!-- rig nodes -->
+  <g fill="#60a5fa" stroke="#0d1526" stroke-width="1.6">
+    <circle cx="32" cy="13" r="4.2"/>
+    <circle cx="48.5" cy="22.5" r="4.2"/>
+    <circle cx="48.5" cy="41.5" r="4.2"/>
+    <circle cx="32" cy="51" r="4.2"/>
+    <circle cx="15.5" cy="41.5" r="4.2"/>
+    <circle cx="15.5" cy="22.5" r="4.2"/>
+  </g>
+  <!-- central hub -->
+  <circle cx="32" cy="32" r="7.5" fill="#0d1526" stroke="#34d399" stroke-width="3"/>
+  <circle cx="32" cy="32" r="2.8" fill="#34d399"/>
+</svg>

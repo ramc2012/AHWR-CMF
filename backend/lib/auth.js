@@ -22,7 +22,9 @@ if (!JWT_SECRET || /change[-_ ]?me/i.test(JWT_SECRET) || JWT_SECRET.length < 32)
 }
 const TOKEN_TTL = process.env.TOKEN_TTL || '12h';
 const OIDC_ENABLED = process.env.OIDC_ENABLED === 'true';
-const AUTH_MODE = (process.env.AUTH_MODE || 'local').toLowerCase();   // local | ldap | both
+// AUTH_MODE lives in ldap._cfg so the Settings panel can change it at runtime;
+// read it per-login instead of freezing the env value at module load.
+const authMode = () => ldap.getMode();
 const ROLE_RANK = { viewer: 1, operator: 2, admin: 3 };
 
 // Issue a signed portal JWT for an authenticated principal (local or directory).
@@ -69,12 +71,12 @@ async function loginLdap(username, password) {
 async function login(username, password) {
     if (!username || !password) return null;
 
-    if (AUTH_MODE === 'local' || AUTH_MODE === 'both') {
+    if (authMode() === 'local' || authMode() === 'both') {
         const local = await loginLocal(username, password);
         if (local) return local;
-        if (AUTH_MODE === 'local') return null;
+        if (authMode() === 'local') return null;
     }
-    if (AUTH_MODE === 'ldap' || AUTH_MODE === 'both') {
+    if (authMode() === 'ldap' || authMode() === 'both') {
         return loginLdap(username, password);
     }
     return null;

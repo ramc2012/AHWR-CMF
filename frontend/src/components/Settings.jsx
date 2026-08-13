@@ -35,6 +35,20 @@ const ETP_SETTING_KEYS = [
     'etp20_server_enabled', 'etp20_server_path', 'etp20_server_token',
 ];
 
+// Active Directory (Windows domain login) — authentication modes, mirrored from
+// the edge Settings panel so both apps behave identically.
+const LDAP_MODES = [
+    { value: 'local', label: 'Local only', help: 'Only accounts created in this portal can sign in.' },
+    { value: 'ldap', label: 'Domain (Active Directory) only', help: 'Only Windows-domain accounts can sign in — make sure an AD group maps to admin first.' },
+    { value: 'both', label: 'Local + Domain', help: 'Local accounts are tried first (break-glass admin), then the domain.' },
+];
+const LDAP_ROLES = ['viewer', 'operator', 'admin'];
+const LDAP_EMPTY = {
+    mode: 'local', url: '', bindDN: '', searchBase: '', searchFilter: '', domain: '',
+    defaultRole: 'viewer', roleAdmin: '', roleOperator: '', roleViewer: '',
+    startTLS: false, rejectUnauthorized: true,
+};
+
 export default function Settings() {
     const { can } = useAuth();
     const isAdmin = can('admin');
@@ -63,6 +77,15 @@ export default function Settings() {
     const [etpBusy, setEtpBusy] = useState(false);
     const [networkUrls, setNetworkUrls] = useState(null);
     const [urlCopied, setUrlCopied] = useState('');
+
+    // ---- Active Directory (Windows domain login) ---------------------------------
+    const [ldapCfg, setLdapCfg] = useState(null);          // last server copy (carries hasBindPassword / ldapEnabled)
+    const [ldapDraft, setLdapDraft] = useState(LDAP_EMPTY);
+    const [ldapPassword, setLdapPassword] = useState('');  // write-only: never pre-filled, sent only when typed
+    const [ldapSaving, setLdapSaving] = useState(false);
+    const [ldapTesting, setLdapTesting] = useState(false);
+    const [ldapTest, setLdapTest] = useState(null);        // { ok, message } from the connectivity probe
+    const [ldapMsg, setLdapMsg] = useState('');
 
     // ---- Presence ---------------------------------------------------------------
     const [presence, setPresence] = useState([]);
@@ -100,7 +123,31 @@ export default function Settings() {
             .catch((e) => { if (e?.response?.status !== 401) setErr(e?.response?.data?.error || 'Failed to load ETP 2.0 status'); });
     }, []);
 
-    useEffect(() => { loadRigs(); loadSettings(); loadEtpStatus(); loadNetworkUrls(); }, [loadRigs, loadSettings, loadEtpStatus, loadNetworkUrls]);
+    // Fold a fresh server copy of the LDAP config into chip state + editable draft.
+    const applyLdap = useCallback((c) => {
+        setLdapCfg(c || null);
+        setLdapDraft({
+            mode: c?.mode || 'local', url: c?.url || '', bindDN: c?.bindDN || '',
+            searchBase: c?.searchBase || '', searchFilter: c?.searchFilter || '', domain: c?.domain || '',
+            defaultRole: c?.defaultRole || 'viewer',
+            roleAdmin: c?.roleAdmin || '', roleOperator: c?.roleOperator || '', roleViewer: c?.roleViewer || '',
+            startTLS: !!c?.startTLS, rejectUnauthorized: c?.rejectUnauthorized !== false,
+        });
+    }, []);
+
+    const loadLdap = useCallback(() => {
+        api.ldapConfig()
+            .then(applyLdap)
+            .catch((e) => {
+                const s = e?.response?.status;
+                if (s !== 401 && s !== 403) setErr(e?.response?.data?.error || 'Failed to load Active Directory settings');
+            });
+    }, [applyLdap]);
+
+    useEffect(() => {
+        loadRigs(); loadSettings(); loadEtpStatus(); loadNetworkUrls();
+        if (isAdmin) loadLdap(); // GET /api/settings/ldap is admin-only
+    }, [loadRigs, loadSettings, loadEtpStatus, loadNetworkUrls, loadLdap, isAdmin]);
 
     useEffect(() => {
         const t = setInterval(() => loadEtpStatus(), 2000);
@@ -231,6 +278,35 @@ export default function Settings() {
             if (e?.response?.status !== 401) setErr(e?.response?.data?.error || `ETP 2.0 ${action} failed`);
         } finally {
             setEtpBusy(false);
+        }
+    };
+
+    const saveLdap = async () => {
+        setLdapSaving(true); setErr(''); setLdapMsg(''); setLdapTest(null);
+        try {
+            const patch = { ...ldapDraft };
+            // Write-only bind password: send only when the admin typed a new one (empty = keep).
+            if (ldapPassword.trim()) patch.bindPassword = ldapPassword;
+            const updated = await api.saveLdapConfig(patch); // PUT returns the fresh safe config
+            applyLdap(updated);
+            setLdapPassword('');
+            setLdapMsg('Active Directory settings saved.');
+        } catch (e) {
+            if (e?.response?.status !== 401) setErr(e?.response?.data?.error || 'Failed to save Active Directory settings');
+        } finally {
+            setLdapSaving(false);
+        }
+    };
+
+    const testLdapConnection = async () => {
+        setLdapTesting(true); setErr(''); setLdapMsg(''); setLdapTest(null);
+        try {
+            const res = await api.testLdap();
+            setLdapTest(res || { ok: false, message: 'No response from server' });
+        } catch (e) {
+            if (e?.response?.status !== 401) setLdapTest({ ok: false, message: e?.response?.data?.error || 'Connection test failed' });
+        } finally {
+            setLdapTesting(false);
         }
     };
     return (
@@ -447,7 +523,187 @@ export default function Settings() {
                             Central outbound client: {etpStatus?.client?.state || etpStatus?.state || 'disabled'} | Built-in server: {etpStatus?.server?.state || 'disabled'} at {etpStatus?.server?.path || '/etp'} | Connected ETP clients: {etpStatus?.server?.clientCount ?? 0} | Last ETP ingest: {etpStatus?.server?.lastIngestRig || '--'} / {etpStatus?.server?.lastIngestPoints ?? 0} points
                         </Typography>
                     </Paper>
-                    {/* 4) USER LIVENESS ----------------------------------------------------- */}
+
+                    {/* 4) ACTIVE DIRECTORY (WINDOWS DOMAIN LOGIN) --------------------------- */}
+                    <Paper sx={{ p: 2, display: 'flex', flexDirection: 'column' }}>
+                        <Stack direction="row" alignItems="center" spacing={2} mb={1}>
+                            <VpnKey color="primary" />
+                            <Box sx={{ flexGrow: 1 }}>
+                                <Typography variant="h6">Active Directory (Windows domain login)</Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                    Sign in with Windows-domain accounts; AD security groups map to portal roles.
+                                    Environment variables stay the defaults — values saved here override them live. Audit-logged.
+                                </Typography>
+                            </Box>
+                            <Chip
+                                size="small"
+                                color={ldapCfg?.ldapEnabled ? 'success' : 'default'}
+                                label={ldapCfg?.ldapEnabled ? `Domain login ACTIVE (${ldapCfg.mode})` : 'Domain login inactive'}
+                            />
+                            {isAdmin && (
+                                <Stack direction="row" spacing={1}>
+                                    <Button variant="outlined" startIcon={<Cable />} disabled={ldapTesting || !ldapCfg} onClick={testLdapConnection}>
+                                        {ldapTesting ? 'Testing…' : 'Test connection'}
+                                    </Button>
+                                    <Button variant="contained" startIcon={<Save />} disabled={ldapSaving || !ldapCfg} onClick={saveLdap}>
+                                        {ldapSaving ? 'Saving…' : 'Save'}
+                                    </Button>
+                                </Stack>
+                            )}
+                        </Stack>
+                        {ldapMsg && <Alert severity="success" sx={{ mb: 1.5 }} onClose={() => setLdapMsg('')}>{ldapMsg}</Alert>}
+                        {ldapTest && <Alert severity={ldapTest.ok ? 'success' : 'error'} sx={{ mb: 1.5 }} onClose={() => setLdapTest(null)}>{ldapTest.message}</Alert>}
+                        {!isAdmin ? (
+                            <Typography variant="caption" color="text.secondary">
+                                Administrator access required to view or change domain-login settings.
+                            </Typography>
+                        ) : (
+                            <>
+                                <Grid container spacing={2}>
+                                    <Grid item xs={12} md={4}>
+                                        <TextField
+                                            select size="small" fullWidth label="Authentication mode"
+                                            value={ldapDraft.mode} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, mode: e.target.value })}
+                                            SelectProps={{ renderValue: (v) => (LDAP_MODES.find((m) => m.value === v)?.label || v) }}
+                                            helperText={(LDAP_MODES.find((m) => m.value === ldapDraft.mode) || LDAP_MODES[0]).help}
+                                        >
+                                            {LDAP_MODES.map((m) => (
+                                                <MenuItem key={m.value} value={m.value}>
+                                                    <Box>
+                                                        <Typography variant="body2">{m.label}</Typography>
+                                                        <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: 'normal', display: 'block' }}>{m.help}</Typography>
+                                                    </Box>
+                                                </MenuItem>
+                                            ))}
+                                        </TextField>
+                                    </Grid>
+                                    <Grid item xs={12} md={4}>
+                                        <TextField
+                                            size="small" fullWidth label="Domain (UPN suffix)" placeholder="corp.example.com"
+                                            InputLabelProps={{ shrink: true }}
+                                            value={ldapDraft.domain} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, domain: e.target.value })}
+                                            helperText="Used to build user@domain logins from bare usernames."
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} md={4}>
+                                        <TextField
+                                            select size="small" fullWidth label="Default role"
+                                            value={ldapDraft.defaultRole} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, defaultRole: e.target.value })}
+                                            helperText="Role for domain users who match no group mapping below."
+                                        >
+                                            {LDAP_ROLES.map((r) => <MenuItem key={r} value={r} sx={{ textTransform: 'capitalize' }}>{r}</MenuItem>)}
+                                        </TextField>
+                                    </Grid>
+                                    <Grid item xs={12} md={6}>
+                                        <TextField
+                                            size="small" fullWidth label="LDAP URL" placeholder="ldap://dc.corp.example.com:389 or ldaps://dc:636"
+                                            InputLabelProps={{ shrink: true }}
+                                            value={ldapDraft.url} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, url: e.target.value })}
+                                            helperText="Domain Controller address. Use ldaps:// (or StartTLS) in production."
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} md={6}>
+                                        <TextField
+                                            size="small" fullWidth label="Search base" placeholder="DC=corp,DC=example,DC=com"
+                                            InputLabelProps={{ shrink: true }}
+                                            value={ldapDraft.searchBase} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, searchBase: e.target.value })}
+                                            helperText="Directory subtree searched for user entries."
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} md={6}>
+                                        <TextField
+                                            size="small" fullWidth label="Bind DN (service account)"
+                                            placeholder="CN=svc-crmf,OU=Service Accounts,DC=corp,DC=example,DC=com"
+                                            InputLabelProps={{ shrink: true }}
+                                            value={ldapDraft.bindDN} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, bindDN: e.target.value })}
+                                            helperText="Leave blank for direct user@domain bind (no service account)."
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} md={6}>
+                                        <TextField
+                                            size="small" fullWidth type="password" label="Bind password" autoComplete="new-password"
+                                            placeholder={ldapCfg?.hasBindPassword ? 'unchanged — leave blank to keep' : ''}
+                                            InputLabelProps={{ shrink: true }}
+                                            value={ldapPassword} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapPassword(e.target.value)}
+                                            helperText="Write-only: never displayed. Only sent when you type a new one."
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12}>
+                                        <TextField
+                                            size="small" fullWidth label="Search filter"
+                                            placeholder="(|(sAMAccountName={username})(userPrincipalName={username}))"
+                                            InputLabelProps={{ shrink: true }}
+                                            value={ldapDraft.searchFilter} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, searchFilter: e.target.value })}
+                                            helperText={'{username} is replaced with the login name (LDAP-escaped).'}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12}>
+                                        <Typography variant="subtitle2" fontWeight={800}>Group → role mapping</Typography>
+                                        <Typography variant="caption" color="text.secondary">
+                                            Comma-separated AD security-group names (CN or full DN). First match wins: admin, then operator, then viewer.
+                                        </Typography>
+                                    </Grid>
+                                    <Grid item xs={12} md={4}>
+                                        <TextField
+                                            size="small" fullWidth label="Admin groups" placeholder="CRMF-Admins, Domain Admins"
+                                            InputLabelProps={{ shrink: true }}
+                                            value={ldapDraft.roleAdmin} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, roleAdmin: e.target.value })}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} md={4}>
+                                        <TextField
+                                            size="small" fullWidth label="Operator groups" placeholder="CRMF-Operators"
+                                            InputLabelProps={{ shrink: true }}
+                                            value={ldapDraft.roleOperator} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, roleOperator: e.target.value })}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} md={4}>
+                                        <TextField
+                                            size="small" fullWidth label="Viewer groups" placeholder="CRMF-Viewers"
+                                            InputLabelProps={{ shrink: true }}
+                                            value={ldapDraft.roleViewer} disabled={!ldapCfg}
+                                            onChange={(e) => setLdapDraft({ ...ldapDraft, roleViewer: e.target.value })}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} md={4}>
+                                        <FormControlLabel
+                                            control={<Switch checked={ldapDraft.startTLS} disabled={!ldapCfg}
+                                                onChange={(e) => setLdapDraft({ ...ldapDraft, startTLS: e.target.checked })} />}
+                                            label="StartTLS (upgrade ldap:// to TLS)"
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} md={8}>
+                                        <FormControlLabel
+                                            control={<Switch checked={ldapDraft.rejectUnauthorized} disabled={!ldapCfg}
+                                                onChange={(e) => setLdapDraft({ ...ldapDraft, rejectUnauthorized: e.target.checked })} />}
+                                            label="Validate TLS certificate"
+                                        />
+                                        {!ldapDraft.rejectUnauthorized && (
+                                            <Typography variant="caption" sx={{ color: 'warning.main', display: 'block' }}>
+                                                Warning: certificate validation is OFF — the connection can be intercepted. Use only for lab / self-signed Domain Controllers.
+                                            </Typography>
+                                        )}
+                                    </Grid>
+                                </Grid>
+                                <Typography variant="caption" color="text.secondary" sx={{ mt: 1.5 }}>
+                                    Test connection uses the last saved settings — Save first if you changed anything.
+                                    It binds the service account (or reads the root DSE anonymously) without attempting a user login.
+                                </Typography>
+                            </>
+                        )}
+                    </Paper>
+
+                    {/* 5) USER LIVENESS ----------------------------------------------------- */}
                     <Paper sx={{ p: 2, display: 'flex', flexDirection: 'column' }}>
                         <Box mb={1}>
                             <Typography variant="h6">Signed-in users</Typography>

@@ -122,4 +122,64 @@ async function authenticate(rawUsername, password) {
     return { username, displayName, role, groups };
 }
 
-module.exports = { ldapEnabled, info, authenticate, parseUsername, _cfg: cfg };
+// ---------------------------------------------------------------------------
+// Runtime configuration (Settings -> Active Directory panel). Env vars are the
+// DEFAULT layer; overrides persist in app_settings (key 'ldap_config') and are
+// loaded by server boot. Bind password is WRITE-ONLY: never returned to any
+// client; an empty value on save means "keep the stored one".
+// ---------------------------------------------------------------------------
+function applyOverrides(saved) {
+    if (!saved || typeof saved !== 'object') return;
+    const str = (v) => (typeof v === 'string' ? v.trim() : undefined);
+    if (str(saved.mode) && ['local', 'ldap', 'both'].includes(saved.mode.toLowerCase())) cfg.mode = saved.mode.toLowerCase();
+    for (const k of ['url', 'bindDN', 'searchBase', 'searchFilter', 'domain']) {
+        if (str(saved[k]) !== undefined) cfg[k] = saved[k].trim();
+    }
+    if (str(saved.bindPassword)) cfg.bindPassword = saved.bindPassword;
+    if (str(saved.defaultRole) && ['viewer', 'operator', 'admin'].includes(saved.defaultRole.toLowerCase())) cfg.defaultRole = saved.defaultRole.toLowerCase();
+    for (const [k, key] of [['groupAdmin', 'roleAdmin'], ['groupOperator', 'roleOperator'], ['groupViewer', 'roleViewer']]) {
+        if (typeof saved[key] === 'string') cfg[k] = list(saved[key]);
+    }
+    if (saved.startTLS !== undefined) cfg.startTLS = !!saved.startTLS;
+    if (saved.rejectUnauthorized !== undefined) cfg.rejectUnauthorized = !!saved.rejectUnauthorized;
+}
+
+function getSafeConfig() {
+    return {
+        mode: cfg.mode, url: cfg.url, bindDN: cfg.bindDN,
+        hasBindPassword: !!cfg.bindPassword,
+        searchBase: cfg.searchBase, searchFilter: cfg.searchFilter, domain: cfg.domain,
+        defaultRole: cfg.defaultRole,
+        roleAdmin: cfg.groupAdmin.join(','), roleOperator: cfg.groupOperator.join(','), roleViewer: cfg.groupViewer.join(','),
+        startTLS: cfg.startTLS, rejectUnauthorized: cfg.rejectUnauthorized,
+        ldapEnabled: ldapEnabled(),
+    };
+}
+
+async function testConnection() {
+    if (!Client) return { ok: false, message: 'ldapts module not installed' };
+    if (!cfg.url) return { ok: false, message: 'LDAP URL is not configured' };
+    const client = newClient();
+    try {
+        if (cfg.startTLS && !/^ldaps:/i.test(cfg.url)) await client.startTLS({ rejectUnauthorized: cfg.rejectUnauthorized });
+        if (cfg.bindDN) {
+            // A successful authenticated BIND is the proof that matters. The root
+            // DSE read below is a bonus check — some lightweight test directories
+            // (e.g. the bundled ldapjs demo DC) don't serve the '' base at all,
+            // and that must not fail the test when the bind itself was accepted.
+            await client.bind(cfg.bindDN, cfg.bindPassword || '');
+            try { await client.search('', { scope: 'base', filter: '(objectClass=*)', attributes: ['namingContexts'], sizeLimit: 1 }); } catch { /* bind already proven */ }
+            return { ok: true, message: 'Connected and service-account bind accepted' };
+        }
+        await client.search('', { scope: 'base', filter: '(objectClass=*)', attributes: ['namingContexts'], sizeLimit: 1 });
+        return { ok: true, message: 'Connected (anonymous root DSE read)' };
+    } catch (e) {
+        return { ok: false, message: e.message };
+    } finally {
+        try { await client.unbind(); } catch { /* ignore */ }
+    }
+}
+
+const getMode = () => cfg.mode;
+
+module.exports = { ldapEnabled, info, authenticate, parseUsername, _cfg: cfg, applyOverrides, getSafeConfig, testConnection, getMode };

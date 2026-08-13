@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 96" width="260" height="96" role="img" aria-label="ONGC — Energy: Now and Next">
+  <!-- Placeholder lockup — drop the official ONGC logo SVG in this file to replace -->
+  <!-- Typographic lockup only: the official ONGC logo artwork is trademarked and not bundled here.
+       The maroon badge + white wordmark reads on both dark and light backgrounds without CSS. -->
+  <rect x="60" y="6" width="140" height="46" rx="10" fill="#8B1D2C"/>
+  <text x="133" y="38.5" text-anchor="middle" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="27" font-weight="800" letter-spacing="6" fill="#ffffff">ONGC</text>
+  <text x="131" y="76" text-anchor="middle" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="14" font-weight="400" letter-spacing="1.5" fill="#94a3b8">Energy: Now &amp; Next</text>
+</svg>

@@ -20,12 +20,14 @@ const DRAWER_MINI = 72;      // collapsed (icon-only) width
 
 // `role` (optional) gates a nav item: only shown when can(role) is true.
 const NAV = [
+    // Ordered by operator priority: situational awareness -> safety -> operations
+    // -> asset health -> data integrity -> reporting -> administration.
     { to: '/', label: 'Fleet Overview', icon: <GridView /> },
-    { to: '/wells', label: 'Wells', icon: <Water /> },
     { to: '/alarms', label: 'Alarm Command Centre', icon: <NotificationsActive /> },
-    { to: '/data-quality', label: 'Data Quality', icon: <FactCheck /> },
+    { to: '/wells', label: 'Wells', icon: <Water /> },
     { to: '/workover', label: 'Workover Performance', icon: <Construction /> },
     { to: '/maintenance', label: 'Maintenance & Reliability', icon: <Healing /> },
+    { to: '/data-quality', label: 'Data Quality', icon: <FactCheck /> },
     { to: '/reports', label: 'Reports', icon: <Description /> },
     { to: '/registry', label: 'Config Registry', icon: <Storage /> },
     { to: '/users', label: 'User Access', icon: <ManageAccounts />, role: 'admin' },

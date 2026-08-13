@@ -94,6 +94,13 @@ export const api = {
     deleteNotifyChannel: (id) => axios.delete(`/api/notifications/channels/${id}`).then((r) => r.data),
     testNotifyChannel: (id) => axios.post(`/api/notifications/channels/${id}/test`).then((r) => r.data),
 
+    // Active Directory (Windows domain login) — admin-only on the backend. The bind
+    // password is write-only: include bindPassword in the PUT body only when the admin
+    // typed a new one (empty/absent means keep the stored password).
+    ldapConfig: () => axios.get('/api/settings/ldap').then((r) => r.data),
+    saveLdapConfig: (patch) => axios.put('/api/settings/ldap', patch).then((r) => r.data),
+    testLdap: () => axios.post('/api/settings/ldap/test').then((r) => r.data),
+
     // Central settings (retention/update-rate/offline/latency) — PATCH is admin-only on the backend.
     settings: () => axios.get('/api/settings').then((r) => r.data),
     networkUrls: () => axios.get('/api/network/urls').then((r) => r.data),
