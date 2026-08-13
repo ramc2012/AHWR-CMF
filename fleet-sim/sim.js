@@ -34,6 +34,8 @@ const RIG_TOKENS = (() => {
     }
 })();
 const BATCH_SECONDS = Number(process.env.BATCH_SECONDS || 10);
+// Seconds between PERSISTED samples (see the tick loop). 1 = full 1 Hz.
+const SAMPLE_EVERY_S = Math.max(1, Number(process.env.SAMPLE_EVERY_S || 5));
 
 const osc = (t, base, amp, period, phase = 0) => base + amp * Math.sin((2 * Math.PI * (t + phase)) / period);
 const noise = (a) => (Math.random() - 0.5) * a;
@@ -272,7 +274,15 @@ function tick() {
         rig.well = jobAt(rig, t);
 
         const { v, events } = snapshot(rig, t);
-        rig.batch.channels.push({ ts: new Date().toISOString(), values: v });
+        // DEV DENSITY: the sim models 1 Hz sampling, but persisting every sample
+        // for a 50-rig fleet writes ~28 GB/day — far more than is needed to see
+        // the features work, and it filled the dev box. Keep only every Nth
+        // sample (SAMPLE_EVERY_S, default 5 s) so trends, EDR, aggregates and the
+        // fleet view all still render from real movement at ~1/5 the volume.
+        // Set SAMPLE_EVERY_S=1 for full-rate collection (production behaviour).
+        if (t % SAMPLE_EVERY_S === 0) {
+            rig.batch.channels.push({ ts: new Date().toISOString(), values: v });
+        }
         for (const e of events) rig.batch.events.push({ ts: new Date().toISOString(), ...e });
 
         rig.sealCountdown -= 1;
@@ -291,7 +301,7 @@ function tick() {
     }
 }
 
-console.log(`CRMF fleet-sim: streaming ${rigs.length} rigs -> ${CENTRAL_URL}/ingest every ${BATCH_SECONDS}s (1 Hz channels)`);
+console.log(`CRMF fleet-sim: streaming ${rigs.length} rigs -> ${CENTRAL_URL}/ingest every ${BATCH_SECONDS}s (sampling every ${SAMPLE_EVERY_S}s)`);
 if (EXCLUDED.size) {
     console.log(`fleet-sim: NOT simulating ${[...EXCLUDED].join(', ')} (real edge attached)`);
 }

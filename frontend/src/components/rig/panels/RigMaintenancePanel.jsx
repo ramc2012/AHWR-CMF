@@ -1,401 +1,291 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-    Box, Paper, Typography, Chip, Stack, Alert, Button,
-    Table, TableBody, TableCell, TableHead, TableRow, TableContainer,
-    Dialog, DialogTitle, DialogContent, DialogActions, TextField, MenuItem,
+    Box, Typography, Paper, Stack, Chip, Tabs, Tab, Table, TableBody, TableCell,
+    TableContainer, TableHead, TableRow, Alert, CircularProgress, Tooltip,
 } from '@mui/material';
-import { FavoriteBorder, Build, Tune } from '@mui/icons-material';
 import { api } from '../../../api';
-import { useRigData } from '../../../context/RigDataContext';
 
-const BG = '#071225';
-const PANEL = '#263447';
-const BORDER = '#344963';
-const BLUE = '#29b6ff';
-const GREEN = '#22e070';
-const YELLOW = '#ffb300';
-const RED = '#ff3f4b';
-const TEXT = '#eaf3ff';
-const MUTED = '#9fb4d1';
+// Fleet-side Maintenance view for ONE rig, rendered from the CMMS snapshot the
+// rig edge ships (event `cmms.snapshot` -> table rig_cmms). The edge remains the
+// system of record — this is read-only mirror, consistent with the platform's
+// monitoring-only contract. Nothing here can write back to a rig.
 
-const fmt = (v, d = 2) => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }) : '0.00';
+const PM_COLOR = { overdue: '#ef4444', 'due-soon': '#f59e0b', ok: '#22c55e' };
+const PM_LABEL = { overdue: 'Overdue', 'due-soon': 'Due Soon', ok: 'OK' };
+const pmColor = (s) => PM_COLOR[s] || '#64748b';
+
+const fmtTs = (ts) => {
+    if (!ts) return '—';
+    const d = new Date(ts);
+    return Number.isNaN(d.getTime()) ? '—'
+        : d.toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
 };
+const fmtNum = (v, d = 1) => (Number.isFinite(Number(v)) ? Number(v).toFixed(d) : '—');
+const fmtMin = (m) => (Number.isFinite(Number(m)) ? `${Math.round(Number(m))} min` : '—');
 
-function hoursUntil(next, current) {
-    return Number(next || 0) - Number(current || 0);
-}
-
-function nextDueHour(current, interval, fallbackNext) {
-    const cur = Math.max(0, Number(current) || 0);
-    const intv = Math.max(1, Number(interval) || 1);
-    const configured = Number(fallbackNext);
-    if (Number.isFinite(configured) && configured > cur) return configured;
-    return Math.ceil((cur + 0.001) / intv) * intv;
-}
-
-function dueUsedPct(current, next, interval) {
-    const cur = Math.max(0, Number(current) || 0);
-    const nxt = Math.max(cur, Number(next) || cur);
-    const intv = Math.max(1, Number(interval) || 1);
-    const last = Math.max(0, nxt - intv);
-    return Math.min(100, Math.max(0, ((cur - last) / intv) * 100));
-}
-
-function healthScore(dueIn, interval, downtime = 0) {
-    const used = 100 - Math.min(100, Math.max(0, (Number(dueIn) / Math.max(1, Number(interval) || 1)) * 100));
-    return Math.max(0, Math.min(100, 100 - used * 0.65 - Number(downtime || 0) * 12));
-}
-
-function statusFor(dueIn) {
-    if (dueIn < 0) return { label: 'Overdue', color: RED };
-    if (dueIn <= 50) return { label: 'Due Soon', color: YELLOW };
-    return { label: 'OK', color: GREEN };
-}
-
-function SummaryTile({ label, value, color }) {
+function Kpi({ label, value, color }) {
     return (
-        <Paper variant="outlined" sx={{ bgcolor: PANEL, borderColor: color, p: 3, minHeight: 120, display: 'grid', placeItems: 'center', borderRadius: 1 }}>
-            <Box sx={{ textAlign: 'center' }}>
-                <Typography sx={{ color: MUTED, textTransform: 'uppercase', letterSpacing: 1.2, fontSize: 15 }}>{label}</Typography>
-                <Typography sx={{ color, fontWeight: 900, fontSize: 42, lineHeight: 1.1 }}>{value}</Typography>
-            </Box>
-        </Paper>
-    );
-}
-
-function HealthCard({ name, group, hours, source, dueIn, interval, metrics, tasks, downtime }) {
-    const st = statusFor(dueIn);
-    const health = healthScore(dueIn, interval, downtime);
-    const duePct = 100 - Math.min(100, Math.max(0, (Number(dueIn) / Math.max(1, Number(interval) || 1)) * 100));
-    return (
-        <Paper variant="outlined" sx={{ bgcolor: PANEL, borderColor: BORDER, p: 2, minHeight: 220, borderRadius: 1 }}>
-            <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
-                <Box>
-                    <Typography sx={{ color: TEXT, fontWeight: 900, fontSize: 20 }}>{name}</Typography>
-                    <Typography sx={{ color: MUTED, mt: 0.5 }}>{group}</Typography>
-                </Box>
-                <Chip size="small" label={st.label} sx={{ color: st.color, borderColor: st.color, bgcolor: `${st.color}22`, fontWeight: 900 }} variant="outlined" />
-            </Stack>
-            <Stack direction="row" alignItems="center" spacing={1} sx={{ mt: 2 }}>
-                <Typography sx={{ color: BLUE, fontWeight: 900, fontSize: 24 }}>{fmt(hours)} h</Typography>
-                <Chip size="small" label={source} sx={{ bgcolor: '#1b4961', color: '#a9c1dc', height: 22 }} />
-                {downtime ? <Chip size="small" label={`${downtime} open DT`} sx={{ bgcolor: '#5b2a3a', color: RED, fontWeight: 900, ml: 'auto' }} /> : null}
-            </Stack>
-            <Typography sx={{ color: MUTED, mt: 1.5 }}>
-                next due in <Box component="span" sx={{ color: st.color, fontWeight: 900 }}>{fmt(dueIn)} h</Box>
+        <Paper sx={{ px: 2, py: 1.25, minWidth: 132, textAlign: 'center', border: `1px solid ${color || '#334155'}` }}>
+            <Typography variant="caption" sx={{ color: 'text.secondary', textTransform: 'uppercase', letterSpacing: 1, fontSize: 10.5 }}>{label}</Typography>
+            <Typography variant="h5" sx={{ color: color || 'text.primary', fontWeight: 800, lineHeight: 1.25 }}>
+                {value == null ? '—' : value}
             </Typography>
-            <Stack direction="row" justifyContent="space-between" sx={{ mt: 1 }}>
-                <Typography sx={{ color: MUTED }}>Health</Typography>
-                <Typography sx={{ color: health < 55 ? RED : health < 75 ? YELLOW : GREEN, fontWeight: 900 }}>{fmt(health, 0)}%</Typography>
-            </Stack>
-            <Box sx={{ height: 8, bgcolor: 'rgba(148,163,184,.18)', borderRadius: 4, mt: 0.6, overflow: 'hidden' }}>
-                <Box sx={{ height: '100%', width: `${duePct}%`, bgcolor: duePct > 90 ? RED : duePct > 75 ? YELLOW : GREEN }} />
-            </Box>
-            <Box sx={{ borderTop: `1px solid ${BORDER}`, mt: 2, pt: 1.3 }}>
-                {metrics.map((m) => <Typography key={m} sx={{ color: MUTED, lineHeight: 1.75 }}>{m}</Typography>)}
-                <Typography sx={{ color: '#6f86aa', mt: 1 }}>{tasks} PM task(s)</Typography>
-            </Box>
         </Paper>
     );
 }
 
-function StatusPill({ dueIn }) {
-    const st = statusFor(dueIn);
-    return <Chip size="small" label={st.label} variant="outlined" sx={{ color: st.color, borderColor: st.color, bgcolor: `${st.color}18`, fontWeight: 900 }} />;
+// Equipment health tile — kept on ONE horizontally scrolling row so the whole
+// rig is comparable at a glance (same layout rule as the edge HMI).
+function AssetTile({ asset }) {
+    const c = pmColor(asset.pmStatus);
+    return (
+        <Paper sx={{ p: 1.5, flex: '0 0 240px', minWidth: 240, borderLeft: `3px solid ${c}`, display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+            <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
+                <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="subtitle2" noWrap sx={{ fontWeight: 800 }}>{asset.name}</Typography>
+                    <Typography variant="caption" color="text.secondary">{asset.category}</Typography>
+                </Box>
+                <Chip size="small" label={PM_LABEL[asset.pmStatus] || asset.pmStatus || '—'}
+                    sx={{ height: 20, bgcolor: `${c}22`, color: c, border: `1px solid ${c}55`, fontWeight: 700 }} />
+            </Stack>
+            <Stack direction="row" alignItems="baseline" spacing={1}>
+                <Typography variant="h6" sx={{ color: '#38bdf8', fontWeight: 800 }}>{fmtNum(asset.hours, 0)} h</Typography>
+                <Chip size="small" label={asset.source === 'measured' ? 'measured' : 'derived'}
+                    sx={{ height: 17, fontSize: 10, bgcolor: asset.source === 'measured' ? '#22c55e22' : '#94a3b822', color: asset.source === 'measured' ? '#22c55e' : '#94a3b8' }} />
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+                next due in <span style={{ color: c, fontWeight: 700 }}>{fmtNum(asset.nextDueInHours, 0)} h</span>
+            </Typography>
+            {Array.isArray(asset.health) && asset.health.length > 0 && (
+                <Box sx={{ pt: 0.75, mt: 'auto', borderTop: '1px solid', borderColor: 'divider' }}>
+                    {asset.health.map((h, i) => (
+                        <Stack key={`${h.label}-${i}`} direction="row" justifyContent="space-between">
+                            <Typography variant="caption" color="text.secondary">{h.label}</Typography>
+                            <Typography variant="caption" sx={{ fontWeight: 700 }}>{fmtNum(h.value, 2)}</Typography>
+                        </Stack>
+                    ))}
+                </Box>
+            )}
+            {asset.openDowntime > 0 && (
+                <Chip size="small" label={`${asset.openDowntime} open DT`}
+                    sx={{ height: 19, alignSelf: 'flex-start', bgcolor: '#ef444422', color: '#ef4444', fontWeight: 700 }} />
+            )}
+        </Paper>
+    );
 }
 
-const BASE_SCHEDULE = [
-    { task: 'Mud Pump Liners & Valves', asset: 'Mud Pump', interval: 300, current: 3620, next: 3600 },
-    { task: 'Drawworks Brake Inspection', asset: 'Drawworks', interval: 200, current: 3850.1, next: 3880 },
-    { task: 'Drill-Line Slip & Cut', asset: 'Drawworks', interval: 150, current: 3850.1, next: 3950 },
-    { task: 'Top Drive Gearbox Oil', asset: 'Top Drive (HTD)', interval: 750, current: 0, next: 2900 },
-    { task: 'HPU Hydraulic Filter', asset: 'Hydraulic Power Unit', interval: 350, current: 0, next: 3300 },
-    { task: 'Engine Oil & Filter', asset: 'CAT Engine', interval: 250, current: 0, next: 4230 },
-    { task: 'Engine Major Service', asset: 'CAT Engine', interval: 1000, current: 0, next: 4600 },
-];
+const headSx = { fontWeight: 700, fontSize: 11.5, textTransform: 'uppercase', letterSpacing: 0.4, color: 'text.secondary' };
 
-const CALIBRATION_ROWS = [
-    { type: 'Depth / Block Encoder', asset: 'drawworks', value: '1500.0 m', by: 'seed', time: 'Jun 12, 05:33' },
-    { type: 'Weight Indicator', asset: 'drawworks', value: '0 t tare', by: 'seed', time: 'Jun 11, 05:33' },
-    { type: 'Pump Stroke Counter', asset: 'mudpump', value: '1.00 factor', by: 'seed', time: 'Jun 10, 05:33' },
-];
-
-const todayInput = () => new Date().toISOString().slice(0, 10);
+function EmptyRow({ span, children }) {
+    return <TableRow><TableCell colSpan={span}><Typography variant="body2" color="text.secondary">{children}</Typography></TableCell></TableRow>;
+}
 
 export default function RigMaintenancePanel({ rigId }) {
-    const { data } = useRigData();
-    const [rows, setRows] = useState([]);
+    const [data, setData] = useState(null);
+    const [loading, setLoading] = useState(true);
     const [err, setErr] = useState('');
-    const [msg, setMsg] = useState('');
-    const [busy, setBusy] = useState(false);
-    const [serviceOpen, setServiceOpen] = useState(null);
-    const [calOpen, setCalOpen] = useState(false);
-    const [serviceDraft, setServiceDraft] = useState({ performedAt: todayInput(), outcome: 'pass', notes: '' });
-    const [calDraft, setCalDraft] = useState({ type: 'Depth / Block Encoder', asset: 'drawworks', value: '', performedAt: todayInput(), outcome: 'pass', notes: '' });
+    const [tab, setTab] = useState(0);
 
     const load = useCallback(() => {
         if (!rigId) return;
-        api.maintenance({ rigId })
-            .then((list) => setRows(Array.isArray(list) ? list : []))
-            .catch((e) => {
-                if (e?.response?.status !== 401) setErr(e?.response?.data?.error || 'Failed to load maintenance records');
-            });
+        api.rigCmms(rigId)
+            .then((d) => { setData(d); setErr(''); })
+            .catch((e) => { if (e?.response?.status !== 401) setErr(e?.response?.data?.error || 'Failed to load maintenance data'); })
+            .finally(() => setLoading(false));
     }, [rigId]);
 
+    useEffect(() => { setLoading(true); load(); }, [load]);
     useEffect(() => {
-        load();
-        const t = setInterval(load, 15000);
+        const t = setInterval(load, 30000);   // snapshots arrive ~1/min from the edge
         return () => clearInterval(t);
     }, [load]);
 
-    const runtimeForAsset = useCallback((asset) => {
-        const key = String(asset || '').toLowerCase();
-        if (key.includes('cat') || key.includes('engine')) return Number(data?.cat_engine?.run_hours || data?.cat?.run_hours || 0);
-        if (key.includes('hpu') || key.includes('hydraulic')) return Number(data?.hpu?.run_hours || 0);
-        if (key.includes('htd') || key.includes('top drive')) return Number(data?.htd?.run_hours || data?.topdrive?.run_hours || 0);
-        if (key.includes('mud')) return Number(data?.mudpump?.run_hours || 0);
-        if (key.includes('drawworks')) return Number(data?.drawworks?.run_hours || 0);
-        return 0;
-    }, [data]);
+    const assets = useMemo(() => (Array.isArray(data?.assets) ? data.assets : []), [data]);
+    const counts = data?.counts || {};
+    const wo = data?.cmmsSummary?.workOrders || {};
+    const downtime = useMemo(() => (Array.isArray(data?.downtime) ? data.downtime : []), [data]);
+    const logbook = useMemo(() => (Array.isArray(data?.logbook) ? data.logbook : []), [data]);
+    const workOrders = useMemo(() => (Array.isArray(data?.workOrders) ? data.workOrders : []), [data]);
+    const pm = useMemo(() => (Array.isArray(data?.pm) ? data.pm : []), [data]);
+    const instruments = useMemo(() => (Array.isArray(data?.instruments) ? data.instruments : []), [data]);
 
-    const openService = (row) => {
-        setServiceOpen(row);
-        setServiceDraft({ performedAt: todayInput(), outcome: 'pass', notes: `${row.task} completed`, runtimeHours: fmt(row.current, 2) });
-    };
+    if (loading) return <Box sx={{ display: 'flex', justifyContent: 'center', py: 6 }}><CircularProgress /></Box>;
 
-    const saveService = async () => {
-        if (!serviceOpen) return;
-        setBusy(true); setErr(''); setMsg('');
-        try {
-            await api.addMaintenance({
-                rigId,
-                type: 'PM',
-                title: serviceOpen.task,
-                status: 'done',
-                performedAt: serviceDraft.performedAt,
-                runtimeHours: Number(serviceDraft.runtimeHours || serviceOpen.current || 0),
-                outcome: serviceDraft.outcome,
-                notes: serviceDraft.notes,
-            });
-            setMsg(`Service saved: ${serviceOpen.task}`);
-            setServiceOpen(null);
-            load();
-        } catch (e) {
-            setErr(e?.response?.data?.error || 'Failed to save service record');
-        } finally {
-            setBusy(false);
-        }
-    };
-
-    const saveCalibration = async () => {
-        setBusy(true); setErr(''); setMsg('');
-        try {
-            const title = `${calDraft.type} calibration`;
-            await api.addMaintenance({
-                rigId,
-                type: 'calibration',
-                title,
-                status: 'done',
-                performedAt: calDraft.performedAt,
-                runtimeHours: runtimeForAsset(calDraft.asset),
-                outcome: calDraft.outcome,
-                notes: [calDraft.value ? `Value: ${calDraft.value}` : '', calDraft.notes].filter(Boolean).join(' | '),
-            });
-            setMsg(`Calibration saved: ${calDraft.type}`);
-            setCalOpen(false);
-            setCalDraft({ type: 'Depth / Block Encoder', asset: 'drawworks', value: '', performedAt: todayInput(), outcome: 'pass', notes: '' });
-            load();
-        } catch (e) {
-            setErr(e?.response?.data?.error || 'Failed to save calibration record');
-        } finally {
-            setBusy(false);
-        }
-    };
-
-    const derived = useMemo(() => {
-        const catHours = Number(data?.cat_engine?.run_hours || data?.cat?.run_hours || 0);
-        const hpuHours = Number(data?.hpu?.run_hours || 0);
-        const htdHours = Number(data?.htd?.run_hours || data?.topdrive?.run_hours || 0);
-        const mudHours = Number(data?.mudpump?.run_hours || 0);
-        const dwHours = Number(data?.drawworks?.run_hours || 0);
-
-        const schedule = BASE_SCHEDULE.map((r) => {
-            let current = r.current;
-            if (r.asset === 'CAT Engine') current = catHours;
-            if (r.asset === 'Hydraulic Power Unit') current = hpuHours;
-            if (r.asset === 'Top Drive (HTD)') current = htdHours;
-            if (r.asset === 'Mud Pump') current = mudHours;
-            if (r.asset === 'Drawworks') current = dwHours;
-            const next = nextDueHour(current, r.interval, r.next);
-            const dueIn = hoursUntil(next, current);
-            const duePct = dueUsedPct(current, next, r.interval);
-            const health = healthScore(dueIn, r.interval);
-            return { ...r, current, next, dueIn, duePct, health };
-        });
-        const openDowntime = rows.filter((r) => r.type === 'breakdown' && r.status !== 'done').length;
-        const avgHealth = schedule.length ? schedule.reduce((sum, r) => sum + r.health, 0) / schedule.length : 100;
-        const calibrationRows = rows
-            .filter((r) => r.type === 'calibration')
-            .slice(0, 20)
-            .map((r) => ({
-                type: r.title || 'Calibration',
-                asset: r.notes?.match(/asset: ([^|]+)/i)?.[1] || r.rig_id || rigId,
-                value: r.notes?.match(/Value: ([^|]+)/i)?.[1]?.trim() || r.outcome || '--',
-                by: r.created_by || r.createdBy || 'operator',
-                time: r.performed_at ? new Date(r.performed_at).toLocaleString() : new Date(r.created_at || Date.now()).toLocaleString(),
-            }));
-
-        return {
-            schedule,
-            overdue: schedule.filter((r) => r.dueIn < 0).length || rows.filter((r) => r.status === 'overdue').length,
-            dueSoon: schedule.filter((r) => r.dueIn >= 0 && r.dueIn <= 50).length,
-            openDowntime,
-            avgHealth,
-            calibrationRows: calibrationRows.length ? calibrationRows : CALIBRATION_ROWS,
-            cards: [
-                { name: 'CAT Engine', group: 'Power', hours: catHours, source: catHours ? 'measured' : 'waiting', dueIn: nextDueHour(catHours, 250, 4230) - catHours, interval: 250, metrics: ['Coolant C', 'Oil bar'], tasks: 2 },
-                { name: 'Hydraulic Power Unit', group: 'Hydraulics', hours: hpuHours, source: hpuHours ? 'measured' : 'waiting', dueIn: nextDueHour(hpuHours, 350, 3300) - hpuHours, interval: 350, metrics: ['Oil Temp C', 'Disch bar'], tasks: 1, downtime: openDowntime },
-                { name: 'Top Drive (HTD)', group: 'Rotary', hours: htdHours, source: htdHours ? 'measured' : 'waiting', dueIn: nextDueHour(htdHours, 750, 2900) - htdHours, interval: 750, metrics: ['RPM', 'Torque'], tasks: 1 },
-                { name: 'Drawworks', group: 'Hoisting', hours: dwHours, source: 'derived', dueIn: nextDueHour(dwHours, 200, 3880) - dwHours, interval: 200, metrics: ['Hook Load t', 'Rope wear'], tasks: 2 },
-                { name: 'Mud Pump', group: 'Circulating', hours: mudHours, source: 'derived', dueIn: nextDueHour(mudHours, 300, 3600) - mudHours, interval: 300, metrics: ['SPM', 'Pressure bar'], tasks: 1 },
-            ],
-        };
-    }, [data, rows]);
+    // An edge that has not yet shipped a snapshot is a normal state (older edge
+    // build, or a rig that just came online) — say so plainly rather than
+    // rendering an empty shell that looks like a fault.
+    if (!data?.available) {
+        return (
+            <Alert severity="info" sx={{ mt: 1 }}>
+                No maintenance snapshot received from <strong>{rigId}</strong> yet. The rig edge ships its CMMS
+                (asset health, PM, work orders, maintenance log, downtime, instruments) about once a minute once it is running a build that supports it.
+            </Alert>
+        );
+    }
 
     return (
-        <Box sx={{ bgcolor: BG, minHeight: '100%', p: 2 }}>
-            <Stack direction="row" alignItems="center" spacing={1.2} sx={{ mb: 3 }}>
-                <FavoriteBorder sx={{ color: BLUE }} />
-                <Typography sx={{ color: BLUE, fontWeight: 900, fontSize: 26 }}>Maintenance & Asset Health</Typography>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, minHeight: 0 }}>
+            {err && <Alert severity="error" onClose={() => setErr('')}>{err}</Alert>}
+
+            <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap alignItems="center">
+                <Kpi label="PM Overdue" value={counts.overdue} color="#ef4444" />
+                <Kpi label="PM Due Soon" value={counts.dueSoon} color="#f59e0b" />
+                <Kpi label="Open WOs" value={wo.open} color="#38bdf8" />
+                <Kpi label="Breakdowns" value={wo.breakdownOpen} color="#ef4444" />
+                <Kpi label="Open Downtime" value={counts.openDowntime} color="#f97316" />
+                <Kpi label="Instruments" value={data?.instrumentSummary?.total ?? instruments.length} color="#a78bfa" />
+                <Box sx={{ flexGrow: 1 }} />
+                <Tooltip title={`Snapshot generated ${fmtTs(data.generatedAt)} · received ${fmtTs(data.receivedAt)}`}>
+                    <Chip size="small" variant="outlined" label={`edge snapshot · ${fmtTs(data.generatedAt)}`} />
+                </Tooltip>
             </Stack>
 
-            {err && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setErr('')}>{err}</Alert>}
-            {msg && <Alert severity="success" sx={{ mb: 2 }} onClose={() => setMsg('')}>{msg}</Alert>}
-
-            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(3, minmax(0, 1fr))' }, gap: 2, mb: 3 }}>
-                <SummaryTile label="Overdue" value={derived.overdue} color={RED} />
-                <SummaryTile label="Due Soon" value={derived.dueSoon} color={YELLOW} />
-                <SummaryTile label="Avg Health" value={`${fmt(derived.avgHealth, 0)}%`} color={BLUE} />
+            {/* SINGLE ROW of equipment health tiles (scrolls horizontally). */}
+            <Box>
+                <Typography variant="subtitle2" sx={{ fontWeight: 800, mb: 1 }}>Equipment health</Typography>
+                <Box sx={{
+                    display: 'flex', gap: 1.5, overflowX: 'auto', pb: 1,
+                    '&::-webkit-scrollbar': { height: 8 },
+                    '&::-webkit-scrollbar-thumb': { bgcolor: 'divider', borderRadius: 4 },
+                }}>
+                    {assets.map((a) => <AssetTile key={a.id} asset={a} />)}
+                    {assets.length === 0 && <Typography variant="body2" color="text.secondary">No equipment reported.</Typography>}
+                </Box>
             </Box>
 
-            <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5 }}>
-                <FavoriteBorder sx={{ color: BLUE }} />
-                <Typography sx={{ color: BLUE, fontWeight: 900, fontSize: 22 }}>Asset Health</Typography>
-            </Stack>
-            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(2, minmax(0, 1fr))', xl: 'repeat(4, minmax(0, 1fr))' }, gap: 2, mb: 3 }}>
-                {derived.cards.map((card) => <HealthCard key={card.name} {...card} />)}
-            </Box>
+            <Paper sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                <Tabs value={tab} onChange={(e, v) => setTab(v)} variant="scrollable" scrollButtons="auto"
+                    sx={{ borderBottom: '1px solid', borderColor: 'divider', minHeight: 44, '& .MuiTab-root': { minHeight: 44, textTransform: 'none' } }}>
+                    <Tab label={`PM schedule (${pm.length})`} />
+                    <Tab label={`Work orders (${workOrders.length})`} />
+                    <Tab label={`Maintenance log (${logbook.length})`} />
+                    <Tab label={`NPT / downtime (${downtime.length})`} />
+                    <Tab label={`Instruments (${instruments.length})`} />
+                </Tabs>
 
-            <Paper variant="outlined" sx={{ bgcolor: PANEL, borderColor: BORDER, p: 2, borderRadius: 1, mb: 2 }}>
-                <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 2 }}>
-                    <Build sx={{ color: BLUE }} />
-                    <Typography sx={{ color: BLUE, fontWeight: 900, fontSize: 22 }}>Preventive Maintenance Schedule</Typography>
-                </Stack>
-                <TableContainer>
-                    <Table size="small">
-                        <TableHead>
-                            <TableRow>
-                                {['Task', 'Asset', 'Interval', 'Current', 'Next', 'Due Used', 'Due In', 'Status', 'Action'].map((h) => (
-                                    <TableCell key={h} sx={{ color: MUTED, fontWeight: 900, fontSize: 16 }}>{h}</TableCell>
-                                ))}
-                            </TableRow>
-                        </TableHead>
-                        <TableBody>
-                            {derived.schedule.map((r) => {
-                                const st = statusFor(r.dueIn);
-                                return (
-                                    <TableRow key={r.task} hover sx={{ '& td': { borderColor: '#1d2c3f', color: TEXT, fontSize: 16, fontWeight: 700 } }}>
-                                        <TableCell>{r.task}</TableCell>
-                                        <TableCell>{r.asset}</TableCell>
-                                        <TableCell>{fmt(r.interval)} h</TableCell>
-                                        <TableCell>{fmt(r.current)} h</TableCell>
-                                        <TableCell>{fmt(r.next)} h</TableCell>
-                                        <TableCell>{fmt(r.duePct, 0)}%</TableCell>
-                                        <TableCell sx={{ color: `${st.color} !important` }}>{fmt(r.dueIn)} h</TableCell>
-                                        <TableCell><StatusPill dueIn={r.dueIn} /></TableCell>
-                                        <TableCell align="right"><Button size="small" variant="outlined" startIcon={<Build />} onClick={() => openService(r)}>Service</Button></TableCell>
+                <TableContainer sx={{ flex: 1, minHeight: 0 }}>
+                    {tab === 0 && (
+                        <Table size="small" stickyHeader>
+                            <TableHead><TableRow>
+                                <TableCell sx={headSx}>Equipment</TableCell><TableCell sx={headSx}>Task</TableCell>
+                                <TableCell sx={headSx} align="right">Interval (h)</TableCell>
+                                <TableCell sx={headSx} align="right">Due in (h)</TableCell>
+                                <TableCell sx={headSx}>Status</TableCell>
+                            </TableRow></TableHead>
+                            <TableBody>
+                                {pm.map((t, i) => (
+                                    <TableRow key={t.id || i} hover>
+                                        <TableCell>{t.assetName || t.assetId}</TableCell>
+                                        <TableCell>{t.task || t.name || '—'}</TableCell>
+                                        <TableCell align="right">{fmtNum(t.intervalH, 0)}</TableCell>
+                                        <TableCell align="right" sx={{ color: pmColor(t.status), fontWeight: 700 }}>{fmtNum(t.dueInHours, 0)}</TableCell>
+                                        <TableCell><Chip size="small" label={PM_LABEL[t.status] || t.status || '—'} sx={{ height: 20, bgcolor: `${pmColor(t.status)}22`, color: pmColor(t.status), fontWeight: 700 }} /></TableCell>
                                     </TableRow>
-                                );
-                            })}
-                        </TableBody>
-                    </Table>
+                                ))}
+                                {pm.length === 0 && <EmptyRow span={5}>No PM tasks reported.</EmptyRow>}
+                            </TableBody>
+                        </Table>
+                    )}
+
+                    {tab === 1 && (
+                        <Table size="small" stickyHeader>
+                            <TableHead><TableRow>
+                                <TableCell sx={headSx}>WO No.</TableCell><TableCell sx={headSx}>Type</TableCell>
+                                <TableCell sx={headSx}>Equipment</TableCell><TableCell sx={headSx}>Title</TableCell>
+                                <TableCell sx={headSx}>Priority</TableCell><TableCell sx={headSx}>Status</TableCell>
+                                <TableCell sx={headSx}>Raised</TableCell>
+                            </TableRow></TableHead>
+                            <TableBody>
+                                {workOrders.map((w, i) => (
+                                    <TableRow key={w.id || i} hover>
+                                        <TableCell sx={{ fontFamily: 'monospace' }}>{w.woNo || w.id || '—'}</TableCell>
+                                        <TableCell>{w.type || '—'}</TableCell>
+                                        <TableCell>{w.assetName || w.assetId || '—'}</TableCell>
+                                        <TableCell>{w.title || '—'}</TableCell>
+                                        <TableCell>{w.priority || '—'}</TableCell>
+                                        <TableCell><Chip size="small" label={w.status || '—'} sx={{ height: 20, fontWeight: 700 }} /></TableCell>
+                                        <TableCell>{fmtTs(w.raisedAt || w.createdAt)}</TableCell>
+                                    </TableRow>
+                                ))}
+                                {workOrders.length === 0 && <EmptyRow span={7}>No work orders reported.</EmptyRow>}
+                            </TableBody>
+                        </Table>
+                    )}
+
+                    {tab === 2 && (
+                        <Table size="small" stickyHeader>
+                            <TableHead><TableRow>
+                                <TableCell sx={headSx}>When</TableCell><TableCell sx={headSx}>Shift</TableCell>
+                                <TableCell sx={headSx}>Category</TableCell><TableCell sx={headSx}>Equipment</TableCell>
+                                <TableCell sx={headSx}>Notification</TableCell><TableCell sx={headSx}>Entry</TableCell>
+                                <TableCell sx={headSx}>By</TableCell>
+                            </TableRow></TableHead>
+                            <TableBody>
+                                {logbook.map((l, i) => (
+                                    <TableRow key={l.id || i} hover>
+                                        <TableCell>{fmtTs(l.ts || l.date)}</TableCell>
+                                        <TableCell>{l.shift || '—'}</TableCell>
+                                        <TableCell>{l.category || l.logType || '—'}</TableCell>
+                                        <TableCell>{l.assetId || '—'}</TableCell>
+                                        <TableCell sx={{ fontFamily: 'monospace' }}>{l.notificationNo || l.workOrderNo || '—'}</TableCell>
+                                        <TableCell>{l.entry || '—'}</TableCell>
+                                        <TableCell>{l.by || '—'}</TableCell>
+                                    </TableRow>
+                                ))}
+                                {logbook.length === 0 && <EmptyRow span={7}>No log entries reported.</EmptyRow>}
+                            </TableBody>
+                        </Table>
+                    )}
+
+                    {tab === 3 && (
+                        <Table size="small" stickyHeader>
+                            <TableHead><TableRow>
+                                <TableCell sx={headSx}>Start</TableCell><TableCell sx={headSx}>End</TableCell>
+                                <TableCell sx={headSx} align="right">Duration</TableCell>
+                                <TableCell sx={headSx}>Equipment</TableCell><TableCell sx={headSx}>Reason</TableCell>
+                                <TableCell sx={headSx}>Notification</TableCell><TableCell sx={headSx}>Notes</TableCell>
+                            </TableRow></TableHead>
+                            <TableBody>
+                                {downtime.map((d, i) => (
+                                    <TableRow key={d.id || i} hover>
+                                        <TableCell>{fmtTs(d.start)}</TableCell>
+                                        <TableCell>{d.end ? fmtTs(d.end) : <Chip size="small" label="OPEN" sx={{ height: 20, bgcolor: '#f9731622', color: '#f97316', fontWeight: 700 }} />}</TableCell>
+                                        <TableCell align="right">{d.end ? fmtMin(d.durationMin) : '—'}</TableCell>
+                                        <TableCell>{d.assetId || '—'}</TableCell>
+                                        <TableCell>{d.reasonCode || '—'}</TableCell>
+                                        <TableCell sx={{ fontFamily: 'monospace' }}>{d.notificationNo || '—'}</TableCell>
+                                        <TableCell>{d.notes || '—'}</TableCell>
+                                    </TableRow>
+                                ))}
+                                {downtime.length === 0 && <EmptyRow span={7}>No downtime reported.</EmptyRow>}
+                            </TableBody>
+                        </Table>
+                    )}
+
+                    {tab === 4 && (
+                        <Table size="small" stickyHeader>
+                            <TableHead><TableRow>
+                                <TableCell sx={headSx}>Tag</TableCell><TableCell sx={headSx}>Instrument</TableCell>
+                                <TableCell sx={headSx}>Type</TableCell><TableCell sx={headSx}>Last cal.</TableCell>
+                                <TableCell sx={headSx}>Next due</TableCell><TableCell sx={headSx}>Status</TableCell>
+                            </TableRow></TableHead>
+                            <TableBody>
+                                {instruments.map((n, i) => (
+                                    <TableRow key={n.id || i} hover>
+                                        <TableCell sx={{ fontFamily: 'monospace' }}>{n.tag || n.id || '—'}</TableCell>
+                                        <TableCell>{n.name || '—'}</TableCell>
+                                        <TableCell>{n.type || '—'}</TableCell>
+                                        <TableCell>{fmtTs(n.lastCalDate)}</TableCell>
+                                        <TableCell>{fmtTs(n.nextCalDate || n.nextDueDate)}</TableCell>
+                                        <TableCell><Chip size="small" label={n.calStatus || '—'} sx={{ height: 20, fontWeight: 700 }} /></TableCell>
+                                    </TableRow>
+                                ))}
+                                {instruments.length === 0 && <EmptyRow span={6}>No instruments reported.</EmptyRow>}
+                            </TableBody>
+                        </Table>
+                    )}
                 </TableContainer>
             </Paper>
-
-            <Paper variant="outlined" sx={{ bgcolor: PANEL, borderColor: BORDER, p: 2, borderRadius: 1 }}>
-                <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 2 }}>
-                    <Stack direction="row" alignItems="center" spacing={1}>
-                        <Tune sx={{ color: BLUE }} />
-                        <Typography sx={{ color: BLUE, fontWeight: 900, fontSize: 22 }}>Calibration History</Typography>
-                    </Stack>
-                    <Button size="small" variant="outlined" onClick={() => setCalOpen(true)}>Add Calibration</Button>
-                </Stack>
-                <TableContainer>
-                    <Table size="small">
-                        <TableHead>
-                            <TableRow>
-                                {['Type', 'Asset', 'Value', 'By', 'Time'].map((h) => <TableCell key={h} sx={{ color: MUTED, fontWeight: 900, fontSize: 16 }}>{h}</TableCell>)}
-                            </TableRow>
-                        </TableHead>
-                        <TableBody>
-                            {derived.calibrationRows.map((r) => (
-                                <TableRow key={r.type} sx={{ '& td': { borderColor: '#1d2c3f', color: TEXT, fontSize: 16, fontWeight: 700 } }}>
-                                    <TableCell>{r.type}</TableCell>
-                                    <TableCell>{r.asset}</TableCell>
-                                    <TableCell>{r.value}</TableCell>
-                                    <TableCell>{r.by}</TableCell>
-                                    <TableCell>{r.time}</TableCell>
-                                </TableRow>
-                            ))}
-                        </TableBody>
-                    </Table>
-                </TableContainer>
-            </Paper>
-
-            <Dialog open={Boolean(serviceOpen)} onClose={() => setServiceOpen(null)} maxWidth="sm" fullWidth>
-                <DialogTitle>Service Record</DialogTitle>
-                <DialogContent>
-                    <Stack spacing={2} sx={{ mt: 1 }}>
-                        <TextField label="Task" value={serviceOpen?.task || ''} InputProps={{ readOnly: true }} />
-                        <TextField label="Performed Date" type="date" value={serviceDraft.performedAt} onChange={(e) => setServiceDraft((d) => ({ ...d, performedAt: e.target.value }))} InputLabelProps={{ shrink: true }} />
-                        <TextField label="Runtime Hours" value={serviceDraft.runtimeHours || ''} onChange={(e) => setServiceDraft((d) => ({ ...d, runtimeHours: e.target.value }))} />
-                        <TextField select label="Outcome" value={serviceDraft.outcome} onChange={(e) => setServiceDraft((d) => ({ ...d, outcome: e.target.value }))}>
-                            {['pass', 'fail', 'monitor'].map((v) => <MenuItem key={v} value={v}>{v.toUpperCase()}</MenuItem>)}
-                        </TextField>
-                        <TextField label="Notes" multiline minRows={3} value={serviceDraft.notes} onChange={(e) => setServiceDraft((d) => ({ ...d, notes: e.target.value }))} />
-                    </Stack>
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setServiceOpen(null)}>Cancel</Button>
-                    <Button variant="contained" disabled={busy} onClick={saveService}>Save Service</Button>
-                </DialogActions>
-            </Dialog>
-
-            <Dialog open={calOpen} onClose={() => setCalOpen(false)} maxWidth="sm" fullWidth>
-                <DialogTitle>Add Calibration</DialogTitle>
-                <DialogContent>
-                    <Stack spacing={2} sx={{ mt: 1 }}>
-                        <TextField select label="Calibration Type" value={calDraft.type} onChange={(e) => setCalDraft((d) => ({ ...d, type: e.target.value }))}>
-                            {['Depth / Block Encoder', 'Weight Indicator', 'Pump Stroke Counter', 'Torque Sensor', 'Pressure Sensor'].map((v) => <MenuItem key={v} value={v}>{v}</MenuItem>)}
-                        </TextField>
-                        <TextField select label="Asset" value={calDraft.asset} onChange={(e) => setCalDraft((d) => ({ ...d, asset: e.target.value }))}>
-                            {['drawworks', 'mudpump', 'htd', 'hpu', 'CAT Engine'].map((v) => <MenuItem key={v} value={v}>{v}</MenuItem>)}
-                        </TextField>
-                        <TextField label="Calibration Value" value={calDraft.value} onChange={(e) => setCalDraft((d) => ({ ...d, value: e.target.value }))} placeholder="e.g. 0 t tare / 1.00 factor" />
-                        <TextField label="Performed Date" type="date" value={calDraft.performedAt} onChange={(e) => setCalDraft((d) => ({ ...d, performedAt: e.target.value }))} InputLabelProps={{ shrink: true }} />
-                        <TextField select label="Outcome" value={calDraft.outcome} onChange={(e) => setCalDraft((d) => ({ ...d, outcome: e.target.value }))}>
-                            {['pass', 'fail', 'monitor'].map((v) => <MenuItem key={v} value={v}>{v.toUpperCase()}</MenuItem>)}
-                        </TextField>
-                        <TextField label="Notes" multiline minRows={3} value={calDraft.notes} onChange={(e) => setCalDraft((d) => ({ ...d, notes: e.target.value }))} />
-                    </Stack>
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setCalOpen(false)}>Cancel</Button>
-                    <Button variant="contained" disabled={busy || !calDraft.value.trim()} onClick={saveCalibration}>Save Calibration</Button>
-                </DialogActions>
-            </Dialog>
         </Box>
     );
 }

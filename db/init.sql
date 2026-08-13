@@ -517,6 +517,21 @@ CREATE INDEX IF NOT EXISTS wells_current_rig_idx
     ON wells (current_rig_id) WHERE current_rig_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------
+-- CMMS mirror (edge -> central). The rig edge is the SYSTEM OF RECORD for
+-- maintenance; central holds the latest snapshot per rig purely so the fleet
+-- Maintenance view can render asset health, PM, work orders, the maintenance
+-- log, downtime/NPT and instruments without querying 50 rigs directly.
+-- One row per rig, replaced wholesale on each snapshot: idempotent, and a
+-- missed event self-heals on the next one.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rig_cmms (
+    rig_id       TEXT PRIMARY KEY REFERENCES rigs(rig_id) ON DELETE CASCADE,
+    snapshot     JSONB NOT NULL,
+    generated_at TIMESTAMPTZ,
+    received_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------
 -- Least-privilege application role (audit #2).
 -- The bootstrap/owner role (crmf, a superuser) creates the schema, but the
 -- running application SHOULD connect as crmf_app in production. crmf_app is a
@@ -544,7 +559,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
     rigs, rig_latest, telemetry, events, connections, tags,
     deployment_status, escalations, decisions, value_metrics,
     maintenance_record, users, notification_channels, notifications,
-    app_settings, user_sessions, wells, well_runs, rig_messages
+    app_settings, user_sessions, wells, well_runs, rig_messages, rig_cmms
     TO crmf_app;
 
 -- The continuous aggregate is read-only for the app.

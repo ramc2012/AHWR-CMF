@@ -633,6 +633,24 @@ async function processEvents(client, rigId, events) {
             );
         } else if (ev.type === 'activity') {
             activity = ev.payload || {};
+        } else if (ev.type === 'cmms.snapshot') {
+            // Whole-snapshot replace: the edge is the system of record, so the
+            // newest snapshot always wins. generated_at guards against an
+            // out-of-order store-and-forward replay overwriting fresher state.
+            const snap = ev.payload && typeof ev.payload === 'object' ? ev.payload : null;
+            if (snap) {
+                await client.query(
+                    `INSERT INTO rig_cmms (rig_id, snapshot, generated_at, received_at)
+                     VALUES ($1, $2::jsonb, $3, now())
+                     ON CONFLICT (rig_id) DO UPDATE
+                       SET snapshot = EXCLUDED.snapshot,
+                           generated_at = EXCLUDED.generated_at,
+                           received_at = now()
+                     WHERE rig_cmms.generated_at IS NULL
+                        OR EXCLUDED.generated_at IS NULL
+                        OR EXCLUDED.generated_at >= rig_cmms.generated_at`,
+                    [rigId, JSON.stringify(snap), coerceTsIso(snap.generatedAt) || ts]);
+            }
         } else if (ev.type === 'well.created' || ev.type === 'well.updated') {
             const well = normalizeWellEvent(ev);
             if (well.wellId) await upsertWellFromEvent(client, rigId, well, well.status || 'workover', false);

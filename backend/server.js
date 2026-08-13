@@ -382,6 +382,19 @@ function buildApiRouter() {
     // width-proportional activity bar. Read-only, default 24h window.
     r.get('/rigs/:id/activity', wrap((req) =>
         activity.getActivity(req.params.id, Number(req.query.hours) || 24)));
+    // CMMS mirror for one rig (asset health, PM, work orders, maintenance log,
+    // downtime/NPT, instruments, run hours) as last snapshotted by that edge.
+    r.get('/rigs/:id/cmms', wrap(async (req) => {
+        const { rows } = await query(
+            'SELECT snapshot, generated_at, received_at FROM rig_cmms WHERE rig_id = $1',
+            [req.params.id]);
+        if (!rows.length) return { available: false, rigId: req.params.id };
+        return {
+            available: true, rigId: req.params.id,
+            generatedAt: rows[0].generated_at, receivedAt: rows[0].received_at,
+            ...(rows[0].snapshot || {}),
+        };
+    }));
     r.get('/rigs/:id/messages', wrap((req) => messages.list(req.params.id, req.query.limit)));
     // Fleet-wide message feed for the Fleet Overview message centre (authenticated
     // like every /api route; listAll caps the limit at 500 server-side).
