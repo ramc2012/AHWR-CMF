@@ -27,8 +27,12 @@ const isNpt = (phase, declared) => (
     declared === false || declared === 'false' ? true
         : declared === true || declared === 'true' ? false
             : NPT_PHASES.has(phaseKey(phase)));
-// code: first 4 chars of the (upper) phase name, matching the edge convention.
-const phaseCode = (phase) => phaseKey(phase).slice(0, 4);
+// The activity CODE is the edge's own operation code — RIH, POOH, MAKE_UP,
+// BREAK_OUT, CIRCULATE, MILLING, CDR, WASH, PERFORATION, FISHING, SWAB, ...
+// It is NOT a 4-character abbreviation: truncating produced BREAK_OUT -> "BREA",
+// CIRCULATE -> "CIRC", PERFORATION -> "PERF", which no consumer could match
+// against the operation vocabulary the fleet view categorises by.
+const phaseCode = (phase) => phaseKey(phase);
 
 function emptyResult() {
     return {
