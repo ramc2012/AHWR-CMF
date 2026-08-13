@@ -394,11 +394,17 @@ function buildCmmsSnapshot(rig, t) {
             id: `op-${n}-${i}`, logType: 'OPERATIONS', category: 'Operations',
             text, at: isoDaysAgo(i * 0.25), by: 'driller', shift: i % 2 ? 'NIGHT' : 'DAY',
         })),
-        ...LOG_MAINT.slice(0, 2).map((text, i) => ({
-            id: `mt-${n}-${i}`, logType: 'MAINTENANCE', category: 'Maintenance',
-            text, at: isoDaysAgo(i * 0.5 + 0.2), by: 'mechanic', shift: 'DAY',
-            notificationNo: `NOTIF-${100000 + n * 100 + i}`,
-        })),
+        // assetId/asset let the central equipment-health tile drill-down filter
+        // this rig's maintenance history down to ONE asset.
+        ...LOG_MAINT.slice(0, 2).map((text, i) => {
+            const a = CMMS_ASSETS[(n + i) % CMMS_ASSETS.length];
+            return {
+                id: `mt-${n}-${i}`, logType: 'MAINTENANCE', category: 'Maintenance',
+                assetId: a.id, asset: a.name,
+                text, at: isoDaysAgo(i * 0.5 + 0.2), by: 'mechanic', shift: 'DAY',
+                notificationNo: `NOTIF-${100000 + n * 100 + i}`,
+            };
+        }),
     ];
     const downtime = [{
         id: `dt-${n}`, assetId: CMMS_ASSETS[n % CMMS_ASSETS.length].id,

@@ -4,6 +4,7 @@ import {
     TableContainer, TableHead, TableRow, Alert, CircularProgress, Tooltip,
 } from '@mui/material';
 import { api } from '../../../api';
+import AssetHistoryDialog from './AssetHistoryDialog';
 
 // Fleet-side Maintenance view for ONE rig, rendered from the CMMS snapshot the
 // rig edge ships (event `cmms.snapshot` -> table rig_cmms). The edge remains the
@@ -36,10 +37,22 @@ function Kpi({ label, value, color }) {
 
 // Equipment health tile — kept on ONE horizontally scrolling row so the whole
 // rig is comparable at a glance (same layout rule as the edge HMI).
-function AssetTile({ asset }) {
+function AssetTile({ asset, onOpen }) {
     const c = pmColor(asset.pmStatus);
     return (
-        <Paper sx={{ p: 1.5, flex: '0 0 240px', minWidth: 240, borderLeft: `3px solid ${c}`, display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+        <Paper
+            role="button"
+            tabIndex={0}
+            aria-label={`Open ${asset.name} history`}
+            onClick={onOpen}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(); } }}
+            sx={{
+                p: 1.5, flex: '0 0 240px', minWidth: 240, borderLeft: `3px solid ${c}`,
+                display: 'flex', flexDirection: 'column', gap: 0.75,
+                cursor: 'pointer', transition: 'transform 120ms ease, box-shadow 120ms ease',
+                '&:hover': { transform: 'translateY(-1px)', boxShadow: `0 0 0 1px ${c}55` },
+                '&:focus-visible': { outline: `2px solid ${c}`, outlineOffset: 2 },
+            }}>
             <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
                 <Box sx={{ minWidth: 0 }}>
                     <Typography variant="subtitle2" noWrap sx={{ fontWeight: 800 }}>{asset.name}</Typography>
@@ -85,6 +98,7 @@ export default function RigMaintenancePanel({ rigId }) {
     const [loading, setLoading] = useState(true);
     const [err, setErr] = useState('');
     const [tab, setTab] = useState(0);
+    const [drillAsset, setDrillAsset] = useState(null);   // equipment-health tile drill-down
 
     const load = useCallback(() => {
         if (!rigId) return;
@@ -148,7 +162,7 @@ export default function RigMaintenancePanel({ rigId }) {
                     '&::-webkit-scrollbar': { height: 8 },
                     '&::-webkit-scrollbar-thumb': { bgcolor: 'divider', borderRadius: 4 },
                 }}>
-                    {assets.map((a) => <AssetTile key={a.id} asset={a} />)}
+                    {assets.map((a) => <AssetTile key={a.id} asset={a} onOpen={() => setDrillAsset(a)} />)}
                     {assets.length === 0 && <Typography variant="body2" color="text.secondary">No equipment reported.</Typography>}
                 </Box>
             </Box>
@@ -286,6 +300,15 @@ export default function RigMaintenancePanel({ rigId }) {
                     )}
                 </TableContainer>
             </Paper>
+
+            {/* Equipment-health tile drill-down: run-hour / maintenance-log / NPT
+                history for the clicked asset, derived from this same snapshot. */}
+            <AssetHistoryDialog
+                asset={drillAsset}
+                snapshot={data}
+                open={Boolean(drillAsset)}
+                onClose={() => setDrillAsset(null)}
+            />
         </Box>
     );
 }
