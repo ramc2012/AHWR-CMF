@@ -563,6 +563,72 @@ function buildApiRouter() {
     r.get('/maintenance', wrap((req) =>
         maint.listMaintenance({ rigId: req.query.rigId, status: req.query.status })));
     r.get('/maintenance/summary', wrap(() => maint.maintenanceSummary()));
+
+    // Rig-wise daily maintenance/NPT rollup for the Maintenance & Reliability page.
+    // - log:        maintenance-log entries for the most recent day that HAS entries
+    // - nptPrevDay: NPT minutes for the previous calendar day
+    // - nptFy:      cumulative NPT minutes for the Indian financial year (1 Apr - 31 Mar)
+    // Sourced from rig_downtime / rig_maint_log, which accumulate the point-in-time
+    // CMMS snapshots each edge ships (rig_cmms holds only the latest).
+    r.get('/maintenance/fleet-daily', wrap(async (req) => {
+        const tz = String(req.query.tz || 'Asia/Kolkata');
+        const { rows } = await query(
+            `WITH fy AS (
+                 SELECT CASE WHEN EXTRACT(MONTH FROM now() AT TIME ZONE $1) >= 4
+                             THEN make_date(EXTRACT(YEAR  FROM now() AT TIME ZONE $1)::int, 4, 1)
+                             ELSE make_date(EXTRACT(YEAR  FROM now() AT TIME ZONE $1)::int - 1, 4, 1)
+                        END AS start_date
+             ),
+             npt AS (
+                 SELECT d.rig_id,
+                        COALESCE(SUM(d.duration_min) FILTER (
+                            WHERE (d.start_ts AT TIME ZONE $1)::date = ((now() AT TIME ZONE $1)::date - 1)), 0) AS npt_prev_day_min,
+                        COALESCE(SUM(d.duration_min) FILTER (
+                            WHERE (d.start_ts AT TIME ZONE $1)::date >= (SELECT start_date FROM fy)), 0) AS npt_fy_min,
+                        COUNT(*) FILTER (WHERE d.end_ts IS NULL) AS npt_open
+                   FROM rig_downtime d GROUP BY d.rig_id
+             ),
+             lastday AS (
+                 SELECT rig_id, MAX((at_ts AT TIME ZONE $1)::date) AS d
+                   FROM rig_maint_log WHERE at_ts IS NOT NULL GROUP BY rig_id
+             )
+             SELECT r.rig_id, r.name, r.status, r.asset_unit, r.field,
+                    COALESCE(n.npt_prev_day_min, 0) AS npt_prev_day_min,
+                    COALESCE(n.npt_fy_min, 0)       AS npt_fy_min,
+                    COALESCE(n.npt_open, 0)         AS npt_open,
+                    ld.d                            AS log_date,
+                    COALESCE((
+                        SELECT json_agg(json_build_object(
+                                   'at', m.at_ts, 'asset', COALESCE(m.asset, m.asset_id),
+                                   'text', m.text, 'by', m.by_who, 'shift', m.shift,
+                                   'notificationNo', m.notification_no, 'category', m.category)
+                                 ORDER BY m.at_ts DESC)
+                          FROM rig_maint_log m
+                         WHERE m.rig_id = r.rig_id
+                           AND COALESCE(m.log_type, '') <> 'OPERATIONS'
+                           AND (m.at_ts AT TIME ZONE $1)::date = ld.d
+                    ), '[]'::json) AS log
+               FROM rigs r
+               LEFT JOIN npt     n  ON n.rig_id  = r.rig_id
+               LEFT JOIN lastday ld ON ld.rig_id = r.rig_id
+              ORDER BY r.rig_id`, [tz]);
+        const fmt = (v) => Number(Number(v || 0).toFixed(1));
+        return {
+            timezone: tz,
+            financialYearStart: new Date().getMonth() + 1 >= 4
+                ? `${new Date().getFullYear()}-04-01`
+                : `${new Date().getFullYear() - 1}-04-01`,
+            rigs: rows.map((r) => ({
+                rigId: r.rig_id, name: r.name, status: r.status,
+                assetUnit: r.asset_unit, field: r.field,
+                logDate: r.log_date, log: r.log || [],
+                nptPrevDayMin: fmt(r.npt_prev_day_min),
+                nptFyMin: fmt(r.npt_fy_min),
+                nptFyHours: fmt(Number(r.npt_fy_min || 0) / 60),
+                nptOpen: Number(r.npt_open || 0),
+            })),
+        };
+    }));
     r.post('/maintenance', requireRoleAudited('operator'),
         wrap((req) => maint.addMaintenance(req.body, req.user.username)));
     r.patch('/maintenance/:id', requireRoleAudited('operator'),

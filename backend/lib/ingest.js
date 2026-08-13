@@ -606,6 +606,46 @@ async function completeWellForRig(client, rigId, ev) {
         [wellId, finalStatus, tdDate, rigId]);
     return { wellId, name: well.name || wellId, wasActive: !!activeOpen };
 }
+// Accumulate the point-in-time CMMS snapshot's downtime + maintenance-log rows
+// into history tables. Idempotent: keyed on (rig_id, edge record id), so a rig
+// re-sending the same records just refreshes them (an OPEN downtime record gets
+// its end/duration filled in when the edge later closes it).
+async function persistCmmsHistory(client, rigId, snap) {
+    try {
+        for (const d of Array.isArray(snap.downtime) ? snap.downtime.slice(0, 200) : []) {
+            const id = String(d.id || `${d.assetId || 'asset'}-${d.start || ''}`).slice(0, 120);
+            if (!id) continue;
+            await client.query(
+                `INSERT INTO rig_downtime (rig_id, record_id, asset_id, asset, reason_code, start_ts, end_ts, duration_min, notes, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
+                 ON CONFLICT (rig_id, record_id) DO UPDATE SET
+                   end_ts = EXCLUDED.end_ts, duration_min = EXCLUDED.duration_min,
+                   reason_code = COALESCE(EXCLUDED.reason_code, rig_downtime.reason_code),
+                   notes = COALESCE(EXCLUDED.notes, rig_downtime.notes), updated_at = now()`,
+                [rigId, id, d.assetId || null, d.asset || null, d.reasonCode || d.reason || null,
+                 coerceTsIso(d.start), coerceTsIso(d.end),
+                 Number.isFinite(Number(d.durationMin)) ? Number(d.durationMin) : null, d.notes || null]);
+        }
+        for (const l of Array.isArray(snap.logbook) ? snap.logbook.slice(0, 300) : []) {
+            const id = String(l.id || `${l.at || ''}-${(l.text || '').slice(0, 40)}`).slice(0, 160);
+            if (!id) continue;
+            await client.query(
+                `INSERT INTO rig_maint_log (rig_id, entry_id, log_type, category, asset_id, asset, text, by_who, shift, notification_no, at_ts, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now())
+                 ON CONFLICT (rig_id, entry_id) DO UPDATE SET
+                   text = EXCLUDED.text, notification_no = COALESCE(EXCLUDED.notification_no, rig_maint_log.notification_no),
+                   updated_at = now()`,
+                [rigId, id, l.logType || null, l.category || null, l.assetId || null, l.asset || null,
+                 String(l.text || '').slice(0, 500), l.by || null, l.shift || null,
+                 l.notificationNo || l.woNo || null, coerceTsIso(l.at || l.ts)]);
+        }
+    } catch (e) {
+        // Rethrow: the caller's SAVEPOINT contains it. Swallowing here would leave
+        // the transaction aborted with no way to recover it.
+        throw e;
+    }
+}
+
 async function processEvents(client, rigId, events) {
     let alarmCounts = null;
     let activity = null;
@@ -650,6 +690,22 @@ async function processEvents(client, rigId, events) {
                         OR EXCLUDED.generated_at IS NULL
                         OR EXCLUDED.generated_at >= rig_cmms.generated_at`,
                     [rigId, JSON.stringify(snap), coerceTsIso(snap.generatedAt) || ts]);
+                // rig_cmms holds only the LATEST snapshot (whole-row replace), so
+                // downtime/log rows would vanish on the next snapshot. Accumulate
+                // them into history tables keyed by the edge's own record id, so
+                // "previous-day NPT" and "cumulative FY NPT" have something to sum.
+                // SAVEPOINT: a swallowed failure inside an open transaction would
+                // leave it ABORTED (25P02) and every later statement — including
+                // COMMIT — would silently roll the whole batch back. Same trap as
+                // the provenance audit; contain it to the savepoint.
+                await client.query('SAVEPOINT cmms_hist');
+                try {
+                    await persistCmmsHistory(client, rigId, snap);
+                    await client.query('RELEASE SAVEPOINT cmms_hist');
+                } catch (e) {
+                    await client.query('ROLLBACK TO SAVEPOINT cmms_hist');
+                    console.warn(`[ingest] ${rigId}: CMMS history persist failed: ${e.message}`);
+                }
             }
         } else if (ev.type === 'well.created' || ev.type === 'well.updated') {
             const well = normalizeWellEvent(ev);

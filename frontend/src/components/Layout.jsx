@@ -26,7 +26,6 @@ const NAV = [
     { to: '/data-quality', label: 'Data Quality', icon: <FactCheck /> },
     { to: '/workover', label: 'Workover Performance', icon: <Construction /> },
     { to: '/maintenance', label: 'Maintenance & Reliability', icon: <Healing /> },
-    { to: '/governance', label: 'Governance & Rollout', icon: <AccountTree /> },
     { to: '/reports', label: 'Reports', icon: <Description /> },
     { to: '/registry', label: 'Config Registry', icon: <Storage /> },
     { to: '/users', label: 'User Access', icon: <ManageAccounts />, role: 'admin' },

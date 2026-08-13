@@ -32,6 +32,7 @@ export default function Maintenance() {
     const [open, setOpen] = useState(false);
     const [draft, setDraft] = useState({ rigId: '', type: 'PM', title: '', dueDate: '', runtimeHours: '', notes: '' });
     const [saving, setSaving] = useState(false);
+    const [daily, setDaily] = useState(null);   // rig-wise last-day log + NPT rollup
 
     const load = useCallback(() => {
         setErr('');
@@ -39,8 +40,9 @@ export default function Maintenance() {
         Promise.all([
             api.maintenance(params),
             api.maintenanceSummary(),
+            api.maintenanceFleetDaily().catch(() => null),
         ])
-            .then(([list, sum]) => { setRows(Array.isArray(list) ? list : []); setSummary(sum); })
+            .then(([list, sum, day]) => { setRows(Array.isArray(list) ? list : []); setSummary(sum); setDaily(day); })
             .catch((e) => { if (e?.response?.status !== 401) setErr(e?.response?.data?.error || 'Failed to load maintenance data'); })
             .finally(() => setLoading(false));
     }, [filter]);
@@ -99,6 +101,77 @@ export default function Maintenance() {
                 <Grid item xs={6} md={3}><KpiCard label="Open / in-progress" value={s.openCount ?? 0} /></Grid>
                 <Grid item xs={6} md={3}><KpiCard label="Breakdowns" value={s.breakdownCount ?? 0} color={(s.breakdownCount ?? 0) ? 'warning.main' : 'success.main'} /></Grid>
             </Grid>
+
+            {/* Rig-wise daily maintenance log + NPT. Sourced from rig_downtime /
+                rig_maint_log, which accumulate each edge's CMMS snapshots (the
+                snapshot table itself keeps only the latest, so cumulative FY NPT
+                needs the history). FY = Indian financial year, 1 Apr - 31 Mar. */}
+            {daily && (
+                <Paper sx={{ mb: 2 }}>
+                    <Stack direction="row" alignItems="baseline" spacing={1.5} sx={{ p: 2, pb: 1 }} flexWrap="wrap" useFlexGap>
+                        <Typography variant="h6">Rig-wise daily maintenance log &amp; NPT</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                            latest logged day per rig · previous-day NPT · cumulative NPT since FY start {daily.financialYearStart}
+                        </Typography>
+                    </Stack>
+                    <TableContainer sx={{ maxHeight: 420, overflow: 'auto' }}>
+                        <Table size="small" stickyHeader>
+                            <TableHead>
+                                <TableRow>
+                                    <TableCell>Rig</TableCell>
+                                    <TableCell>Log date</TableCell>
+                                    <TableCell>Latest maintenance log</TableCell>
+                                    <TableCell align="right">NPT prev. day</TableCell>
+                                    <TableCell align="right">NPT FY (cum.)</TableCell>
+                                </TableRow>
+                            </TableHead>
+                            <TableBody>
+                                {daily.rigs.map((r) => (
+                                    <TableRow key={r.rigId} hover
+                                        sx={{ cursor: 'pointer' }}
+                                        onClick={() => navigate(`/rigs/${encodeURIComponent(r.rigId)}`)}>
+                                        <TableCell>
+                                            <Typography variant="body2" fontWeight={700}>{r.rigId}</Typography>
+                                            <Typography variant="caption" color="text.secondary">{r.assetUnit || r.field || '—'}</Typography>
+                                        </TableCell>
+                                        <TableCell>{r.logDate ? String(r.logDate).slice(0, 10) : '—'}</TableCell>
+                                        <TableCell sx={{ maxWidth: 460 }}>
+                                            {r.log.length ? (
+                                                <Stack spacing={0.4}>
+                                                    {r.log.slice(0, 3).map((l, i) => (
+                                                        <Stack key={i} direction="row" spacing={1} alignItems="baseline" flexWrap="wrap" useFlexGap>
+                                                            {l.notificationNo && (
+                                                                <Chip size="small" variant="outlined" label={l.notificationNo}
+                                                                    sx={{ height: 18, fontSize: 10, fontFamily: 'monospace' }} />
+                                                            )}
+                                                            <Typography variant="caption" sx={{ fontWeight: 600 }}>{l.asset || '—'}</Typography>
+                                                            <Typography variant="caption" color="text.secondary">{l.text}</Typography>
+                                                        </Stack>
+                                                    ))}
+                                                    {r.log.length > 3 && (
+                                                        <Typography variant="caption" color="text.secondary">+{r.log.length - 3} more…</Typography>
+                                                    )}
+                                                </Stack>
+                                            ) : <Typography variant="caption" color="text.secondary">no maintenance entries</Typography>}
+                                        </TableCell>
+                                        <TableCell align="right">
+                                            <Typography variant="body2" sx={{ fontWeight: 700, color: r.nptPrevDayMin > 0 ? 'warning.main' : 'text.secondary' }}>
+                                                {fmtNum(r.nptPrevDayMin, 0)} min
+                                            </Typography>
+                                        </TableCell>
+                                        <TableCell align="right">
+                                            <Typography variant="body2" sx={{ fontWeight: 700, color: r.nptFyMin > 0 ? 'error.main' : 'success.main' }}>
+                                                {fmtNum(r.nptFyHours, 1)} h
+                                            </Typography>
+                                            {r.nptOpen > 0 && <Chip size="small" color="warning" label={`${r.nptOpen} open`} sx={{ height: 16, fontSize: 10, ml: 0.5 }} />}
+                                        </TableCell>
+                                    </TableRow>
+                                ))}
+                            </TableBody>
+                        </Table>
+                    </TableContainer>
+                </Paper>
+            )}
 
             <Grid container spacing={2} sx={{ flex: 1, minHeight: 0 }}>
                 <Grid item xs={12} md={s.byRig?.length ? 8 : 12} sx={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>

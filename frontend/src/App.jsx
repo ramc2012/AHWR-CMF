@@ -10,7 +10,6 @@ import WellDetail from './components/WellDetail';
 import AlarmCommandCentre from './components/AlarmCommandCentre';
 import DataQuality from './components/DataQuality';
 import WorkoverPerformance from './components/WorkoverPerformance';
-import Governance from './components/Governance';
 import Reports from './components/Reports';
 import ConfigRegistry from './components/ConfigRegistry';
 import Maintenance from './components/Maintenance';
@@ -43,7 +42,6 @@ export default function App() {
                 <Route path="data-quality" element={<DataQuality />} />
                 <Route path="workover" element={<WorkoverPerformance />} />
                 <Route path="maintenance" element={<Maintenance />} />
-                <Route path="governance" element={<Governance />} />
                 <Route path="reports" element={<Reports />} />
                 <Route path="registry" element={<ConfigRegistry />} />
                 <Route path="users" element={<RequireRole role="admin"><Users /></RequireRole>} />
