@@ -13,3 +13,17 @@ html[data-crmf-theme='purple'] body {
 html[data-crmf-theme='dark'] body {
     filter: none;
 }
+
+/* ONGC corporate typeface (Brand Identity Manual 2.0) — self-hosted. */
+@font-face {
+  font-family: 'Mukta';
+  src: url('/fonts/Mukta-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Mukta';
+  src: url('/fonts/Mukta-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-display: swap;
+}

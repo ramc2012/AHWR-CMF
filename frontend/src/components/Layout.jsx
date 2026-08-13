@@ -14,6 +14,7 @@ import { FleetProvider, useFleet } from '../context/FleetContext';
 import { disconnectSocket } from '../socket';
 import { api } from '../api';
 import ErrorBoundary from './ErrorBoundary';
+import { OngcBlockLogo } from './Brand/OngcBrand';
 
 const DRAWER = 248;          // expanded width
 const DRAWER_MINI = 72;      // collapsed (icon-only) width
@@ -152,9 +153,14 @@ function NavDrawer({ width, collapsed }) {
     return (
         <Drawer variant="permanent" sx={{ width, flexShrink: 0, whiteSpace: 'nowrap', boxSizing: 'border-box',
             '& .MuiDrawer-paper': { width, boxSizing: 'border-box', bgcolor: '#0d1526', borderRight: '1px solid rgba(255,255,255,0.06)', overflowX: 'hidden', transition: 'width .2s' } }}>
-            <Toolbar sx={{ flexDirection: 'column', alignItems: collapsed ? 'center' : 'flex-start', justifyContent: 'center', py: 1, px: collapsed ? 0 : 2 }}>
-                <Typography variant="h6" fontWeight={900} letterSpacing={collapsed ? 0 : 1}>{collapsed ? 'C' : 'CRMF'}</Typography>
-                {!collapsed && <Typography variant="caption" color="text.secondary">ONGC · AHWR Fleet</Typography>}
+            <Toolbar sx={{ py: 1, px: collapsed ? 0 : 2, gap: 1.25, justifyContent: collapsed ? 'center' : 'flex-start' }}>
+                <OngcBlockLogo size={collapsed ? 34 : 40} />
+                {!collapsed && (
+                    <Box>
+                        <Typography variant="h6" fontWeight={900} letterSpacing={1} lineHeight={1.2}>CRMF</Typography>
+                        <Typography variant="caption" color="text.secondary">ONGC · AHWR Fleet</Typography>
+                    </Box>
+                )}
             </Toolbar>
             <Divider />
             <List sx={{ px: 1 }}>

@@ -268,7 +268,7 @@ function EdgeTwinTopBar({ rig, onBack, showKpiToggle, kpiOpen, onToggleKpis }) {
                         <Typography variant="h6" fontWeight={900} sx={{ color: 'primary.main', lineHeight: 1, letterSpacing: 0 }} noWrap>
                             {title}
                         </Typography>
-                        <Typography variant="caption" color="text.secondary" fontWeight={700}>{rig?.rigId || 'AHWR-50-TWIN'}</Typography>
+                        <Typography variant="caption" color="text.secondary" fontWeight={700}>{rig?.rigId || 'AHWR RIG'}</Typography>
                     </Box>
                 </Stack>
                 <RigMessageButton rig={rig} />
