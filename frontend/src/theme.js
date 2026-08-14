@@ -4,9 +4,9 @@ import { createTheme } from '@mui/material/styles';
 const theme = createTheme({
     palette: {
         mode: 'dark',
-        primary: { main: '#3ea6ff' },
+        primary: { main: '#38bdf8' },   // same sky-blue accent as the edge HMI
         secondary: { main: '#7c4dff' },
-        background: { default: '#0b1220', paper: '#121b2e' },
+        background: { default: '#0f172a', paper: '#1e293b' },   // same slate surfaces as the edge HMI
         success: { main: '#22c55e' },
         warning: { main: '#f59e0b' },
         error: { main: '#ef4444' },

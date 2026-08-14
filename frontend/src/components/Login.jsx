@@ -13,10 +13,10 @@ const fieldSx = {
         color: '#fff',
         '& fieldset': { borderColor: '#475569' },
         '&:hover fieldset': { borderColor: '#94a3b8' },
-        '&.Mui-focused fieldset': { borderColor: '#34d399' },
+        '&.Mui-focused fieldset': { borderColor: '#38bdf8' },
     },
     '& .MuiInputLabel-root': { color: '#94a3b8' },
-    '& .MuiInputLabel-root.Mui-focused': { color: '#34d399' },
+    '& .MuiInputLabel-root.Mui-focused': { color: '#38bdf8' },
 };
 
 export default function Login() {
@@ -80,7 +80,7 @@ export default function Login() {
                     px: { xs: 3, md: 7 },
                     py: { xs: 4, md: 6 },
                     minHeight: { md: '100vh' },
-                    background: 'linear-gradient(160deg, #0b1220 0%, #0e2230 55%, #0b1220 100%)',
+                    background: 'linear-gradient(160deg, #0b1220 0%, #0f1d36 55%, #0b1220 100%)',
                     borderRight: { md: '1px solid rgba(148,163,184,0.12)' },
                     borderBottom: { xs: '1px solid rgba(148,163,184,0.12)', md: 'none' },
                 }}
@@ -99,7 +99,7 @@ export default function Login() {
                         <Typography sx={{ fontWeight: 800, letterSpacing: 0.5, color: '#fff', fontSize: { xs: 22, md: 28 }, lineHeight: 1.15, fontFamily: 'Mukta, sans-serif' }}>
                             CRMF
                         </Typography>
-                        <Typography variant="body2" sx={{ color: '#6ee7b7', letterSpacing: 1.5, textTransform: 'uppercase', fontSize: 12 }}>
+                        <Typography variant="body2" sx={{ color: '#7dd3fc', letterSpacing: 1.5, textTransform: 'uppercase', fontSize: 12 }}>
                             Centralised Rig Monitoring Facility
                         </Typography>
                     </Box>
@@ -112,7 +112,7 @@ export default function Login() {
                     <Typography variant="body2" sx={{ color: '#94a3b8', mt: 1 }}>
                         ONGC AHWR Fleet
                     </Typography>
-                    <Box sx={{ mt: 2.5, height: 3, width: 76, borderRadius: 2, background: 'linear-gradient(90deg, #34d399, #60a5fa)' }} />
+                    <Box sx={{ mt: 2.5, height: 3, width: 76, borderRadius: 2, background: 'linear-gradient(90deg, #38bdf8, #f59e0b)' }} />
                 </Box>
 
                 <Box sx={{ position: 'relative' }}>
@@ -162,7 +162,7 @@ export default function Login() {
                         sx={{
                             mb: 2.5,
                             '& .MuiToggleButton-root': { color: '#94a3b8', borderColor: '#475569', textTransform: 'none', py: 0.75 },
-                            '& .Mui-selected': { color: '#fff !important', bgcolor: 'rgba(52,211,153,0.18) !important', borderColor: '#34d399 !important' },
+                            '& .Mui-selected': { color: '#fff !important', bgcolor: 'rgba(56,189,248,0.18) !important', borderColor: '#38bdf8 !important' },
                         }}
                     >
                         <ToggleButton value="local">
@@ -210,8 +210,8 @@ export default function Login() {
                         sx={{
                             mt: 3,
                             py: 1.55,
-                            bgcolor: '#34d399',
-                            '&:hover': { bgcolor: '#10b981' },
+                            bgcolor: '#38bdf8',
+                            '&:hover': { bgcolor: '#0284c7' },
                             color: '#07111f',
                             fontWeight: 900,
                             fontSize: 16,

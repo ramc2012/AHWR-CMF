@@ -67,7 +67,7 @@ function TopBar({ width, collapsed, onToggle }) {
     const s = summary || {};
 
     return (
-        <AppBar position="fixed" sx={{ width: `calc(100% - ${width}px)`, ml: `${width}px`, bgcolor: 'background.paper', borderBottom: '1px solid rgba(255,255,255,0.06)', transition: 'width .2s, margin .2s' }} elevation={0}>
+        <AppBar position="fixed" sx={{ width: `calc(100% - ${width}px)`, ml: `${width}px`, bgcolor: '#0f172a', borderBottom: '1px solid #334155', transition: 'width .2s, margin .2s' }} elevation={0}>
             <Toolbar sx={{ gap: 2 }}>
                 <Tooltip title={collapsed ? 'Expand menu' : 'Collapse menu'}>
                     <IconButton onClick={onToggle} edge="start" size="small" sx={{ color: 'text.secondary' }}>
@@ -152,7 +152,7 @@ function NavDrawer({ width, collapsed }) {
     const items = NAV.filter((n) => !n.role || can(n.role));
     return (
         <Drawer variant="permanent" sx={{ width, flexShrink: 0, whiteSpace: 'nowrap', boxSizing: 'border-box',
-            '& .MuiDrawer-paper': { width, boxSizing: 'border-box', bgcolor: '#0d1526', borderRight: '1px solid rgba(255,255,255,0.06)', overflowX: 'hidden', transition: 'width .2s' } }}>
+            '& .MuiDrawer-paper': { width, boxSizing: 'border-box', bgcolor: '#0f172a', borderRight: '1px solid rgba(255,255,255,0.06)', overflowX: 'hidden', transition: 'width .2s' } }}>
             <Toolbar sx={{ py: 1, px: collapsed ? 0 : 2, gap: 1.25, justifyContent: collapsed ? 'center' : 'flex-start' }}>
                 <OngcBlockLogo size={collapsed ? 34 : 40} />
                 {!collapsed && (
@@ -186,7 +186,7 @@ function NavDrawer({ width, collapsed }) {
                     const btn = (
                         <ListItemButton key={n.to} selected={active} onClick={() => nav(n.to)}
                             sx={{ borderRadius: 2, mb: 0.5, justifyContent: collapsed ? 'center' : 'flex-start',
-                                px: collapsed ? 1 : 2, '&.Mui-selected': { bgcolor: 'rgba(62,166,255,0.15)' } }}>
+                                px: collapsed ? 1 : 2, '&.Mui-selected': { bgcolor: 'rgba(56,189,248,0.15)' } }}>
                             <ListItemIcon sx={{ minWidth: 0, mr: collapsed ? 0 : 1.5, justifyContent: 'center', color: active ? 'primary.main' : 'text.secondary' }}>{n.icon}</ListItemIcon>
                             {!collapsed && <ListItemText primary={n.label} primaryTypographyProps={{ fontSize: 14, fontWeight: active ? 700 : 500 }} />}
                         </ListItemButton>

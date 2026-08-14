@@ -68,15 +68,16 @@ export const Ongc70Tagline = ({ color = '#f3e9d2', fontSize = 22, markHeight = 5
     </Box>
 );
 
-// Full-bleed AHWR rig aerial photograph with a dark gradient overlay, for use
-// as the login brand-panel backdrop (keeps foreground text legible).
-export const RigPhotoBackdrop = ({ overlay = 'linear-gradient(160deg, rgba(7,13,24,0.92) 0%, rgba(7,13,24,0.55) 45%, rgba(7,13,24,0.82) 100%)' }) => (
+// Full-bleed AHWR rig aerial photograph with a light gradient overlay, for use
+// as the login brand-panel backdrop (keeps foreground text legible without
+// greying the photo out; the crop keeps the rig centred at any panel ratio).
+export const RigPhotoBackdrop = ({ overlay = 'linear-gradient(165deg, rgba(7,13,24,0.62) 0%, rgba(7,13,24,0.22) 45%, rgba(7,13,24,0.58) 100%)' }) => (
     <Box aria-hidden="true" sx={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
         <Box
             component="img"
             src="/brand/rig-aerial.jpg"
             alt=""
-            sx={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+            sx={{ width: '100%', height: '100%', objectFit: 'cover', objectPosition: '42% 30%', display: 'block' }}
         />
         <Box sx={{ position: 'absolute', inset: 0, background: overlay }} />
     </Box>
