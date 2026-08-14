@@ -2,9 +2,9 @@ import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
     Box, Paper, Typography, Stack, Chip, TextField, InputAdornment, Select, MenuItem,
-    FormControl, InputLabel, IconButton, Tooltip, Alert, ToggleButtonGroup, ToggleButton,
+    FormControl, InputLabel, IconButton, Tooltip, Alert,
 } from '@mui/material';
-import { Search, DeleteOutline, History } from '@mui/icons-material';
+import { Search, DeleteOutline } from '@mui/icons-material';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { KpiCard, fmtNum } from './common';
@@ -42,7 +42,9 @@ const OPERATION_META = {
     WAIT:       { label: 'Waiting (NPT)',  color: '#ff4a60' },
 };
 // Tile order: the operations that matter most to a workover fleet first.
-const OPERATION_TILES = ['RIH', 'POOH', 'CIRCULATE', 'MILLING', 'FISHING', 'CDR', 'SWAB', 'WASH', 'PERFORATION', 'PWOC', 'WAIT'];
+const OPERATION_TILES = ['RIH', 'POOH', 'CIRCULATE', 'MILLING', 'FISHING', 'CDR', 'SWAB', 'WASH', 'PERFORATION', 'PWOC', 'WAIT', 'IDLE'];
+// NPT / Idle stay visible even at zero — their absence is itself information.
+const ALWAYS_TILES = new Set(['WAIT', 'IDLE']);
 // Edge activity codes fold onto the operations axis: make-up happens while
 // running in, break-out while pulling out; rig up/down count as idle time.
 const OP_FOLD = { MAKE_UP: 'RIH', BREAK_OUT: 'POOH', RIG_UP: 'IDLE', RIG_DOWN: 'IDLE' };
@@ -143,12 +145,12 @@ export default function Wells() {
     const [loading, setLoading] = useState(true);
     const [err, setErr] = useState('');
 
-    const [view, setView] = useState('live');   // 'live' | 'history'
     const [unit, setUnit] = useState('all');
     const [status, setStatus] = useState('all');
     const [type, setType] = useState('all');
     const [op, setOp] = useState('all');
     const [q, setQ] = useState('');
+    const [qh, setQh] = useState('');   // separate search for the history panel
 
     const load = useCallback(() => {
         setErr('');
@@ -169,11 +171,14 @@ export default function Wells() {
     // TD date (job end) newest-first; falls back to well id.
     const historyRows = useMemo(() => rows
         .filter((r) => ['completed', 'producing', 'suspended', 'abandoned'].includes(r.status))
-        .filter((r) => !q || `${r.name} ${r.uwi || ''} ${r.wellId} ${r.assetUnit || r.field || ''}`.toLowerCase().includes(q.toLowerCase()))
+        .filter((r) => !qh || `${r.name} ${r.uwi || ''} ${r.wellId} ${r.assetUnit || r.field || ''}`.toLowerCase().includes(qh.toLowerCase()))
         .sort((a, b) => String(b.tdDate || '').localeCompare(String(a.tdDate || '')) || String(a.wellId).localeCompare(String(b.wellId))),
-    [rows, q]);
+    [rows, qh]);
 
+    // CURRENT panel: wells still in play; post-job lifecycle stages live in the
+    // separate Well history panel below (unless a rig is back on the well).
     const filtered = useMemo(() => rows.filter((r) => {
+        if (['completed', 'producing', 'suspended', 'abandoned'].includes(r.status) && !r.currentOperation) return false;
         if (unit !== 'all' && (r.assetUnit || r.field) !== unit) return false;
         if (status !== 'all' && r.status !== status) return false;
         if (type !== 'all' && r.wellType !== type) return false;
@@ -211,16 +216,11 @@ export default function Wells() {
     };
 
     return (
-        <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'auto' }}>
             <Stack direction="row" alignItems="center" spacing={2} mb={2}>
                 <Typography variant="h5" fontWeight={800} sx={{ flexGrow: 1 }}>Activity status</Typography>
-                <ToggleButtonGroup size="small" exclusive value={view} onChange={(_, v) => v && setView(v)}>
-                    <ToggleButton value="live">Live activity</ToggleButton>
-                    <ToggleButton value="history"><History fontSize="small" sx={{ mr: 0.75 }} /> Well history</ToggleButton>
-                </ToggleButtonGroup>
             </Stack>
 
-            {view === 'live' && (<>
             {/* KPI row — fleet-wide counts by CURRENT OPERATION (what each rig is
                 doing on its well right now). A tile shows when its operation is
                 live anywhere in the fleet; clicking it filters the list. */}
@@ -228,9 +228,9 @@ export default function Wells() {
                 <Box onClick={() => setOp('all')} sx={{ cursor: 'pointer' }}>
                     <KpiCard label="Wells on job" value={counts.onJob} color="#22c55e" />
                 </Box>
-                {OPERATION_TILES.filter((k) => counts.ops[k]).map((k) => (
+                {OPERATION_TILES.filter((k) => counts.ops[k] || ALWAYS_TILES.has(k)).map((k) => (
                     <Box key={k} onClick={() => setOp(op === k ? 'all' : k)} sx={{ cursor: 'pointer', opacity: op === 'all' || op === k ? 1 : 0.5 }}>
-                        <KpiCard label={OPERATION_META[k].label} value={counts.ops[k]} color={OPERATION_META[k].color} />
+                        <KpiCard label={OPERATION_META[k].label} value={counts.ops[k] || 0} color={OPERATION_META[k].color} />
                     </Box>
                 ))}
                 {Object.keys(counts.ops).filter((k) => !OPERATION_TILES.includes(k)).map((k) => (
@@ -253,12 +253,14 @@ export default function Wells() {
                 ))}
             </Stack>
 
-            </>)}
 
             {err && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setErr('')}>{err}</Alert>}
 
-            {view === 'live' && (
-            <Paper sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+            {/* -------- CURRENT WELLS (live operations) -------- */}
+            <Paper sx={{ display: 'flex', flexDirection: 'column', mb: 2, flex: '0 0 auto' }}>
+                <Box sx={{ px: 1.5, pt: 1.5 }}>
+                    <Typography variant="h6" fontWeight={700}>Current wells</Typography>
+                </Box>
                 {/* Filter controls. */}
                 <Box sx={{ p: 1.5, flex: '0 0 auto' }}>
                     <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
@@ -301,7 +303,7 @@ export default function Wells() {
                 </Box>
 
                 {/* Tile grid. */}
-                <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: 1.5, pb: 1.5 }}>
+                <Box sx={{ maxHeight: 420, overflow: 'auto', px: 1.5, pb: 1.5 }}>
                     <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 1.25, alignItems: 'stretch' }}>
                         {filtered.map((w) => (
                             <WellTile key={w.wellId} well={w} canAdmin={canAdmin}
@@ -321,19 +323,22 @@ export default function Wells() {
                     )}
                 </Box>
             </Paper>
-            )}
-            {view === 'history' && (
-                <Paper sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+
+            {/* -------- WELL HISTORY (completed jobs) -------- */}
+                <Paper sx={{ display: 'flex', flexDirection: 'column', flex: '0 0 auto' }}>
+                    <Box sx={{ px: 1.5, pt: 1.5 }}>
+                        <Typography variant="h6" fontWeight={700}>Well history</Typography>
+                    </Box>
                     <Box sx={{ p: 1.5, flex: '0 0 auto' }}>
                         <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-                            <TextField size="small" placeholder="Search name / UWI" value={q} onChange={(e) => setQ(e.target.value)} sx={{ flex: 1, minWidth: 180 }}
+                            <TextField size="small" placeholder="Search name / UWI" value={qh} onChange={(e) => setQh(e.target.value)} sx={{ flex: 1, minWidth: 180 }}
                                 InputProps={{ startAdornment: <InputAdornment position="start"><Search fontSize="small" /></InputAdornment> }} />
                             <Typography variant="caption" color="text.secondary">
                                 {historyRows.length} completed well{historyRows.length !== 1 ? 's' : ''} — click a well to open its historical EDR and operations / maintenance log
                             </Typography>
                         </Stack>
                     </Box>
-                    <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: 1.5, pb: 1.5 }}>
+                    <Box sx={{ maxHeight: 420, overflow: 'auto', px: 1.5, pb: 1.5 }}>
                         <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 1.25, alignItems: 'stretch' }}>
                             {historyRows.map((w) => (
                                 <WellTile key={w.wellId} well={w} canAdmin={canAdmin}
@@ -348,8 +353,6 @@ export default function Wells() {
                         )}
                     </Box>
                 </Paper>
-            )}
-
         </Box>
     );
 }

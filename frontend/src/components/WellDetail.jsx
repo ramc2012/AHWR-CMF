@@ -111,8 +111,6 @@ export default function WellDetail() {
     if (err) return <Alert severity="error">{err} — <MLink sx={{ cursor: 'pointer' }} onClick={() => nav('/wells')}>back to wells</MLink></Alert>;
     if (!well) return <Typography color="text.secondary">Loading {id}…</Typography>;
 
-    const stats = well.stats || {};
-
     return (
         <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'auto' }}>
             {/* Back + title. */}
@@ -165,64 +163,10 @@ export default function WellDetail() {
                 )}
             </Paper>
 
-            {/* RUNS TABLE. */}
-            <Paper sx={{ mb: 2 }}>
-                <Box sx={{ p: 1.5, pb: 0.5 }}>
-                    <Stack direction="row" alignItems="baseline" spacing={1.5}>
-                        <Typography variant="h6">Runs</Typography>
-                        <Typography variant="caption" color="text.secondary">
-                            {stats.runCount != null ? stats.runCount : runs.length} run{(stats.runCount ?? runs.length) !== 1 ? 's' : ''}
-                            {stats.totalRuntimeSec != null ? ` · ${fmtDuration(stats.totalRuntimeSec)} total runtime` : ''}
-                        </Typography>
-                    </Stack>
-                </Box>
-                <TableContainer>
-                    <Table size="small">
-                        <TableHead><TableRow>
-                            <TableCell>Rig</TableCell>
-                            <TableCell>Job</TableCell>
-                            <TableCell>Service</TableCell>
-                            <TableCell>Started By</TableCell>
-                            <TableCell>Start</TableCell>
-                            <TableCell>End</TableCell>
-                            <TableCell align="right">Duration</TableCell>
-                            <TableCell align="right">Depth Delta</TableCell>
-                            <TableCell align="right">Joints</TableCell>
-                            <TableCell align="center">State</TableCell>
-                        </TableRow></TableHead>
-                        <TableBody>
-                            {runs.map((r) => (
-                                <TableRow key={r.id} hover>
-                                    <TableCell>
-                                        <MLink component="button" type="button" onClick={() => nav('/rigs/' + r.rigId)} sx={{ fontFamily: 'monospace', fontWeight: 700, cursor: 'pointer' }}>{r.rigId}</MLink>
-                                    </TableCell>
-                                    <TableCell sx={{ fontFamily: 'monospace' }}>{r.jobNo || '—'}</TableCell>
-                                    <TableCell>{r.service || '—'}</TableCell>
-                                    <TableCell>{r.startedBy || '—'}</TableCell>
-                                    <TableCell>{fmtDate(r.startedAt)}</TableCell>
-                                    <TableCell>{r.active ? '—' : fmtDate(r.endedAt)}</TableCell>
-                                    <TableCell align="right">{fmtDuration(r.durationSec)}</TableCell>
-                                    <TableCell align="right">{r.depthDelta != null ? `${fmtNum(r.depthDelta, 2)} m` : '—'}</TableCell>
-                                    <TableCell align="right">{r.joints ?? '—'}</TableCell>
-                                    <TableCell align="center">
-                                        {r.active
-                                            ? <Chip size="small" label="ACTIVE" sx={{ bgcolor: '#22c55e22', color: '#22c55e', border: '1px solid #22c55e55', fontWeight: 700 }} />
-                                            : <Chip size="small" variant="outlined" label="ended" />}
-                                    </TableCell>
-                                </TableRow>
-                            ))}
-                            {!runs.length && (
-                                <TableRow><TableCell colSpan={10} align="center" sx={{ py: 4, color: 'text.secondary' }}>No recorded runs yet.</TableCell></TableRow>
-                            )}
-                        </TableBody>
-                    </Table>
-                </TableContainer>
-            </Paper>
-
             {/* OFFLINE EDR PLAYBACK. */}
             <Paper sx={{ p: 1.5, mb: 1 }}>
                 <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2} flexWrap="wrap" useFlexGap mb={1.5}>
-                    <Typography variant="h6">Recorded well data (offline)</Typography>
+                    <Typography variant="h6">Historical EDR — full parameters (offline)</Typography>
                     {runs.length > 0 && (
                         <FormControl size="small" sx={{ minWidth: 280 }}>
                             <InputLabel id="run-select-label">Run</InputLabel>
@@ -242,7 +186,7 @@ export default function WellDetail() {
                 )}
 
                 {selectedRun && (
-                    <Box sx={{ height: 360, minHeight: 0 }}>
+                    <Box sx={{ height: 560, minHeight: 0 }}>
                         <ErrorBoundary>
                             <EdrView
                                 key={selectedRun.id}
@@ -255,16 +199,28 @@ export default function WellDetail() {
                                     label: well.name,
                                 }}
                                 defaultStrips={[
-                                    { title: 'Hoisting', pens: [
-                                        { channelId: 'drawworks.hook_load', color: '#38bdf8', min: 0, max: 500, enabled: true },
+                                    { title: 'Hookload / WOB', pens: [
+                                        { channelId: 'drilling.wob', color: '#38bdf8', min: 0, max: 100, enabled: true },
+                                        { channelId: 'drawworks.hook_load', color: '#fbbf24', min: 0, max: 500, enabled: true },
+                                        { channelId: 'drawworks.block_position', color: '#4ade80', min: 0, max: 50, enabled: true },
+                                    ] },
+                                    { title: 'Rotary', pens: [
+                                        { channelId: 'drilling.rpm', color: '#a78bfa', min: 0, max: 250, enabled: true },
                                         { channelId: 'drilling.rop', color: '#f472b6', min: 0, max: 80, enabled: true },
+                                        { channelId: 'drilling.torque', color: '#22d3ee', min: 0, max: 20000, enabled: true },
                                     ] },
                                     { title: 'Pump', pens: [
-                                        { channelId: 'mudpump.spm', color: '#4ade80', min: 0, max: 200, enabled: true },
-                                        { channelId: 'mudpump.pressure', color: '#fbbf24', min: 0, max: 500, enabled: true },
+                                        { channelId: 'mudpump.spm', color: '#fb7185', min: 0, max: 200, enabled: true },
+                                        { channelId: 'mudpump.pressure', color: '#38bdf8', min: 0, max: 500, enabled: true },
+                                        { channelId: 'mudpump.flow_in', color: '#f97316', min: 0, max: 3000, enabled: true },
+                                    ] },
+                                    { title: 'Mud Volumes', pens: [
+                                        { channelId: 'fluid.total_tank_volume', color: '#4ade80', min: 0, max: 500, enabled: true },
+                                        { channelId: 'fluid.tank_gain_loss', color: '#fbbf24', min: -50, max: 50, enabled: true },
+                                        { channelId: 'fluid.trip_tank', color: '#a78bfa', min: 0, max: 50, enabled: true },
                                     ] },
                                 ]}
-                                channels={['drawworks.hook_load', 'drilling.rop', 'mudpump.spm', 'mudpump.pressure']}
+                                rightReadouts={['mudpump.pressure', 'mudpump.spm', 'drilling.rop', 'drawworks.hook_load']}
                             />
                         </ErrorBoundary>
                     </Box>

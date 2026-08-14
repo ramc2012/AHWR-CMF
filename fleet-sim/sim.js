@@ -44,7 +44,7 @@ const noise = (a) => (Math.random() - 0.5) * a;
 const r = (v, d = 1) => Number(Number(v).toFixed(d));
 
 // Scripted workover cycle (mirrors the edge mock) so activity / torque-turn / alarms are demonstrable.
-const PHASES = [['RIH', 20], ['MAKE_UP', 8], ['CIRCULATE', 15], ['POOH', 20], ['BREAK_OUT', 8], ['PWOC', 10]];
+const PHASES = [['RIH', 20], ['MAKE_UP', 8], ['CIRCULATE', 15], ['WAIT', 6], ['POOH', 20], ['BREAK_OUT', 8], ['PWOC', 10]];
 const CYCLE_LEN = PHASES.reduce((s, p) => s + p[1], 0);
 function phaseAt(tt) {
     const cycleIndex = Math.floor(tt / CYCLE_LEN);
