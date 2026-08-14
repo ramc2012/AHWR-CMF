@@ -2,19 +2,13 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
     Box, Paper, Typography, Stack, Grid, Table, TableBody, TableCell, TableHead, TableRow,
     TableContainer, TextField, Button, Dialog, DialogTitle, DialogContent, DialogActions,
-    IconButton, Tooltip, Alert, Autocomplete, InputAdornment, Divider, Chip, Switch, FormControlLabel, MenuItem,
+    IconButton, Tooltip, Alert, InputAdornment, Divider, Chip, Switch, FormControlLabel, MenuItem,
 } from '@mui/material';
 import { Add, DeleteOutline, Save, FiberManualRecord, VpnKey, Autorenew, ContentCopy, Cable, PowerSettingsNew } from '@mui/icons-material';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { fmtAgo } from './common';
 
-// Pan-ONGC asset units — suggestions for the "Add rig" form (free text still allowed).
-const ASSET_UNITS = [
-    'Mumbai High', 'Bassein & Satellite', 'Mehsana', 'Ahmedabad', 'Ankleshwar', 'Cambay',
-    'Rajahmundry (KG)', 'Karaikal (Cauvery)', 'Assam (Sivasagar)', 'Tripura (Agartala)',
-    'Rajasthan (Barmer)', 'Jorhat (Assam)',
-];
 
 const ROLE_COLOR = { admin: '#7c4dff', operator: '#38bdf8', viewer: '#64748b' };
 
@@ -171,11 +165,6 @@ export default function Settings() {
             const created = await api.addRig({
                 rigId: draft.rigId.trim(),
                 name: draft.name.trim(),
-                assetUnit: draft.assetUnit?.trim() || undefined,
-                field: draft.field?.trim() || undefined,
-                latitude: draft.latitude === '' ? undefined : Number(draft.latitude),
-                longitude: draft.longitude === '' ? undefined : Number(draft.longitude),
-                deviceToken: draft.deviceToken?.trim() || undefined,
             });
             setAddOpen(false);
             setDraft(emptyRig);
@@ -756,33 +745,19 @@ export default function Settings() {
                     <Grid container spacing={2} mt={0}>
                         <Grid item xs={12} sm={6}>
                             <TextField size="small" fullWidth label="Rig ID" value={draft.rigId} autoComplete="off"
+                                helperText="Must match the Device ID configured on the rig's edge app."
                                 onChange={(e) => setDraft({ ...draft, rigId: e.target.value })} />
                         </Grid>
                         <Grid item xs={12} sm={6}>
                             <TextField size="small" fullWidth label="Name" value={draft.name}
                                 onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
                         </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <Autocomplete freeSolo options={ASSET_UNITS} value={draft.assetUnit}
-                                onInputChange={(_e, v) => setDraft({ ...draft, assetUnit: v })}
-                                renderInput={(params) => <TextField {...params} size="small" label="Asset unit" />} />
-                        </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField size="small" fullWidth label="Field" value={draft.field}
-                                onChange={(e) => setDraft({ ...draft, field: e.target.value })} />
-                        </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField size="small" fullWidth type="number" label="Latitude" value={draft.latitude}
-                                onChange={(e) => setDraft({ ...draft, latitude: e.target.value })} />
-                        </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField size="small" fullWidth type="number" label="Longitude" value={draft.longitude}
-                                onChange={(e) => setDraft({ ...draft, longitude: e.target.value })} />
-                        </Grid>
                         <Grid item xs={12}>
-                            <TextField size="small" fullWidth label="Device token (fixed shared)" value={draft.deviceToken}
-                                autoComplete="off" helperText="Edge sync credential. Leave blank to auto-generate on the backend — it is shown once after save."
-                                onChange={(e) => setDraft({ ...draft, deviceToken: e.target.value })} />
+                            <Alert severity="info" sx={{ mt: 0.5 }}>
+                                A unique device token is generated automatically on save and shown once,
+                                together with the sync settings to enter on the edge app. Asset unit,
+                                field and coordinates sync from the rig's own edge configuration.
+                            </Alert>
                         </Grid>
                     </Grid>
                 </DialogContent>
@@ -827,12 +802,26 @@ export default function Settings() {
 
             {/* Device token reveal (shown once after create or rotate) */}
             <Dialog open={!!reveal} onClose={() => { setReveal(null); setCopied(false); }} fullWidth maxWidth="sm">
-                <DialogTitle>Device token — save it now</DialogTitle>
+                <DialogTitle>Edge sync credentials — save them now</DialogTitle>
                 <DialogContent>
                     <Alert severity="warning" sx={{ mb: 2 }}>
-                        This is the edge sync credential for <b>{reveal?.rig?.name}</b> (<code>{reveal?.rig?.rig_id}</code>).
-                        It is shown <b>only once</b>. Save it now and set it as <code>DEVICE_TOKEN</code> on the rig's edge node.
+                        Sync credentials for <b>{reveal?.rig?.name}</b> (<code>{reveal?.rig?.rig_id}</code>).
+                        The token is shown <b>only once</b>. Enter these three values in the rig's
+                        edge app under <b>Edge Sync → configuration</b> (they map to Central URL,
+                        Device ID and Device token).
                     </Alert>
+                    <TextField
+                        size="small" fullWidth label="Central URL (edge → central ingest)"
+                        value={networkUrls?.ingestUrl || ''} sx={{ mb: 1.5 }}
+                        InputProps={{ readOnly: true, sx: { fontFamily: 'monospace' } }}
+                        onFocus={(e) => e.target.select()}
+                    />
+                    <TextField
+                        size="small" fullWidth label="Device ID"
+                        value={reveal?.rig?.rig_id || ''} sx={{ mb: 1.5 }}
+                        InputProps={{ readOnly: true, sx: { fontFamily: 'monospace' } }}
+                        onFocus={(e) => e.target.select()}
+                    />
                     <TextField
                         size="small" fullWidth label="Device token" value={reveal?.token || ''}
                         InputProps={{
