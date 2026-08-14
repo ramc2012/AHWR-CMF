@@ -25,7 +25,7 @@ const NAV = [
     // -> asset health -> data integrity -> reporting -> administration.
     { to: '/', label: 'Fleet Overview', icon: <GridView /> },
     { to: '/alarms', label: 'Alarm Command Centre', icon: <NotificationsActive /> },
-    { to: '/wells', label: 'Wells', icon: <Water /> },
+    { to: '/wells', label: 'Activity Status', icon: <Water /> },
     { to: '/workover', label: 'Workover Performance', icon: <Construction /> },
     { to: '/maintenance', label: 'Maintenance & Reliability', icon: <Healing /> },
     { to: '/data-quality', label: 'Data Quality', icon: <FactCheck /> },

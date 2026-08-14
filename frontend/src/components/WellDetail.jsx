@@ -96,6 +96,18 @@ export default function WellDetail() {
 
     const selectedRun = useMemo(() => runs.find((r) => String(r.id) === String(selectedRunId)) || null, [runs, selectedRunId]);
 
+    // WELL-HISTORY: operations log + maintenance/NPT for the selected run.
+    const [runLog, setRunLog] = useState(null);
+    useEffect(() => {
+        setRunLog(null);   // never show the previous run's log while the new fetch is in flight
+        if (!selectedRun) return;
+        let alive = true;
+        api.wellRunLog(id, selectedRun.id)
+            .then((d) => { if (alive) setRunLog(d); })
+            .catch(() => { if (alive) setRunLog(null); });
+        return () => { alive = false; };
+    }, [id, selectedRun]);
+
     if (err) return <Alert severity="error">{err} — <MLink sx={{ cursor: 'pointer' }} onClick={() => nav('/wells')}>back to wells</MLink></Alert>;
     if (!well) return <Typography color="text.secondary">Loading {id}…</Typography>;
 
@@ -258,6 +270,127 @@ export default function WellDetail() {
                     </Box>
                 )}
             </Paper>
+
+            {/* OPERATIONS & MAINTENANCE LOG for the selected run (well history). */}
+            {selectedRun && runLog?.available && (
+                <Paper sx={{ p: 1.5, mb: 1 }}>
+                    <Stack direction="row" alignItems="center" spacing={1.5} flexWrap="wrap" useFlexGap mb={1.5}>
+                        <Typography variant="h6" sx={{ flexGrow: 1 }}>Operations &amp; maintenance log</Typography>
+                        {runLog.activity?.totals && (
+                            <Stack direction="row" spacing={1}>
+                                <Chip size="small" label={`Productive ${runLog.activity.totals.prodPct ?? 0}%`}
+                                    sx={{ bgcolor: '#22c55e22', color: '#22c55e', fontWeight: 700 }} />
+                                <Chip size="small" label={`NPT ${runLog.activity.totals.nptPct ?? 0}%`}
+                                    sx={{ bgcolor: '#ef444422', color: '#ef4444', fontWeight: 700 }} />
+                            </Stack>
+                        )}
+                    </Stack>
+
+                    {/* Per-operation time split for the run. */}
+                    {Array.isArray(runLog.activity?.byPhase) && runLog.activity.byPhase.length > 0 && (
+                        <Stack direction="row" spacing={1} mb={1.5} flexWrap="wrap" useFlexGap>
+                            {runLog.activity.byPhase.map((pph) => (
+                                <Chip key={pph.phase} size="small" variant="outlined"
+                                    label={`${pph.label || pph.phase} · ${fmtDuration(pph.durationSec)} (${pph.pct}%)`} />
+                            ))}
+                        </Stack>
+                    )}
+
+                    <Grid container spacing={1.5}>
+                        {/* Operations log — the rig's activity segments over the run window. */}
+                        <Grid item xs={12} lg={6}>
+                            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Operations log</Typography>
+                            <TableContainer sx={{ maxHeight: 300 }}>
+                                <Table size="small" stickyHeader>
+                                    <TableHead>
+                                        <TableRow>
+                                            <TableCell>Start</TableCell>
+                                            <TableCell>Operation</TableCell>
+                                            <TableCell>Duration</TableCell>
+                                            <TableCell>Class</TableCell>
+                                        </TableRow>
+                                    </TableHead>
+                                    <TableBody>
+                                        {(runLog.activity?.segments || []).slice().reverse().slice(0, 200).map((seg, i) => (
+                                            <TableRow key={i} hover>
+                                                <TableCell sx={{ whiteSpace: 'nowrap' }}>{fmtDate(seg.start)}</TableCell>
+                                                <TableCell sx={{ fontWeight: 700 }}>{seg.label || seg.phase}{seg.nptReason ? ` — ${seg.nptReason}` : ''}</TableCell>
+                                                <TableCell>{fmtDuration(seg.durationSec)}</TableCell>
+                                                <TableCell>
+                                                    <Chip size="small" label={seg.productive ? 'PROD' : (seg.npt ? 'NPT' : 'OTHER')}
+                                                        sx={{ fontWeight: 700, fontSize: 10,
+                                                              bgcolor: seg.productive ? '#22c55e22' : (seg.npt ? '#ef444422' : '#64748b22'),
+                                                              color: seg.productive ? '#22c55e' : (seg.npt ? '#ef4444' : '#94a3b8') }} />
+                                                </TableCell>
+                                            </TableRow>
+                                        ))}
+                                        {!(runLog.activity?.segments || []).length && (
+                                            <TableRow><TableCell colSpan={4} sx={{ color: 'text.secondary' }}>No activity recorded in this run window.</TableCell></TableRow>
+                                        )}
+                                    </TableBody>
+                                </Table>
+                            </TableContainer>
+                        </Grid>
+
+                        {/* Maintenance log + downtime for the rig during the run. */}
+                        <Grid item xs={12} lg={6}>
+                            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Maintenance log</Typography>
+                            <TableContainer sx={{ maxHeight: 140, mb: 1.5 }}>
+                                <Table size="small" stickyHeader>
+                                    <TableHead>
+                                        <TableRow>
+                                            <TableCell>Time</TableCell>
+                                            <TableCell>Notification</TableCell>
+                                            <TableCell>Asset</TableCell>
+                                            <TableCell>Entry</TableCell>
+                                        </TableRow>
+                                    </TableHead>
+                                    <TableBody>
+                                        {(runLog.maintenance || []).map((m2) => (
+                                            <TableRow key={m2.entryId} hover>
+                                                <TableCell sx={{ whiteSpace: 'nowrap' }}>{fmtDate(m2.ts)}</TableCell>
+                                                <TableCell>{m2.notificationNo ? <Chip size="small" label={m2.notificationNo} sx={{ fontFamily: 'monospace', fontSize: 10 }} /> : '—'}</TableCell>
+                                                <TableCell>{m2.asset || m2.assetId || '—'}</TableCell>
+                                                <TableCell>{m2.text || '—'}</TableCell>
+                                            </TableRow>
+                                        ))}
+                                        {!(runLog.maintenance || []).length && (
+                                            <TableRow><TableCell colSpan={4} sx={{ color: 'text.secondary' }}>No maintenance entries in this run window.</TableCell></TableRow>
+                                        )}
+                                    </TableBody>
+                                </Table>
+                            </TableContainer>
+
+                            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Downtime / NPT</Typography>
+                            <TableContainer sx={{ maxHeight: 140 }}>
+                                <Table size="small" stickyHeader>
+                                    <TableHead>
+                                        <TableRow>
+                                            <TableCell>Start</TableCell>
+                                            <TableCell>Duration</TableCell>
+                                            <TableCell>Asset</TableCell>
+                                            <TableCell>Reason</TableCell>
+                                        </TableRow>
+                                    </TableHead>
+                                    <TableBody>
+                                        {(runLog.downtime || []).map((d2) => (
+                                            <TableRow key={d2.recordId} hover>
+                                                <TableCell sx={{ whiteSpace: 'nowrap' }}>{fmtDate(d2.start)}</TableCell>
+                                                <TableCell>{d2.durationMin != null ? `${fmtNum(d2.durationMin, 0)} min` : (d2.end ? '—' : 'OPEN')}</TableCell>
+                                                <TableCell>{d2.asset || d2.assetId || '—'}</TableCell>
+                                                <TableCell>{d2.reasonCode || d2.notes || '—'}</TableCell>
+                                            </TableRow>
+                                        ))}
+                                        {!(runLog.downtime || []).length && (
+                                            <TableRow><TableCell colSpan={4} sx={{ color: 'text.secondary' }}>No downtime in this run window.</TableCell></TableRow>
+                                        )}
+                                    </TableBody>
+                                </Table>
+                            </TableContainer>
+                        </Grid>
+                    </Grid>
+                </Paper>
+            )}
         </Box>
     );
 }

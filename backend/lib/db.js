@@ -118,6 +118,44 @@ async function ensureAppMigrations() {
     // Ingest-concurrency hardening (same DDL as init.sql; owner-run setups
     // self-migrate here, crmf_app deployments get it from init.sql / manual DDL).
     await tryDdl(`ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS source TEXT`);
+    // CMMS history tables fed by ingest's persistCmmsHistory (cmms.snapshot
+    // events). These previously existed only as hand-run DDL on the live
+    // volume; without them the SAVEPOINT'd writes silently rolled back and
+    // /api/maintenance/fleet-daily failed on a fresh database.
+    await tryDdl(`
+        CREATE TABLE IF NOT EXISTS rig_downtime (
+            rig_id TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            asset_id TEXT,
+            asset TEXT,
+            reason_code TEXT,
+            start_ts TIMESTAMPTZ,
+            end_ts TIMESTAMPTZ,
+            duration_min DOUBLE PRECISION,
+            notes TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (rig_id, record_id)
+        )
+    `);
+    await tryDdl(`CREATE INDEX IF NOT EXISTS rig_downtime_rig_start_idx ON rig_downtime(rig_id, start_ts DESC)`);
+    await tryDdl(`
+        CREATE TABLE IF NOT EXISTS rig_maint_log (
+            rig_id TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            log_type TEXT,
+            category TEXT,
+            asset_id TEXT,
+            asset TEXT,
+            text TEXT,
+            by_who TEXT,
+            shift TEXT,
+            notification_no TEXT,
+            at_ts TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (rig_id, entry_id)
+        )
+    `);
+    await tryDdl(`CREATE INDEX IF NOT EXISTS rig_maint_log_rig_at_idx ON rig_maint_log(rig_id, at_ts DESC)`);
     await tryDdl(`ALTER TABLE rigs ADD COLUMN IF NOT EXISTS sender_epoch TEXT`);
     await tryDdl(`ALTER TABLE rigs ADD COLUMN IF NOT EXISTS seq_conflict_at TIMESTAMPTZ`);
     // Close duplicate open runs (keep the newest per rig) BEFORE the unique

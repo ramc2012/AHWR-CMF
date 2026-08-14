@@ -74,7 +74,7 @@ async function getWells({ assetUnit, status, q } = {}) {
     // Wells page categorises by; lifecycle status is the well's own state.
     const { rows } = await query(
         `SELECT w.well_id, w.name, w.uwi, w.well_type, w.service_type, w.status, w.asset_unit, w.field,
-                w.total_depth, w.current_rig_id, w.spud_date,
+                w.total_depth, w.current_rig_id, w.spud_date, w.td_date,
                 CASE WHEN w.current_rig_id IS NOT NULL THEN r.active_activity END AS current_operation,
                 EXISTS (SELECT 1 FROM well_runs wr WHERE wr.well_id = w.well_id AND wr.ended_at IS NULL) AS active_run
          FROM wells w
@@ -93,6 +93,7 @@ async function getWells({ assetUnit, status, q } = {}) {
         currentRigId: r.current_rig_id,
         currentOperation: r.current_operation || null,
         spudDate: r.spud_date,
+        tdDate: r.td_date,
         activeRun: r.active_run === true,
     }));
 }

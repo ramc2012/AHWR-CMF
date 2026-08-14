@@ -2,10 +2,9 @@ import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
     Box, Paper, Typography, Stack, Chip, TextField, InputAdornment, Select, MenuItem,
-    FormControl, InputLabel, Button, Dialog, DialogTitle, DialogContent, DialogActions,
-    IconButton, Tooltip, Alert,
+    FormControl, InputLabel, IconButton, Tooltip, Alert, ToggleButtonGroup, ToggleButton,
 } from '@mui/material';
-import { Search, Add, DeleteOutline } from '@mui/icons-material';
+import { Search, DeleteOutline, History } from '@mui/icons-material';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { KpiCard, fmtNum } from './common';
@@ -31,8 +30,6 @@ const WELL_TYPES = ['production', 'injection', 'exploration', 'appraisal', 'work
 const OPERATION_META = {
     RIH:        { label: 'Running in',     color: '#27cfe6' },
     POOH:       { label: 'Pulling out',    color: '#ff9d2e' },
-    MAKE_UP:    { label: 'Make-up',        color: '#a9ef34' },
-    BREAK_OUT:  { label: 'Break-out',      color: '#ffc24b' },
     CIRCULATE:  { label: 'Circulation',    color: '#46a6ff' },
     SWAB:       { label: 'Swabbing',       color: '#9a8bff' },
     FISHING:    { label: 'Fishing',        color: '#b47aff' },
@@ -40,14 +37,19 @@ const OPERATION_META = {
     CDR:        { label: 'CDR',            color: '#22d3ee' },
     WASH:       { label: 'Wash / cleanout', color: '#38bdf8' },
     PERFORATION:{ label: 'Perforation',    color: '#fb7185' },
-    RIG_UP:     { label: 'Rig up',         color: '#23dd86' },
-    RIG_DOWN:   { label: 'Rig down',       color: '#23dd86' },
+    PWOC:       { label: 'PWOC',           color: '#a9ef34' },
     IDLE:       { label: 'Idle',           color: '#7c8aa0' },
     WAIT:       { label: 'Waiting (NPT)',  color: '#ff4a60' },
 };
 // Tile order: the operations that matter most to a workover fleet first.
-const OPERATION_TILES = ['RIH', 'POOH', 'MAKE_UP', 'BREAK_OUT', 'CIRCULATE', 'MILLING', 'FISHING', 'CDR', 'SWAB', 'WASH', 'PERFORATION', 'WAIT'];
-const opKey = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+const OPERATION_TILES = ['RIH', 'POOH', 'CIRCULATE', 'MILLING', 'FISHING', 'CDR', 'SWAB', 'WASH', 'PERFORATION', 'PWOC', 'WAIT'];
+// Edge activity codes fold onto the operations axis: make-up happens while
+// running in, break-out while pulling out; rig up/down count as idle time.
+const OP_FOLD = { MAKE_UP: 'RIH', BREAK_OUT: 'POOH', RIG_UP: 'IDLE', RIG_DOWN: 'IDLE' };
+const opKey = (v) => {
+    const k = String(v || '').toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+    return OP_FOLD[k] || k;
+};
 
 function OperationChip({ op, size = 'small' }) {
     const meta = OPERATION_META[opKey(op)];
@@ -131,11 +133,6 @@ function MetaCol({ label, value, mono }) {
     );
 }
 
-const BLANK_DRAFT = {
-    wellId: '', name: '', uwi: '', wellType: 'production', status: 'planned',
-    field: '', assetUnit: '', latitude: '', longitude: '', spudDate: '', totalDepth: '',
-    operator: '', blockLease: '',
-};
 
 export default function Wells() {
     const nav = useNavigate();
@@ -146,15 +143,12 @@ export default function Wells() {
     const [loading, setLoading] = useState(true);
     const [err, setErr] = useState('');
 
+    const [view, setView] = useState('live');   // 'live' | 'history'
     const [unit, setUnit] = useState('all');
     const [status, setStatus] = useState('all');
     const [type, setType] = useState('all');
     const [op, setOp] = useState('all');
     const [q, setQ] = useState('');
-
-    const [addOpen, setAddOpen] = useState(false);
-    const [draft, setDraft] = useState(BLANK_DRAFT);
-    const [saving, setSaving] = useState(false);
 
     const load = useCallback(() => {
         setErr('');
@@ -171,11 +165,19 @@ export default function Wells() {
         return Array.from(set).sort((a, b) => a.localeCompare(b));
     }, [rows]);
 
+    // WELL HISTORY: completed jobs (post-workover lifecycle stages). Sorted by
+    // TD date (job end) newest-first; falls back to well id.
+    const historyRows = useMemo(() => rows
+        .filter((r) => ['completed', 'producing', 'suspended', 'abandoned'].includes(r.status))
+        .filter((r) => !q || `${r.name} ${r.uwi || ''} ${r.wellId} ${r.assetUnit || r.field || ''}`.toLowerCase().includes(q.toLowerCase()))
+        .sort((a, b) => String(b.tdDate || '').localeCompare(String(a.tdDate || '')) || String(a.wellId).localeCompare(String(b.wellId))),
+    [rows, q]);
+
     const filtered = useMemo(() => rows.filter((r) => {
         if (unit !== 'all' && (r.assetUnit || r.field) !== unit) return false;
         if (status !== 'all' && r.status !== status) return false;
         if (type !== 'all' && r.wellType !== type) return false;
-        if (op !== 'all' && (op === 'none' ? !!r.currentOperation : opKey(r.currentOperation) !== op)) return false;
+        if (op !== 'all' && opKey(r.currentOperation) !== op) return false;
         if (q && !(`${r.name} ${r.uwi || ''} ${r.wellId} ${r.assetUnit || r.field || ''} ${r.currentRigId || ''}`.toLowerCase().includes(q.toLowerCase()))) return false;
         return true;
     }), [rows, unit, status, type, op, q]);
@@ -201,31 +203,6 @@ export default function Wells() {
         return { total: rows.length, onJob, offJob: rows.length - onJob, ops, lifecycle };
     }, [rows]);
 
-    const addWell = async () => {
-        if (!draft.wellId || !draft.name) return;
-        setSaving(true);
-        setErr('');
-        // Only send filled-in fields; coerce numerics so blanks don't post empty strings.
-        const body = { wellId: draft.wellId.trim(), name: draft.name.trim() };
-        for (const k of ['uwi', 'wellType', 'status', 'field', 'assetUnit', 'operator', 'blockLease']) {
-            if (draft[k] !== '' && draft[k] != null) body[k] = draft[k];
-        }
-        for (const k of ['latitude', 'longitude', 'totalDepth']) {
-            if (draft[k] !== '' && draft[k] != null && !Number.isNaN(Number(draft[k]))) body[k] = Number(draft[k]);
-        }
-        if (draft.spudDate) body.spudDate = draft.spudDate;
-        try {
-            await api.addWell(body);
-            setAddOpen(false);
-            setDraft(BLANK_DRAFT);
-            load();
-        } catch (e) {
-            if (e?.response?.status !== 401) setErr(e?.response?.data?.error || 'Failed to add well');
-        } finally {
-            setSaving(false);
-        }
-    };
-
     const deleteWell = async (well) => {
         if (!window.confirm(`Delete well "${well.name}" (${well.wellId})? This cannot be undone.`)) return;
         setErr('');
@@ -236,10 +213,14 @@ export default function Wells() {
     return (
         <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
             <Stack direction="row" alignItems="center" spacing={2} mb={2}>
-                <Typography variant="h5" fontWeight={800} sx={{ flexGrow: 1 }}>Wells</Typography>
-                {canAdmin && <Button variant="contained" startIcon={<Add />} onClick={() => { setDraft(BLANK_DRAFT); setAddOpen(true); }}>Add well</Button>}
+                <Typography variant="h5" fontWeight={800} sx={{ flexGrow: 1 }}>Activity status</Typography>
+                <ToggleButtonGroup size="small" exclusive value={view} onChange={(_, v) => v && setView(v)}>
+                    <ToggleButton value="live">Live activity</ToggleButton>
+                    <ToggleButton value="history"><History fontSize="small" sx={{ mr: 0.75 }} /> Well history</ToggleButton>
+                </ToggleButtonGroup>
             </Stack>
 
+            {view === 'live' && (<>
             {/* KPI row — fleet-wide counts by CURRENT OPERATION (what each rig is
                 doing on its well right now). A tile shows when its operation is
                 live anywhere in the fleet; clicking it filters the list. */}
@@ -252,17 +233,11 @@ export default function Wells() {
                         <KpiCard label={OPERATION_META[k].label} value={counts.ops[k]} color={OPERATION_META[k].color} />
                     </Box>
                 ))}
-                {Object.keys(counts.ops).filter((k) => !OPERATION_TILES.includes(k) && !['RIG_UP', 'RIG_DOWN', 'IDLE'].includes(k)).map((k) => (
+                {Object.keys(counts.ops).filter((k) => !OPERATION_TILES.includes(k)).map((k) => (
                     <Box key={k} onClick={() => setOp(op === k ? 'all' : k)} sx={{ cursor: 'pointer', opacity: op === 'all' || op === k ? 1 : 0.5 }}>
                         <KpiCard label={OPERATION_META[k]?.label || k} value={counts.ops[k]} color={OPERATION_META[k]?.color || '#7c8aa0'} />
                     </Box>
                 ))}
-                {(counts.ops.RIG_UP || counts.ops.RIG_DOWN || counts.ops.IDLE) ? (
-                    <KpiCard label="Rig up/down · idle" value={(counts.ops.RIG_UP || 0) + (counts.ops.RIG_DOWN || 0) + (counts.ops.IDLE || 0)} color="#7c8aa0" />
-                ) : null}
-                <Box onClick={() => setOp(op === 'none' ? 'all' : 'none')} sx={{ cursor: 'pointer', opacity: op === 'all' || op === 'none' ? 1 : 0.5 }}>
-                    <KpiCard label="Off job" value={counts.offJob} color="#64748b" />
-                </Box>
             </Stack>
             {/* Secondary line — lifecycle summary of the registry. */}
             <Stack direction="row" spacing={1.5} mb={2} flexWrap="wrap" useFlexGap alignItems="center">
@@ -278,8 +253,11 @@ export default function Wells() {
                 ))}
             </Stack>
 
+            </>)}
+
             {err && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setErr('')}>{err}</Alert>}
 
+            {view === 'live' && (
             <Paper sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
                 {/* Filter controls. */}
                 <Box sx={{ p: 1.5, flex: '0 0 auto' }}>
@@ -314,7 +292,6 @@ export default function Wells() {
                                 {Object.keys(OPERATION_META).map((k) => (
                                     <MenuItem key={k} value={k}>{OPERATION_META[k].label}</MenuItem>
                                 ))}
-                                <MenuItem value="none">Off job (no rig)</MenuItem>
                             </Select>
                         </FormControl>
                     </Stack>
@@ -344,54 +321,35 @@ export default function Wells() {
                     )}
                 </Box>
             </Paper>
+            )}
+            {view === 'history' && (
+                <Paper sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                    <Box sx={{ p: 1.5, flex: '0 0 auto' }}>
+                        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                            <TextField size="small" placeholder="Search name / UWI" value={q} onChange={(e) => setQ(e.target.value)} sx={{ flex: 1, minWidth: 180 }}
+                                InputProps={{ startAdornment: <InputAdornment position="start"><Search fontSize="small" /></InputAdornment> }} />
+                            <Typography variant="caption" color="text.secondary">
+                                {historyRows.length} completed well{historyRows.length !== 1 ? 's' : ''} — click a well to open its historical EDR and operations / maintenance log
+                            </Typography>
+                        </Stack>
+                    </Box>
+                    <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: 1.5, pb: 1.5 }}>
+                        <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 1.25, alignItems: 'stretch' }}>
+                            {historyRows.map((w) => (
+                                <WellTile key={w.wellId} well={w} canAdmin={canAdmin}
+                                    onOpen={() => nav('/wells/' + encodeURIComponent(w.wellId))}
+                                    onDelete={() => deleteWell(w)} />
+                            ))}
+                        </Box>
+                        {!loading && !historyRows.length && (
+                            <Box sx={{ py: 6, textAlign: 'center', color: 'text.secondary' }}>
+                                <Typography variant="body2">No completed wells yet.</Typography>
+                            </Box>
+                        )}
+                    </Box>
+                </Paper>
+            )}
 
-            {/* Add well (admin). */}
-            <Dialog open={addOpen} onClose={() => setAddOpen(false)} fullWidth maxWidth="sm">
-                <DialogTitle>Add well</DialogTitle>
-                <DialogContent>
-                    <Stack spacing={2} mt={0.5}>
-                        <Stack direction="row" spacing={2}>
-                            <TextField size="small" fullWidth required label="Well ID" value={draft.wellId} onChange={(e) => setDraft({ ...draft, wellId: e.target.value })} autoComplete="off" />
-                            <TextField size="small" fullWidth required label="Name" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
-                        </Stack>
-                        <Stack direction="row" spacing={2}>
-                            <TextField size="small" fullWidth label="UWI" value={draft.uwi} onChange={(e) => setDraft({ ...draft, uwi: e.target.value })} />
-                            <FormControl size="small" fullWidth>
-                                <InputLabel id="draft-type-label">Type</InputLabel>
-                                <Select labelId="draft-type-label" label="Type" value={draft.wellType} onChange={(e) => setDraft({ ...draft, wellType: e.target.value })}>
-                                    {WELL_TYPES.map((t) => <MenuItem key={t} value={t}>{t}</MenuItem>)}
-                                </Select>
-                            </FormControl>
-                            <FormControl size="small" fullWidth>
-                                <InputLabel id="draft-status-label">Status</InputLabel>
-                                <Select labelId="draft-status-label" label="Status" value={draft.status} onChange={(e) => setDraft({ ...draft, status: e.target.value })}>
-                                    {WELL_STATUSES.map((s) => <MenuItem key={s} value={s}>{s}</MenuItem>)}
-                                </Select>
-                            </FormControl>
-                        </Stack>
-                        <Stack direction="row" spacing={2}>
-                            <TextField size="small" fullWidth label="Field" value={draft.field} onChange={(e) => setDraft({ ...draft, field: e.target.value })} />
-                            <TextField size="small" fullWidth label="Asset unit" value={draft.assetUnit} onChange={(e) => setDraft({ ...draft, assetUnit: e.target.value })} />
-                        </Stack>
-                        <Stack direction="row" spacing={2}>
-                            <TextField size="small" fullWidth label="Operator" value={draft.operator} onChange={(e) => setDraft({ ...draft, operator: e.target.value })} />
-                            <TextField size="small" fullWidth label="Block / lease" value={draft.blockLease} onChange={(e) => setDraft({ ...draft, blockLease: e.target.value })} />
-                        </Stack>
-                        <Stack direction="row" spacing={2}>
-                            <TextField size="small" fullWidth label="Latitude" type="number" value={draft.latitude} onChange={(e) => setDraft({ ...draft, latitude: e.target.value })} />
-                            <TextField size="small" fullWidth label="Longitude" type="number" value={draft.longitude} onChange={(e) => setDraft({ ...draft, longitude: e.target.value })} />
-                        </Stack>
-                        <Stack direction="row" spacing={2}>
-                            <TextField size="small" fullWidth label="Spud date" type="date" InputLabelProps={{ shrink: true }} value={draft.spudDate} onChange={(e) => setDraft({ ...draft, spudDate: e.target.value })} />
-                            <TextField size="small" fullWidth label="Total depth (m)" type="number" value={draft.totalDepth} onChange={(e) => setDraft({ ...draft, totalDepth: e.target.value })} />
-                        </Stack>
-                    </Stack>
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setAddOpen(false)}>Cancel</Button>
-                    <Button variant="contained" onClick={addWell} disabled={saving || !draft.wellId || !draft.name}>{saving ? 'Saving…' : 'Add well'}</Button>
-                </DialogActions>
-            </Dialog>
         </Box>
     );
 }

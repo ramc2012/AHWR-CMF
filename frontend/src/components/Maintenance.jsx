@@ -129,7 +129,7 @@ export default function Maintenance() {
                                 {daily.rigs.map((r) => (
                                     <TableRow key={r.rigId} hover
                                         sx={{ cursor: 'pointer' }}
-                                        onClick={() => navigate(`/rigs/${encodeURIComponent(r.rigId)}`)}>
+                                        onClick={() => nav(`/rigs/${encodeURIComponent(r.rigId)}`)}>
                                         <TableCell>
                                             <Typography variant="body2" fontWeight={700}>{r.rigId}</Typography>
                                             <Typography variant="caption" color="text.secondary">{r.assetUnit || r.field || '—'}</Typography>

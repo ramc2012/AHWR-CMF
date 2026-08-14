@@ -129,6 +129,8 @@ export const api = {
     wells: (params) => axios.get('/api/wells', { params }).then((r) => r.data),
     well: (id) => axios.get(`/api/wells/${encodeURIComponent(id)}`).then((r) => r.data),
     wellRuns: (id) => axios.get(`/api/wells/${encodeURIComponent(id)}/runs`).then((r) => r.data),
+    // Well-history module: operations log + maintenance/NPT for one recorded run.
+    wellRunLog: (id, runId) => axios.get(`/api/wells/${encodeURIComponent(id)}/runlog`, { params: runId ? { runId } : {} }).then((r) => r.data),
     addWell: (b) => axios.post('/api/wells', b).then((r) => r.data),
     updateWell: (id, p) => axios.patch(`/api/wells/${encodeURIComponent(id)}`, p).then((r) => r.data),
     deleteWell: (id) => axios.delete(`/api/wells/${encodeURIComponent(id)}`).then((r) => r.data),

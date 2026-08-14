@@ -10,7 +10,7 @@ const { query } = require('./db');
 
 // Phase classification (per the CRMF activity spec). A phase is PRODUCTIVE if it
 // appears in PRODUCTIVE_PHASES, NPT if in NPT_PHASES; anything else is "other".
-const PRODUCTIVE_PHASES = new Set(['RIH', 'POOH', 'CIRCULATE', 'MAKE_UP', 'BREAK_OUT', 'TRIP', 'DRILL', 'RUN', 'PULL']);
+const PRODUCTIVE_PHASES = new Set(['RIH', 'POOH', 'CIRCULATE', 'MAKE_UP', 'BREAK_OUT', 'PWOC', 'TRIP', 'DRILL', 'RUN', 'PULL']);
 const NPT_PHASES = new Set(['WAIT', 'IDLE', 'REPAIR', 'STOP']);
 
 const phaseKey = (phase) => String(phase || '').trim().toUpperCase();
@@ -43,9 +43,12 @@ function emptyResult() {
     };
 }
 
-// Reconstruct the activity timeline for one rig over the trailing `hours` window.
-async function getActivity(rigId, hours = 24) {
+// Reconstruct the activity timeline for one rig over the trailing `hours`
+// window, or over an ABSOLUTE [fromMs, toMs] range when both are given (used by
+// the well-history module to replay a completed run's operations log).
+async function getActivity(rigId, hours = 24, fromMs = null, toMs = null) {
     const h = Math.min(Math.max(Number(hours) || 24, 1), 24 * 31);
+    const ranged = Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs > fromMs;
 
     // The edge emits { activity, label, productive, npt, source, since } — there is
     // NO 'phase' key. Reading payload->>'phase' filtered out EVERY row, so this
@@ -54,22 +57,37 @@ async function getActivity(rigId, hours = 24) {
     // productive/npt booleans through rather than re-deriving them from a
     // hardcoded phase list that does not know MILLING/CDR/WASH/PERFORATION.
     const { rows } = await query(
-        `SELECT ts,
-                COALESCE(payload->>'activity', payload->>'phase')       AS phase,
-                payload->>'label'                                       AS label,
-                payload->>'productive'                                  AS productive,
-                payload->'npt'->>'reason'                               AS npt_reason
-         FROM events
-         WHERE rig_id = $1 AND type = 'activity' AND ts > now() - ($2 || ' hours')::interval
-         ORDER BY ts ASC`,
-        [rigId, String(h)]);
+        ranged
+            ? `SELECT ts,
+                      COALESCE(payload->>'activity', payload->>'phase')       AS phase,
+                      payload->>'label'                                       AS label,
+                      payload->>'productive'                                  AS productive,
+                      payload->'npt'->>'reason'                               AS npt_reason
+               FROM events
+               WHERE rig_id = $1 AND type = 'activity'
+                 AND ts >= to_timestamp($2::double precision / 1000.0)
+                 AND ts <= to_timestamp($3::double precision / 1000.0)
+               ORDER BY ts ASC`
+            : `SELECT ts,
+                      COALESCE(payload->>'activity', payload->>'phase')       AS phase,
+                      payload->>'label'                                       AS label,
+                      payload->>'productive'                                  AS productive,
+                      payload->'npt'->>'reason'                               AS npt_reason
+               FROM events
+               WHERE rig_id = $1 AND type = 'activity' AND ts > now() - ($2 || ' hours')::interval
+               ORDER BY ts ASC`,
+        ranged ? [rigId, fromMs, toMs] : [rigId, String(h)]);
 
     // active_job for the `current` block (independent of whether events exist).
+    // In RANGED (historical) mode the rig's live job is unrelated to the window
+    // being replayed — leave it null so a completed run never reports today's job.
     let job = null;
-    try {
-        const jr = await query('SELECT active_job FROM rigs WHERE rig_id = $1', [rigId]);
-        job = jr.rows.length ? (jr.rows[0].active_job || null) : null;
-    } catch { /* leave job null */ }
+    if (!ranged) {
+        try {
+            const jr = await query('SELECT active_job FROM rigs WHERE rig_id = $1', [rigId]);
+            job = jr.rows.length ? (jr.rows[0].active_job || null) : null;
+        } catch { /* leave job null */ }
+    }
 
     // Drop rows with no phase (defensive — payload may be malformed).
     const evs = rows.filter((r) => r.phase != null && String(r.phase).trim() !== '');
@@ -79,7 +97,7 @@ async function getActivity(rigId, hours = 24) {
         return out;
     }
 
-    const nowMs = Date.now();
+    const nowMs = ranged ? toMs : Date.now();
 
     // Build SEGMENTS by collapsing consecutive same-phase rows. Each segment ends
     // where the NEXT row begins; the final segment runs to now().

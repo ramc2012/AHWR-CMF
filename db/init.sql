@@ -531,6 +531,42 @@ CREATE TABLE IF NOT EXISTS rig_cmms (
     received_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Accumulating CMMS HISTORY (unlike rig_cmms, these are never replaced):
+-- downtime/NPT records and maintenance-log entries upserted from each
+-- cmms.snapshot by ingest's persistCmmsHistory. Conflict keys match the
+-- ON CONFLICT targets in backend/lib/ingest.js.
+CREATE TABLE IF NOT EXISTS rig_downtime (
+    rig_id       TEXT NOT NULL,
+    record_id    TEXT NOT NULL,
+    asset_id     TEXT,
+    asset        TEXT,
+    reason_code  TEXT,
+    start_ts     TIMESTAMPTZ,
+    end_ts       TIMESTAMPTZ,
+    duration_min DOUBLE PRECISION,
+    notes        TEXT,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (rig_id, record_id)
+);
+CREATE INDEX IF NOT EXISTS rig_downtime_rig_start_idx ON rig_downtime(rig_id, start_ts DESC);
+
+CREATE TABLE IF NOT EXISTS rig_maint_log (
+    rig_id          TEXT NOT NULL,
+    entry_id        TEXT NOT NULL,
+    log_type        TEXT,
+    category        TEXT,
+    asset_id        TEXT,
+    asset           TEXT,
+    text            TEXT,
+    by_who          TEXT,
+    shift           TEXT,
+    notification_no TEXT,
+    at_ts           TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (rig_id, entry_id)
+);
+CREATE INDEX IF NOT EXISTS rig_maint_log_rig_at_idx ON rig_maint_log(rig_id, at_ts DESC);
+
 -- ---------------------------------------------------------------------
 -- Least-privilege application role (audit #2).
 -- The bootstrap/owner role (crmf, a superuser) creates the schema, but the
@@ -559,7 +595,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
     rigs, rig_latest, telemetry, events, connections, tags,
     deployment_status, escalations, decisions, value_metrics,
     maintenance_record, users, notification_channels, notifications,
-    app_settings, user_sessions, wells, well_runs, rig_messages, rig_cmms
+    app_settings, user_sessions, wells, well_runs, rig_messages, rig_cmms,
+    rig_downtime, rig_maint_log
     TO crmf_app;
 
 -- The continuous aggregate is read-only for the app.

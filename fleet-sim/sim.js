@@ -44,7 +44,7 @@ const noise = (a) => (Math.random() - 0.5) * a;
 const r = (v, d = 1) => Number(Number(v).toFixed(d));
 
 // Scripted workover cycle (mirrors the edge mock) so activity / torque-turn / alarms are demonstrable.
-const PHASES = [['RIH', 20], ['MAKE_UP', 8], ['CIRCULATE', 15], ['POOH', 20], ['BREAK_OUT', 8]];
+const PHASES = [['RIH', 20], ['MAKE_UP', 8], ['CIRCULATE', 15], ['POOH', 20], ['BREAK_OUT', 8], ['PWOC', 10]];
 const CYCLE_LEN = PHASES.reduce((s, p) => s + p[1], 0);
 function phaseAt(tt) {
     const cycleIndex = Math.floor(tt / CYCLE_LEN);
@@ -175,7 +175,7 @@ function snapshot(rig, t) {
         // --- Richer equipment status (mirrors the edge rig_data shape) so the
         //     central per-rig HMI panels show full equipment state. Enums per the
         //     edge field map. Booleans are emitted as 0/1 (telemetry is numeric). ---
-        'drilling.operation_mode': ({ RIH: 2, POOH: 3, CIRCULATE: 1, MAKE_UP: 0, BREAK_OUT: 0 }[wf.phase]) ?? 1,
+        'drilling.operation_mode': ({ RIH: 2, POOH: 3, CIRCULATE: 1, MAKE_UP: 0, BREAK_OUT: 0, PWOC: 1 }[wf.phase]) ?? 1,
         'drilling.delta_torque': r(osc(t, 500, 200, 40)),
         'htd.status': (pumping || wf.phase === 'RIH' || wf.phase === 'POOH') ? 2 : 1,
         'htd.torque_command': r(osc(t, 8000, 3000, 70) + 200),

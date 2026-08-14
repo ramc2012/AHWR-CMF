@@ -381,7 +381,8 @@ function buildApiRouter() {
     // reconstructs the day's phase segments + productive/NPT split for the
     // width-proportional activity bar. Read-only, default 24h window.
     r.get('/rigs/:id/activity', wrap((req) =>
-        activity.getActivity(req.params.id, Number(req.query.hours) || 24)));
+        activity.getActivity(req.params.id, Number(req.query.hours) || 24,
+            Number(req.query.from) || null, Number(req.query.to) || null)));
     // CMMS mirror for one rig (asset health, PM, work orders, maintenance log,
     // downtime/NPT, instruments, run hours) as last snapshotted by that edge.
     r.get('/rigs/:id/cmms', wrap(async (req) => {
@@ -422,6 +423,60 @@ function buildApiRouter() {
         assetUnit: req.query.assetUnit, status: req.query.status, q: req.query.q })));
     r.get('/wells/:id', wrap((req) => wells.getWell(req.params.id)));
     r.get('/wells/:id/runs', wrap((req) => wells.getRuns(req.params.id)));
+    // WELL-HISTORY module: the historical operations log + maintenance/NPT log
+    // for one recorded run of a well (defaults to the most recent run). The
+    // operations log is the rig's activity timeline replayed over the run
+    // window; maintenance + downtime come from the accumulated CMMS history.
+    r.get('/wells/:id/runlog', wrap(async (req) => {
+        const wellId = req.params.id;
+        const runId = Number(req.query.runId) || null;
+        const { rows: runs } = await query(
+            `SELECT id, rig_id, job_no, service, started_at, ended_at
+             FROM well_runs WHERE well_id = $1 ORDER BY started_at DESC`, [wellId]);
+        if (!runs.length) return { available: false, wellId, reason: 'no recorded runs' };
+        const run = runId ? runs.find((x) => Number(x.id) === runId) : runs[0];
+        if (!run) return { available: false, wellId, reason: 'run not found' };
+        const fromMs = new Date(run.started_at).getTime();
+        const toMs = run.ended_at ? new Date(run.ended_at).getTime() : Date.now();
+        // A degenerate window (clock skew / force-closed run) must not fall back
+        // to the rig's LIVE trailing-24h activity masquerading as history.
+        if (!(toMs > fromMs)) return { available: false, wellId, reason: 'run window invalid' };
+        const act = await activity.getActivity(run.rig_id, 24, fromMs, toMs);
+        let maintenance = [];
+        let downtime = [];
+        try {
+            const m = await query(
+                `SELECT entry_id AS "entryId", log_type AS "logType", category,
+                        asset_id AS "assetId", asset, text, by_who AS "by", shift,
+                        notification_no AS "notificationNo", at_ts AS "ts"
+                 FROM rig_maint_log
+                 WHERE rig_id = $1
+                   AND at_ts >= to_timestamp($2::double precision / 1000.0)
+                   AND at_ts <= to_timestamp($3::double precision / 1000.0)
+                 ORDER BY at_ts DESC LIMIT 300`, [run.rig_id, fromMs, toMs]);
+            maintenance = m.rows;
+            const d = await query(
+                `SELECT record_id AS "recordId", asset_id AS "assetId", asset,
+                        reason_code AS "reasonCode", start_ts AS "start",
+                        end_ts AS "end", duration_min AS "durationMin", notes
+                 FROM rig_downtime
+                 WHERE rig_id = $1
+                   AND start_ts <= to_timestamp($3::double precision / 1000.0)
+                   AND COALESCE(end_ts, now()) >= to_timestamp($2::double precision / 1000.0)
+                 ORDER BY start_ts DESC LIMIT 200`, [run.rig_id, fromMs, toMs]);
+            downtime = d.rows;
+        } catch { /* history tables not yet provisioned — activity still returned */ }
+        return {
+            available: true,
+            wellId,
+            run: { id: run.id, rigId: run.rig_id, jobNo: run.job_no, service: run.service,
+                   startedAt: run.started_at, endedAt: run.ended_at },
+            window: { fromMs, toMs },
+            activity: act,
+            maintenance,
+            downtime,
+        };
+    }));
     r.post('/wells', requireRoleAudited('admin'),
         wrap((req) => wells.addWell(req.body, req.user.username)));
     r.patch('/wells/:id', requireRoleAudited('admin'),
