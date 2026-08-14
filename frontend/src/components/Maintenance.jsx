@@ -6,6 +6,10 @@ import {
     DialogTitle, DialogContent, DialogActions, IconButton, Tooltip, Alert,
 } from '@mui/material';
 import { Add, CheckCircle, PlayArrow, Healing } from '@mui/icons-material';
+import {
+    ResponsiveContainer, ComposedChart, BarChart, Bar, Line, XAxis, YAxis, Tooltip as ChartTooltip, CartesianGrid, Legend,
+} from 'recharts';
+import ErrorBoundary from './ErrorBoundary';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { useFleet } from '../context/FleetContext';
@@ -17,6 +21,10 @@ const STATUS_COLOR = { open: 'warning', in_progress: 'info', done: 'success', ov
 const TYPE_COLOR = { PM: 'info', calibration: 'secondary', breakdown: 'error', inspection: 'default' };
 
 const fmtDate = (d) => (d ? new Date(d).toLocaleDateString() : '—');
+// Auto-scaling durations (real fleets read in hours/days; compressed demo data stays legible).
+const fmtH = (v) => (v == null ? '—' : v >= 48 ? `${fmtNum(v / 24, 1)} d` : v >= 1 ? `${fmtNum(v, 1)} h` : `${fmtNum(v * 60, 0)} min`);
+const fmtPct = (v, d = 1) => (v == null ? '—' : `${fmtNum(v, d)}%`);
+const chartTooltipStyle = { background: '#0d1526', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8 };
 
 export default function Maintenance() {
     const nav = useNavigate();
@@ -33,6 +41,8 @@ export default function Maintenance() {
     const [draft, setDraft] = useState({ rigId: '', type: 'PM', title: '', dueDate: '', runtimeHours: '', notes: '' });
     const [saving, setSaving] = useState(false);
     const [daily, setDaily] = useState(null);   // rig-wise last-day log + NPT rollup
+    const [kpis, setKpis] = useState(null);     // reliability KPIs (availability / MTBF / MTTR / Pareto)
+    const [days, setDays] = useState(30);
 
     const load = useCallback(() => {
         setErr('');
@@ -48,6 +58,11 @@ export default function Maintenance() {
     }, [filter]);
 
     useEffect(() => { setLoading(true); load(); const t = setInterval(load, 15000); return () => clearInterval(t); }, [load]);
+
+    const loadKpis = useCallback(() => {
+        api.maintenanceKpis(days).then(setKpis).catch(() => {});
+    }, [days]);
+    useEffect(() => { loadKpis(); const t = setInterval(loadKpis, 30000); return () => clearInterval(t); }, [loadKpis]);
 
     const submit = async () => {
         if (!draft.rigId || !draft.title) return;
@@ -81,11 +96,18 @@ export default function Maintenance() {
     };
 
     const s = summary || {};
+    const kf = kpis?.fleet || {};
 
     return (
-        <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'auto' }}>
             <Stack direction="row" alignItems="center" spacing={2} mb={2} flexWrap="wrap" useFlexGap>
                 <Typography variant="h5" fontWeight={800} sx={{ flexGrow: 1 }}>Maintenance &amp; Reliability</Typography>
+                <Typography variant="caption" color="text.secondary">KPI window</Typography>
+                <ToggleButtonGroup size="small" exclusive value={days} onChange={(_e, v) => v && setDays(v)}>
+                    <ToggleButton value={7}>7d</ToggleButton>
+                    <ToggleButton value={30}>30d</ToggleButton>
+                    <ToggleButton value={90}>90d</ToggleButton>
+                </ToggleButtonGroup>
                 <ToggleButtonGroup size="small" exclusive value={filter} onChange={(_e, v) => v && setFilter(v)}>
                     <ToggleButton value="all">All</ToggleButton>
                     {STATUSES.map((st) => <ToggleButton key={st} value={st} sx={{ textTransform: 'none' }}>{st.replace('_', ' ')}</ToggleButton>)}
@@ -95,12 +117,110 @@ export default function Maintenance() {
 
             {err && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setErr('')}>{err}</Alert>}
 
-            <Grid container spacing={2} mb={2}>
-                <Grid item xs={6} md={3}><KpiCard label="PM compliance" value={s.pmCompliancePct == null ? '—' : `${s.pmCompliancePct}%`} sub="target ≥ 95" color={(s.pmCompliancePct ?? 0) >= 95 ? 'success.main' : 'warning.main'} icon={<Healing fontSize="small" color="disabled" />} /></Grid>
-                <Grid item xs={6} md={3}><KpiCard label="Overdue" value={s.overdue ?? 0} color={(s.overdue ?? 0) ? 'error.main' : 'success.main'} /></Grid>
-                <Grid item xs={6} md={3}><KpiCard label="Open / in-progress" value={s.openCount ?? 0} /></Grid>
-                <Grid item xs={6} md={3}><KpiCard label="Breakdowns" value={s.breakdownCount ?? 0} color={(s.breakdownCount ?? 0) ? 'warning.main' : 'success.main'} /></Grid>
+            {/* ---- Reliability KPIs (ISO 14224 style) ---- */}
+            <Typography variant="overline" color="text.secondary">Reliability — last {kpis?.windowDays ?? days} days</Typography>
+            <Grid container spacing={2} mb={1.5}>
+                <Grid item xs={6} md={3}><KpiCard label="Fleet availability" value={fmtPct(kf.availabilityPct)} color={(kf.availabilityPct ?? 100) >= 97 ? 'success.main' : 'warning.main'} sub={`${kf.totalRigs ?? '—'} rigs`} /></Grid>
+                <Grid item xs={6} md={3}><KpiCard label="MTBF" value={fmtH(kf.mtbfHours)} color="#38bdf8" sub="mean time between failures" /></Grid>
+                <Grid item xs={6} md={3}><KpiCard label="MTTR" value={fmtH(kf.mttrHours)} color="#fbbf24" sub="mean time to repair" /></Grid>
+                <Grid item xs={6} md={3}><KpiCard label="NPT (downtime)" value={fmtH(kf.nptHours)} color="#ef4444" sub={`${kf.breakdowns ?? 0} breakdowns · ${kf.openDowntime ?? 0} open`} /></Grid>
             </Grid>
+            <Grid container spacing={2} mb={2}>
+                <Grid item xs={6} md={3}><KpiCard label="PM compliance" value={fmtPct(kf.pmCompliancePct, 0)} sub={`${kf.pmOverdue ?? 0} overdue · ${kf.pmDueSoon ?? 0} due soon`} color={(kf.pmCompliancePct ?? 0) >= 95 ? 'success.main' : 'warning.main'} icon={<Healing fontSize="small" color="disabled" />} /></Grid>
+                <Grid item xs={6} md={3}><KpiCard label="Open work orders" value={kf.woOpen ?? '—'} color="#a78bfa" sub={`${kf.woBreakdown ?? 0} breakdown · ${kf.woP1 ?? 0} P1`} /></Grid>
+                <Grid item xs={6} md={3}><KpiCard label="Calibration overdue" value={kf.instOverdue ?? '—'} color={(kf.instOverdue ?? 0) ? 'error.main' : 'success.main'} sub={`of ${kf.instTotal ?? '—'} instruments`} /></Grid>
+                <Grid item xs={6} md={3}><KpiCard label="Manual records open" value={s.openCount ?? 0} sub={`${s.overdue ?? 0} overdue · ${s.breakdownCount ?? 0} breakdown`} /></Grid>
+            </Grid>
+
+            {/* ---- Downtime Pareto + monthly trend ---- */}
+            <Paper sx={{ p: 1.5, mb: 2, flex: '0 0 auto' }}>
+                <ErrorBoundary>
+                    <Grid container spacing={2}>
+                        <Grid item xs={12} lg={6}>
+                            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Downtime Pareto — by reason (h)</Typography>
+                            <Box sx={{ height: 220 }}>
+                                {(kpis?.pareto || []).length ? (
+                                    <ResponsiveContainer width="100%" height="100%">
+                                        <BarChart data={kpis.pareto.map((p2) => ({ ...p2, hours: Number(p2.hours.toFixed(1)) }))} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 40 }}>
+                                            <CartesianGrid stroke="rgba(255,255,255,0.06)" />
+                                            <XAxis type="number" stroke="#64748b" fontSize={11} />
+                                            <YAxis type="category" dataKey="reason" stroke="#64748b" fontSize={11} width={120} />
+                                            <ChartTooltip contentStyle={chartTooltipStyle} formatter={(v, nm, pl) => [`${v} h · ${pl?.payload?.records ?? 0} records`, pl?.payload?.reason]} />
+                                            <Bar dataKey="hours" name="Hours" fill="#f59e0b" isAnimationActive={false} radius={[0, 3, 3, 0]} />
+                                        </BarChart>
+                                    </ResponsiveContainer>
+                                ) : <Typography variant="caption" color="text.secondary" sx={{ display: 'block', textAlign: 'center', py: 6 }}>{kpis ? 'No closed downtime in window.' : 'Loading…'}</Typography>}
+                            </Box>
+                        </Grid>
+                        <Grid item xs={12} lg={6}>
+                            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>NPT hours &amp; breakdowns by month</Typography>
+                            <Box sx={{ height: 220 }}>
+                                {(kpis?.monthly || []).length ? (
+                                    <ResponsiveContainer width="100%" height="100%">
+                                        <ComposedChart data={kpis.monthly.map((m) => ({ ...m, nptHours: Number(m.nptHours.toFixed(1)) }))} margin={{ top: 8, right: 12, bottom: 0, left: -8 }}>
+                                            <CartesianGrid stroke="rgba(255,255,255,0.06)" />
+                                            <XAxis dataKey="month" stroke="#64748b" fontSize={11} />
+                                            <YAxis yAxisId="npt" stroke="#64748b" fontSize={11} width={48} />
+                                            <YAxis yAxisId="bd" orientation="right" stroke="#64748b" fontSize={11} width={36} allowDecimals={false} />
+                                            <ChartTooltip contentStyle={chartTooltipStyle} />
+                                            <Legend wrapperStyle={{ fontSize: 11 }} />
+                                            <Bar yAxisId="npt" dataKey="nptHours" name="NPT (h)" fill="#ef4444" isAnimationActive={false} radius={[3, 3, 0, 0]} />
+                                            <Line yAxisId="bd" dataKey="breakdowns" name="Breakdowns" stroke="#38bdf8" strokeWidth={2} dot={{ r: 3 }} isAnimationActive={false} />
+                                        </ComposedChart>
+                                    </ResponsiveContainer>
+                                ) : <Typography variant="caption" color="text.secondary" sx={{ display: 'block', textAlign: 'center', py: 6 }}>{kpis ? 'No monthly history yet.' : 'Loading…'}</Typography>}
+                            </Box>
+                        </Grid>
+                    </Grid>
+                </ErrorBoundary>
+            </Paper>
+
+            {/* ---- Per-rig reliability benchmark (worst availability first) ---- */}
+            <Paper sx={{ mb: 2, flex: '0 0 auto' }}>
+                <Box sx={{ p: 1.5, pb: 0.5 }}>
+                    <Typography variant="h6">Rig reliability — last {kpis?.windowDays ?? days} days</Typography>
+                </Box>
+                <TableContainer sx={{ maxHeight: 300 }}>
+                    <Table size="small" stickyHeader>
+                        <TableHead>
+                            <TableRow>
+                                <TableCell>Rig</TableCell>
+                                <TableCell>Availability</TableCell>
+                                <TableCell align="right">NPT</TableCell>
+                                <TableCell align="right">Breakdowns</TableCell>
+                                <TableCell align="right">MTTR</TableCell>
+                                <TableCell align="right">MTBF</TableCell>
+                                <TableCell align="right">Open downtime</TableCell>
+                            </TableRow>
+                        </TableHead>
+                        <TableBody>
+                            {(kpis?.rigs || []).map((r) => (
+                                <TableRow key={r.rigId} hover sx={{ cursor: 'pointer' }} onClick={() => nav(`/rigs/${encodeURIComponent(r.rigId)}`)}>
+                                    <TableCell sx={{ fontFamily: 'monospace', fontWeight: 700 }}>{r.rigId}</TableCell>
+                                    <TableCell sx={{ minWidth: 140 }}>
+                                        <Stack direction="row" alignItems="center" spacing={1}>
+                                            <Box sx={{ flex: 1, height: 6, borderRadius: 3, bgcolor: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
+                                                <Box sx={{ width: `${r.availabilityPct}%`, height: '100%', bgcolor: r.availabilityPct >= 97 ? '#4ade80' : (r.availabilityPct >= 90 ? '#f59e0b' : '#ef4444') }} />
+                                            </Box>
+                                            <Typography variant="caption" fontWeight={700}>{fmtPct(r.availabilityPct)}</Typography>
+                                        </Stack>
+                                    </TableCell>
+                                    <TableCell align="right">{fmtH(r.nptHours)}</TableCell>
+                                    <TableCell align="right">{r.breakdowns}</TableCell>
+                                    <TableCell align="right">{fmtH(r.mttrHours)}</TableCell>
+                                    <TableCell align="right">{fmtH(r.mtbfHours)}</TableCell>
+                                    <TableCell align="right">{r.openDowntime ? <Chip size="small" color="warning" label={r.openDowntime} sx={{ height: 18 }} /> : '—'}</TableCell>
+                                </TableRow>
+                            ))}
+                            {!(kpis?.rigs || []).length && (
+                                <TableRow><TableCell colSpan={7} align="center" sx={{ py: 4, color: 'text.secondary' }}>
+                                    {kpis ? 'No downtime records in window — 100% availability.' : 'Loading KPIs…'}
+                                </TableCell></TableRow>
+                            )}
+                        </TableBody>
+                    </Table>
+                </TableContainer>
+            </Paper>
 
             {/* Rig-wise daily maintenance log + NPT. Sourced from rig_downtime /
                 rig_maint_log, which accumulate each edge's CMMS snapshots (the

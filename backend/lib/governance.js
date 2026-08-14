@@ -101,6 +101,125 @@ async function addDecision({ title, detail }, actor) {
     return rows[0];
 }
 
+
+// ---------------------------------------------------------------------------
+// Maintenance & reliability KPIs (ISO 14224 / CMMS-standard): availability,
+// MTBF, MTTR, NPT hours, downtime Pareto by reason, monthly trend, plus fleet
+// PM / work-order / calibration posture from the latest CMMS snapshots.
+async function getMaintenanceKpis({ days = 30, tz = 'Asia/Kolkata' } = {}) {
+    const d = Math.min(Math.max(Number(days) || 30, 1), 365);
+    const zone = /^[A-Za-z0-9_/+:-]{1,64}$/.test(String(tz || '')) ? String(tz) : 'Asia/Kolkata';
+    const win = `${d} days`;
+    const windowHours = d * 24;
+
+    // Per-rig reliability from the accumulated downtime history.
+    const dtQ = await query(
+        `SELECT dt.rig_id,
+                r.name,
+                count(*) FILTER (WHERE dt.end_ts IS NOT NULL)                       AS breakdowns,
+                count(*) FILTER (WHERE dt.end_ts IS NULL)                           AS open_records,
+                COALESCE(sum(dt.duration_min) FILTER (WHERE dt.end_ts IS NOT NULL), 0) / 60.0 AS npt_hours,
+                avg(dt.duration_min) FILTER (WHERE dt.end_ts IS NOT NULL) / 60.0    AS mttr_hours
+         FROM rig_downtime dt
+         LEFT JOIN rigs r ON r.rig_id = dt.rig_id
+         WHERE dt.rig_id IS NOT NULL AND dt.start_ts > now() - ($1)::interval
+         GROUP BY dt.rig_id, r.name`,
+        [win]);
+
+    // Downtime Pareto by reason code.
+    const parQ = await query(
+        `SELECT COALESCE(NULLIF(trim(reason_code), ''), 'Unspecified') AS reason,
+                COALESCE(sum(duration_min), 0) / 60.0                   AS hours,
+                count(*)                                                AS records
+         FROM rig_downtime
+         WHERE start_ts > now() - ($1)::interval AND end_ts IS NOT NULL
+         GROUP BY 1 ORDER BY hours DESC LIMIT 10`,
+        [win]);
+
+    // Monthly trend — last 6 calendar months in the operating timezone.
+    const monQ = await query(
+        `WITH months AS (
+            SELECT to_char(date_trunc('month', (now() AT TIME ZONE $1)) - (i || ' months')::interval, 'YYYY-MM') AS ym
+            FROM generate_series(0, 5) AS g(i)
+         ),
+         dt AS (
+            SELECT to_char(date_trunc('month', start_ts AT TIME ZONE $1), 'YYYY-MM') AS ym,
+                   COALESCE(sum(duration_min), 0) / 60.0 AS npt_hours,
+                   count(*) FILTER (WHERE end_ts IS NOT NULL) AS breakdowns
+            FROM rig_downtime WHERE start_ts > now() - interval '6 months'
+            GROUP BY 1
+         )
+         SELECT m.ym, COALESCE(dt.npt_hours, 0) AS npt_hours, COALESCE(dt.breakdowns, 0) AS breakdowns
+         FROM months m LEFT JOIN dt ON dt.ym = m.ym
+         ORDER BY m.ym`,
+        [zone]);
+
+    // Fleet CMMS posture from the latest snapshot per rig (PM counts, open
+    // work orders, calibration). ->> on absent keys is NULL; sum() skips NULLs.
+    const cmmsQ = await query(
+        `SELECT count(*)                                                              AS rigs_reporting,
+                sum((snapshot->'counts'->>'overdue')::int)                            AS pm_overdue,
+                sum((snapshot->'counts'->>'dueSoon')::int)                            AS pm_due_soon,
+                sum((snapshot->'counts'->>'ok')::int)                                 AS pm_ok,
+                sum((snapshot->'cmmsSummary'->'workOrders'->>'open')::int)            AS wo_open,
+                sum((snapshot->'cmmsSummary'->'workOrders'->>'breakdownOpen')::int)   AS wo_breakdown,
+                sum((snapshot->'cmmsSummary'->'workOrders'->>'p1Open')::int)          AS wo_p1,
+                sum((snapshot->'instrumentSummary'->>'overdue')::int)                 AS inst_overdue,
+                sum((snapshot->'instrumentSummary'->>'total')::int)                   AS inst_total
+         FROM rig_cmms`);
+
+    const rigCountQ = await query('SELECT count(*) AS n FROM rigs');
+    const totalRigs = Number(rigCountQ.rows[0].n) || 0;
+    const num = (v) => (v == null ? null : Number(v));
+
+    const rigs = dtQ.rows.map((r) => {
+        const nptH = Number(r.npt_hours) || 0;
+        const bd = Number(r.breakdowns) || 0;
+        return {
+            rigId: r.rig_id,
+            name: r.name || r.rig_id,
+            breakdowns: bd,
+            openDowntime: Number(r.open_records) || 0,
+            nptHours: nptH,
+            mttrHours: num(r.mttr_hours),
+            mtbfHours: bd > 0 ? Math.max(0, (windowHours - nptH) / bd) : null,
+            availabilityPct: Math.max(0, Math.min(100, (1 - nptH / windowHours) * 100)),
+        };
+    }).sort((a, b) => a.availabilityPct - b.availabilityPct || String(a.rigId || '').localeCompare(String(b.rigId || '')));
+
+    const totNpt = rigs.reduce((a, r) => a + r.nptHours, 0);
+    const totBd = rigs.reduce((a, r) => a + r.breakdowns, 0);
+    const totDurMin = dtQ.rows.reduce((a, r) => a + ((Number(r.mttr_hours) || 0) * 60 * (Number(r.breakdowns) || 0)), 0);
+    const c = cmmsQ.rows[0] || {};
+    const pmTotal = (Number(c.pm_overdue) || 0) + (Number(c.pm_due_soon) || 0) + (Number(c.pm_ok) || 0);
+
+    return {
+        windowDays: d,
+        timezone: zone,
+        fleet: {
+            availabilityPct: totalRigs > 0 ? Math.max(0, (1 - totNpt / (windowHours * totalRigs)) * 100) : null,
+            mtbfHours: totBd > 0 && totalRigs > 0 ? Math.max(0, (windowHours * totalRigs - totNpt) / totBd) : null,
+            mttrHours: totBd > 0 ? (totDurMin / 60) / totBd : null,
+            nptHours: totNpt,
+            breakdowns: totBd,
+            openDowntime: rigs.reduce((a, r) => a + r.openDowntime, 0),
+            pmOverdue: num(c.pm_overdue),
+            pmDueSoon: num(c.pm_due_soon),
+            pmCompliancePct: pmTotal > 0 ? ((pmTotal - (Number(c.pm_overdue) || 0)) / pmTotal) * 100 : null,
+            woOpen: num(c.wo_open),
+            woBreakdown: num(c.wo_breakdown),
+            woP1: num(c.wo_p1),
+            instOverdue: num(c.inst_overdue),
+            instTotal: num(c.inst_total),
+            rigsReporting: Number(c.rigs_reporting) || 0,
+            totalRigs,
+        },
+        rigs,
+        pareto: parQ.rows.map((r) => ({ reason: r.reason, hours: Number(r.hours) || 0, records: Number(r.records) || 0 })),
+        monthly: monQ.rows.map((m) => ({ month: m.ym, nptHours: Number(m.npt_hours) || 0, breakdowns: Number(m.breakdowns) || 0 })),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Workover KPIs (industry-standard job metrics — IADC-style daily report
 // aggregates): avg days per well, NPT per well, make-up / break-out connection
@@ -395,4 +514,4 @@ async function getFleetReportPeriod(period = 'snapshot') {
 
 module.exports = {
     GATES, GATE_LABEL, getGovernance, updateDeployment, addEscalation,
-    updateEscalation, addDecision, getWorkover, getFleetReport, getFleetReportPeriod, getWorkoverKpis };
+    updateEscalation, addDecision, getWorkover, getFleetReport, getFleetReportPeriod, getWorkoverKpis, getMaintenanceKpis };

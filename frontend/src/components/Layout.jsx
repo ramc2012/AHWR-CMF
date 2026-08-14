@@ -5,9 +5,9 @@ import {
     Divider, Chip, IconButton, Menu, MenuItem, Avatar, Tooltip, Stack, Alert,
 } from '@mui/material';
 import {
-    GridView, NotificationsActive, FactCheck, Construction, AccountTree,
-    Description, Storage, Logout, Circle, Warning, Healing, ManageAccounts,
-    MenuOpen, Menu as MenuIcon, ShieldOutlined, Tune, People, Water,
+    SpaceDashboard, NotificationsActive, FactCheck, Speed, AccountTree,
+    Assessment, Storage, Logout, Circle, Warning, Engineering, ManageAccounts,
+    MenuOpen, Menu as MenuIcon, ShieldOutlined, Tune, People, MonitorHeart,
 } from '@mui/icons-material';
 import { useAuth } from '../context/AuthContext';
 import { FleetProvider, useFleet } from '../context/FleetContext';
@@ -23,13 +23,13 @@ const DRAWER_MINI = 72;      // collapsed (icon-only) width
 const NAV = [
     // Ordered by operator priority: situational awareness -> safety -> operations
     // -> asset health -> data integrity -> reporting -> administration.
-    { to: '/', label: 'Fleet Overview', icon: <GridView /> },
+    { to: '/', label: 'Fleet Overview', icon: <SpaceDashboard /> },
     { to: '/alarms', label: 'Alarm Command Centre', icon: <NotificationsActive /> },
-    { to: '/wells', label: 'Activity Status', icon: <Water /> },
-    { to: '/workover', label: 'Workover Performance', icon: <Construction /> },
-    { to: '/maintenance', label: 'Maintenance & Reliability', icon: <Healing /> },
+    { to: '/wells', label: 'Activity Status', icon: <MonitorHeart /> },
+    { to: '/workover', label: 'Workover Performance', icon: <Speed /> },
+    { to: '/maintenance', label: 'Maintenance & Reliability', icon: <Engineering /> },
     { to: '/data-quality', label: 'Data Quality', icon: <FactCheck /> },
-    { to: '/reports', label: 'Reports', icon: <Description /> },
+    { to: '/reports', label: 'Reports', icon: <Assessment /> },
     { to: '/registry', label: 'Config Registry', icon: <Storage /> },
     { to: '/users', label: 'User Access', icon: <ManageAccounts />, role: 'admin' },
     { to: '/settings', label: 'Settings', icon: <Tune />, role: 'admin' },

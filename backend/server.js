@@ -643,6 +643,9 @@ function buildApiRouter() {
     r.get('/maintenance', wrap((req) =>
         maint.listMaintenance({ rigId: req.query.rigId, status: req.query.status })));
     r.get('/maintenance/summary', wrap(() => maint.maintenanceSummary()));
+    // Fleet reliability KPIs (availability, MTBF/MTTR, NPT, Pareto, monthly
+    // trend + CMMS posture). Read-only.
+    r.get('/maintenance/kpis', wrap((req) => gov.getMaintenanceKpis({ days: req.query.days, tz: req.query.tz })));
 
     // Rig-wise daily maintenance/NPT rollup for the Maintenance & Reliability page.
     // - log:        maintenance-log entries for the most recent day that HAS entries

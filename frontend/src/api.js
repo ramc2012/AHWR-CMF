@@ -77,6 +77,7 @@ export const api = {
     // Maintenance & Reliability (audit #7).
     maintenance: (params) => axios.get('/api/maintenance', { params }).then((r) => r.data),
     maintenanceSummary: () => axios.get('/api/maintenance/summary').then((r) => r.data),
+    maintenanceKpis: (days) => axios.get('/api/maintenance/kpis', { params: days ? { days } : {} }).then((r) => r.data),
     maintenanceFleetDaily: () => axios.get('/api/maintenance/fleet-daily').then((r) => r.data),
     addMaintenance: (body) => axios.post('/api/maintenance', body).then((r) => r.data),
     updateMaintenance: (id, patch) => axios.patch(`/api/maintenance/${id}`, patch).then((r) => r.data),
