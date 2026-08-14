@@ -279,6 +279,89 @@ async function deleteWell(id, actor) {
 //   rigs (already held by the caller) -> wells in ascending well_id -> well_runs.
 // THROWS on failure — the ingest caller wraps it in a SAVEPOINT so a tracking
 // failure rolls back only the tracking, never the batch.
+
+// Stamp productive/NPT seconds + joints onto a JUST-CLOSED run when the edge did
+// not declare them. Productive/NPT are reconstructed from the run window's
+// activity events (the edge's own productive flag wins per event, else the
+// phase classification); joints = make-up connection records in the window.
+// Best-effort and SAVEPOINT-contained: a failure here must never poison the
+// enclosing ingest transaction.
+async function backfillRunStats(client, runId) {
+    if (runId == null) return;
+    await client.query('SAVEPOINT run_stats');
+    try {
+        const { rows } = await client.query(
+            `SELECT id, rig_id, started_at, ended_at, productive_sec, npt_sec, joints
+             FROM well_runs WHERE id = $1`, [runId]);
+        const run = rows[0];
+        if (!run || !run.ended_at) { await client.query('RELEASE SAVEPOINT run_stats'); return; }
+        const needSplit = run.productive_sec == null || run.npt_sec == null;
+        const needJoints = run.joints == null;
+        let prod = null; let npt = null; let joints = null;
+        if (needSplit) {
+            const seg = await client.query(
+                `WITH ev0 AS (
+                    (SELECT ts,
+                            upper(COALESCE(payload->>'activity', payload->>'phase')) AS phase,
+                            payload->>'productive' AS declared
+                     FROM events
+                     WHERE rig_id = $1 AND type = 'activity' AND ts < $2
+                     ORDER BY ts DESC LIMIT 1)
+                    UNION ALL
+                    SELECT ts,
+                           upper(COALESCE(payload->>'activity', payload->>'phase')) AS phase,
+                           payload->>'productive' AS declared
+                    FROM events
+                    WHERE rig_id = $1 AND type = 'activity' AND ts >= $2 AND ts <= $3
+                 ), ev AS (
+                    -- The phase in force at run open is set by the last event BEFORE
+                    -- the window; clamp its segment start to the run start.
+                    SELECT GREATEST(ts, $2::timestamptz) AS ts, phase, declared,
+                           LEAD(GREATEST(ts, $2::timestamptz)) OVER (ORDER BY ts) AS next_ts
+                    FROM ev0
+                 ), seg AS (
+                    SELECT EXTRACT(EPOCH FROM (COALESCE(next_ts, $3::timestamptz) - ts)) AS dur,
+                           CASE WHEN declared = 'true' THEN 'p'
+                                WHEN declared = 'false' THEN 'n'
+                                WHEN phase IN ('WAIT','IDLE','REPAIR','STOP') THEN 'n'
+                                WHEN phase IN ('RIH','POOH','CIRCULATE','MAKE_UP','BREAK_OUT','PWOC','TRIP','DRILL','RUN','PULL') THEN 'p'
+                                ELSE 'o' END AS cls
+                    FROM ev
+                 )
+                 SELECT COALESCE(sum(dur) FILTER (WHERE cls = 'p'), 0) AS prod,
+                        COALESCE(sum(dur) FILTER (WHERE cls = 'n'), 0) AS npt,
+                        count(*) AS n
+                 FROM seg`,
+                [run.rig_id, run.started_at, run.ended_at]);
+            if (Number(seg.rows[0].n) > 0) {
+                prod = Math.round(Number(seg.rows[0].prod));
+                npt = Math.round(Number(seg.rows[0].npt));
+            }
+        }
+        if (needJoints) {
+            const c = await client.query(
+                `SELECT count(*) AS n FROM connections
+                 WHERE rig_id = $1 AND ts >= $2 AND ts <= $3
+                   AND COALESCE(payload->>'op', 'MAKE_UP') = 'MAKE_UP'`,
+                [run.rig_id, run.started_at, run.ended_at]);
+            joints = Number(c.rows[0].n);   // a genuine 0 is a known count, keep it
+        }
+        if (prod != null || npt != null || joints != null) {
+            await client.query(
+                `UPDATE well_runs SET
+                    productive_sec = COALESCE(productive_sec, $2),
+                    npt_sec = COALESCE(npt_sec, $3),
+                    joints = COALESCE(joints, $4)
+                 WHERE id = $1`,
+                [runId, prod, npt, joints]);
+        }
+        await client.query('RELEASE SAVEPOINT run_stats');
+    } catch (e) {
+        await client.query('ROLLBACK TO SAVEPOINT run_stats').catch(() => {});
+        console.warn('[wells] run-stats backfill failed (run ' + runId + '):', e.message);
+    }
+}
+
 async function trackRunInTxn(client, rigId, job) {
     if (!rigId || !job) return;
     const jobName = String(job).trim();
@@ -348,6 +431,7 @@ async function trackRunInTxn(client, rigId, job) {
         // but only from the in-service states; an operator/edge-declared final
         // state (producing/abandoned/suspended) is never overwritten by inference.
         await client.query('UPDATE well_runs SET ended_at = now() WHERE id = $1', [open.id]);
+        await backfillRunStats(client, open.id);
         if (open.well_id && open.well_id !== wellId) {
             await client.query(
                 `UPDATE wells SET current_rig_id = NULL,
@@ -393,5 +477,4 @@ async function trackRun(rigId, job, _nowMs) {
 
 module.exports = {
     getWells, getWell, getRuns, addWell, updateWell, deleteWell, trackRun, trackRunInTxn,
-    WELL_STATUSES, WELL_TYPES,
-};
+    WELL_STATUSES, WELL_TYPES, backfillRunStats };

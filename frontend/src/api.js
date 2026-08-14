@@ -63,6 +63,7 @@ export const api = {
     alarms: (priority) => axios.get('/api/alarms', { params: { priority } }).then((r) => r.data),
     dataQuality: () => axios.get('/api/data-quality').then((r) => r.data),
     workover: (hours) => axios.get('/api/workover', { params: { hours } }).then((r) => r.data),
+    workoverKpis: (days) => axios.get('/api/workover/kpis', { params: days ? { days } : {} }).then((r) => r.data),
     governance: () => axios.get('/api/governance').then((r) => r.data),
     updateDeployment: (rigId, patch) => axios.patch(`/api/governance/deployment/${rigId}`, patch).then((r) => r.data),
     addEscalation: (body) => axios.post('/api/governance/escalations', body).then((r) => r.data),

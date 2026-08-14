@@ -218,12 +218,24 @@ function snapshot(rig, t) {
     // Activity each tick boundary (cheap; one per batch is enough — emit on seal instead).
     rig._wf = wf;
 
-    // Connection record at the end of MAKE_UP.
+    // Connection record at the end of MAKE_UP (op + durationSec mirror the edge
+    // torque-turn payload so central can compute average connection time).
     if (wf.phase === 'MAKE_UP' && wf.elapsed === wf.dur - 1) {
         const fail = wf.cycleIndex % 4 === 3;
         events.push({ type: 'connection', payload: {
+            op: 'MAKE_UP',
             peakTorque: rig.lastMakeupPeak, result: fail ? 'FAIL' : 'PASS',
             joint: wf.cycleIndex + 1, limit: 18000,
+            durationSec: 45 + ((rig.n * 13 + wf.cycleIndex * 7) % 40),
+        } });
+    }
+    // Break-out record at the end of BREAK_OUT (no pass/fail band for break-out).
+    if (wf.phase === 'BREAK_OUT' && wf.elapsed === wf.dur - 1) {
+        events.push({ type: 'connection', payload: {
+            op: 'BREAK_OUT',
+            peakTorque: 5200 + ((rig.n * 11 + wf.cycleIndex * 5) % 2400), result: 'PASS',
+            joint: wf.cycleIndex + 1,
+            durationSec: 30 + ((rig.n * 17 + wf.cycleIndex * 3) % 35),
         } });
     }
 

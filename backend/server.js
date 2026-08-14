@@ -413,6 +413,9 @@ function buildApiRouter() {
     r.get('/alarms', wrap((req) => fleet.getAlarms({ priority: req.query.priority })));
     r.get('/data-quality', wrap(() => fleet.getDataQuality()));
     r.get('/workover', wrap((req) => gov.getWorkover({ hours: req.query.hours })));
+    // Fleet workover KPIs (avg days/well, NPT/well, make-up & break-out times,
+    // diesel per well/month + 6-month trend). Read-only.
+    r.get('/workover/kpis', wrap((req) => gov.getWorkoverKpis({ days: req.query.days, tz: req.query.tz })));
 
     // ----- Well management (WITSML-inspired; proposal §6.1 well drill-down) -----
     // A WELL is a first-class lifecycle entity; a WELL_RUN links telemetry to a

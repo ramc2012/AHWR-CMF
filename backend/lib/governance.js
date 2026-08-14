@@ -101,6 +101,179 @@ async function addDecision({ title, detail }, actor) {
     return rows[0];
 }
 
+// ---------------------------------------------------------------------------
+// Workover KPIs (industry-standard job metrics — IADC-style daily report
+// aggregates): avg days per well, NPT per well, make-up / break-out connection
+// times, diesel consumption per well and per month. Sources: well_runs
+// (job windows + productive/NPT/joints, backfilled at run close), connections
+// (op + durationSec payload), telemetry_1m (cat_engine.fuel_rate integration),
+// rig_downtime (maintenance NPT minutes).
+async function getWorkoverKpis({ days = 30, tz = 'Asia/Kolkata' } = {}) {
+    const d = Math.min(Math.max(Number(days) || 30, 1), 365);
+    const zone = /^[A-Za-z0-9_/+:-]{1,64}$/.test(String(tz || '')) ? String(tz) : 'Asia/Kolkata';
+    const win = `${d} days`;
+
+    // Per-rig job stats from completed runs in the window.
+    const runsQ = await query(
+        `SELECT wr.rig_id,
+                r.name,
+                count(*)                                        AS runs,
+                count(DISTINCT wr.well_id)                      AS wells,
+                avg(EXTRACT(EPOCH FROM (wr.ended_at - wr.started_at)))  AS avg_run_sec,
+                sum(EXTRACT(EPOCH FROM (wr.ended_at - wr.started_at)))  AS total_run_sec,
+                sum(wr.productive_sec)                          AS productive_sec,
+                sum(wr.npt_sec)                                 AS npt_sec,
+                sum(wr.joints)                                  AS joints
+         FROM well_runs wr
+         LEFT JOIN rigs r ON r.rig_id = wr.rig_id
+         WHERE wr.rig_id IS NOT NULL AND wr.ended_at IS NOT NULL AND wr.ended_at > now() - ($1)::interval
+         GROUP BY wr.rig_id, r.name`,
+        [win]);
+
+    // Per-rig connection stats (make-up vs break-out via the payload op;
+    // durationSec present for edge rigs and the fleet sim).
+    const connQ = await query(
+        `SELECT c.rig_id,
+                count(*) FILTER (WHERE COALESCE(c.payload->>'op','MAKE_UP') = 'MAKE_UP')  AS makeups,
+                count(*) FILTER (WHERE COALESCE(c.payload->>'op','MAKE_UP') = 'MAKE_UP' AND c.result = 'PASS') AS makeup_pass,
+                avg((c.payload->>'durationSec')::double precision)
+                    FILTER (WHERE COALESCE(c.payload->>'op','MAKE_UP') = 'MAKE_UP'
+                            AND (c.payload->>'durationSec') ~ '^[0-9]+(\\.[0-9]+)?$')               AS makeup_sec,
+                count(*) FILTER (WHERE c.payload->>'op' = 'BREAK_OUT')                    AS breakouts,
+                avg((c.payload->>'durationSec')::double precision)
+                    FILTER (WHERE c.payload->>'op' = 'BREAK_OUT'
+                            AND (c.payload->>'durationSec') ~ '^[0-9]+(\\.[0-9]+)?$')               AS breakout_sec
+         FROM connections c
+         WHERE c.ts > now() - ($1)::interval
+         GROUP BY c.rig_id`,
+        [win]);
+
+    // Per-rig diesel by fuel-rate integration over 1-minute buckets (l/h / 60).
+    const fuelQ = await query(
+        `SELECT rig_id, sum(avg) / 60.0 AS liters
+         FROM telemetry_1m
+         WHERE metric = 'cat_engine.fuel_rate' AND bucket > now() - ($1)::interval
+         GROUP BY rig_id`,
+        [win]);
+
+    const connBy = new Map(connQ.rows.map((r) => [r.rig_id, r]));
+    const fuelBy = new Map(fuelQ.rows.map((r) => [r.rig_id, r]));
+    const num = (v) => (v == null ? null : Number(v));
+
+    const rigs = runsQ.rows.map((r) => {
+        const c = connBy.get(r.rig_id) || {};
+        const f = fuelBy.get(r.rig_id) || {};
+        const wellsN = Number(r.wells) || 0;
+        const prod = num(r.productive_sec); const npt = num(r.npt_sec);
+        return {
+            rigId: r.rig_id,
+            name: r.name || r.rig_id,
+            wellsCompleted: wellsN,
+            runs: Number(r.runs) || 0,
+            avgDaysPerWell: r.avg_run_sec != null ? Number(r.avg_run_sec) / 86400 : null,
+            nptPct: prod != null && npt != null && (prod + npt) > 0 ? (npt / (prod + npt)) * 100 : null,
+            nptHoursPerWell: npt != null && wellsN > 0 ? npt / 3600 / wellsN : null,
+            joints: num(r.joints),
+            avgMakeupSec: num(c.makeup_sec),
+            avgBreakoutSec: num(c.breakout_sec),
+            makeups: Number(c.makeups) || 0,
+            breakouts: Number(c.breakouts) || 0,
+            makeupPassRate: c.makeups > 0 ? Math.round((Number(c.makeup_pass) / Number(c.makeups)) * 100) : null,
+            dieselLiters: f.liters != null ? Number(f.liters) : null,
+            dieselPerWellL: f.liters != null && wellsN > 0 ? Number(f.liters) / wellsN : null,
+        };
+    }).sort((a, b) => b.wellsCompleted - a.wellsCompleted || String(a.rigId || '').localeCompare(String(b.rigId || '')));
+
+    // Fleet rollup.
+    const totWells = rigs.reduce((a, r) => a + r.wellsCompleted, 0);
+    const totRunSec = runsQ.rows.reduce((a, r) => a + (Number(r.total_run_sec) || 0), 0);
+    const totRuns = rigs.reduce((a, r) => a + r.runs, 0);
+    const totProd = runsQ.rows.reduce((a, r) => a + (Number(r.productive_sec) || 0), 0);
+    const totNpt = runsQ.rows.reduce((a, r) => a + (Number(r.npt_sec) || 0), 0);
+    const wAvg = (sel, wSel) => {
+        let sum = 0; let w = 0;
+        for (const r of rigs) { const v = sel(r); const ww = wSel(r); if (v != null && ww > 0) { sum += v * ww; w += ww; } }
+        return w > 0 ? sum / w : null;
+    };
+    const totDiesel = rigs.reduce((a, r) => a + (r.dieselLiters || 0), 0);
+
+    // Monthly series — last 6 calendar months in the operating timezone.
+    const monthsQ = await query(
+        `WITH months AS (
+            SELECT to_char(date_trunc('month', (now() AT TIME ZONE $1)) - (i || ' months')::interval, 'YYYY-MM') AS ym
+            FROM generate_series(0, 5) AS g(i)
+         ),
+         runs_m AS (
+            SELECT to_char(date_trunc('month', ended_at AT TIME ZONE $1), 'YYYY-MM') AS ym,
+                   count(DISTINCT well_id) AS wells,
+                   avg(EXTRACT(EPOCH FROM (ended_at - started_at))) AS avg_run_sec,
+                   sum(npt_sec) AS npt_sec
+            FROM well_runs WHERE ended_at IS NOT NULL AND ended_at > now() - interval '6 months'
+            GROUP BY 1
+         ),
+         npt_m AS (
+            SELECT to_char(date_trunc('month', start_ts AT TIME ZONE $1), 'YYYY-MM') AS ym,
+                   sum(duration_min) / 60.0 AS npt_hours
+            FROM rig_downtime WHERE start_ts > now() - interval '6 months'
+            GROUP BY 1
+         ),
+         fuel_m AS (
+            SELECT to_char(date_trunc('month', bucket AT TIME ZONE $1), 'YYYY-MM') AS ym,
+                   sum(avg) / 60.0 AS liters
+            FROM telemetry_1m
+            WHERE metric = 'cat_engine.fuel_rate' AND bucket > now() - interval '6 months'
+            GROUP BY 1
+         )
+         SELECT m.ym,
+                COALESCE(r.wells, 0)      AS wells,
+                r.avg_run_sec             AS avg_run_sec,
+                r.npt_sec                 AS run_npt_sec,
+                n.npt_hours               AS downtime_npt_hours,
+                f.liters                  AS diesel_liters
+         FROM months m
+         LEFT JOIN runs_m r ON r.ym = m.ym
+         LEFT JOIN npt_m  n ON n.ym = m.ym
+         LEFT JOIN fuel_m f ON f.ym = m.ym
+         ORDER BY m.ym`,
+        [zone]);
+    const monthly = monthsQ.rows.map((m) => ({
+        month: m.ym,
+        wellsCompleted: Number(m.wells) || 0,
+        avgDaysPerWell: m.avg_run_sec != null ? Number(m.avg_run_sec) / 86400 : null,
+        nptHours: m.downtime_npt_hours != null ? Number(m.downtime_npt_hours)
+            : (m.run_npt_sec != null ? Number(m.run_npt_sec) / 3600 : null),
+        dieselLiters: m.diesel_liters != null ? Number(m.diesel_liters) : null,
+    }));
+    const monthsWithFuel = monthly.filter((m) => m.dieselLiters != null);
+
+    return {
+        windowDays: d,
+        timezone: zone,
+        fleet: {
+            wellsCompleted: totWells,
+            runsCompleted: totRuns,
+            avgDaysPerWell: totRuns > 0 ? (totRunSec / totRuns) / 86400 : null,
+            avgNptHoursPerWell: totWells > 0 && totNpt > 0 ? totNpt / 3600 / totWells : null,
+            nptPct: (totProd + totNpt) > 0 ? (totNpt / (totProd + totNpt)) * 100 : null,
+            productivePct: (totProd + totNpt) > 0 ? (totProd / (totProd + totNpt)) * 100 : null,
+            avgMakeupSec: wAvg((r) => r.avgMakeupSec, (r) => r.makeups),
+            avgBreakoutSec: wAvg((r) => r.avgBreakoutSec, (r) => r.breakouts),
+            makeups: rigs.reduce((a, r) => a + r.makeups, 0),
+            makeupPassRate: (() => {
+                const mk = rigs.reduce((a, r) => a + r.makeups, 0);
+                const pass = rigs.reduce((a, r) => a + (r.makeupPassRate != null ? (r.makeupPassRate / 100) * r.makeups : 0), 0);
+                return mk > 0 ? Math.round((pass / mk) * 100) : null;
+            })(),
+            dieselLiters: totDiesel > 0 ? totDiesel : null,
+            dieselPerWellL: totDiesel > 0 && totWells > 0 ? totDiesel / totWells : null,
+            dieselPerMonthL: monthsWithFuel.length ? monthsWithFuel.reduce((a, m) => a + m.dieselLiters, 0) / monthsWithFuel.length : null,
+        },
+        rigs,
+        monthly,
+    };
+}
+
+
 // ----- Workover performance (proposal §6.1) -----
 async function getWorkover({ hours = 24 } = {}) {
     const h = Math.min(Math.max(Number(hours) || 24, 1), 24 * 30);
@@ -222,5 +395,4 @@ async function getFleetReportPeriod(period = 'snapshot') {
 
 module.exports = {
     GATES, GATE_LABEL, getGovernance, updateDeployment, addEscalation,
-    updateEscalation, addDecision, getWorkover, getFleetReport, getFleetReportPeriod,
-};
+    updateEscalation, addDecision, getWorkover, getFleetReport, getFleetReportPeriod, getWorkoverKpis };

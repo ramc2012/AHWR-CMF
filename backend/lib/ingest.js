@@ -596,8 +596,24 @@ async function completeWellForRig(client, rigId, ev) {
     await lockWellsForRig(client, rigId, wellId);
     await upsertWellFromEvent(client, rigId, { ...well, wellId, name: well.name || wellId }, finalStatus, false);
     const endedAt = coerceTsIso(ev.ts) || new Date().toISOString();
-    await client.query('UPDATE well_runs SET ended_at = $3, summary = COALESCE(summary, $4) WHERE rig_id = $1 AND well_id = $2 AND ended_at IS NULL',
-        [rigId, wellId, endedAt, well.notes || null]);
+    // Persist the edge's DECLARED completion metrics (previously computed on the
+    // edge, sent, and dropped here); backfillRunStats fills whatever is still
+    // null from the run window's activity + connection events.
+    // null/'' must stay SQL NULL (Number(null) === 0 would stamp a false zero
+    // and permanently block the event-derived backfill).
+    const numOrNull = (v) => (v == null || v === '' ? null : (Number.isFinite(Number(v)) ? Number(v) : null));
+    const closed = await client.query(
+        `UPDATE well_runs SET ended_at = $3, summary = COALESCE(summary, $4),
+                productive_sec = COALESCE(productive_sec, $5),
+                npt_sec = COALESCE(npt_sec, $6),
+                joints = COALESCE(joints, $7),
+                depth_delta = COALESCE(depth_delta, $8)
+         WHERE rig_id = $1 AND well_id = $2 AND ended_at IS NULL
+         RETURNING id`,
+        [rigId, wellId, endedAt, well.notes || null,
+         numOrNull(well.productiveSec), numOrNull(well.nptSec),
+         numOrNull(well.joints), numOrNull(well.depthDelta)]);
+    for (const row of closed.rows) await wells.backfillRunStats(client, row.id);
     // td_date is a DATE column — only bind a castable value (same guard as
     // spud_date) so a malformed wire string cannot abort the batch.
     const tdDate = well.tdDate && /^\d{4}-\d{2}-\d{2}/.test(String(well.tdDate))
