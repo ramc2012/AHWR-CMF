@@ -162,6 +162,23 @@ function NavDrawer({ width, collapsed }) {
                     </Box>
                 )}
             </Toolbar>
+            {/* 70-years anniversary tagline (expanded sidebar only) */}
+            {!collapsed && (
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 2, pb: 1.25 }}>
+                    <Box
+                        component="img"
+                        src="/brand/ongc-70.png"
+                        alt="70"
+                        sx={{ height: 24, width: 'auto', filter: 'drop-shadow(0 1px 4px rgba(0,0,0,0.4))' }}
+                    />
+                    <Typography
+                        noWrap
+                        sx={{ color: 'text.secondary', fontFamily: "Georgia, 'Times New Roman', serif", fontStyle: 'italic', fontSize: 12 }}
+                    >
+                        years in Energy Exploration
+                    </Typography>
+                </Box>
+            )}
             <Divider />
             <List sx={{ px: 1 }}>
                 {items.map((n) => {
