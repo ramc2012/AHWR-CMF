@@ -126,11 +126,11 @@ async function getMaintenanceKpis({ days = 30, tz = 'Asia/Kolkata' } = {}) {
          GROUP BY dt.rig_id, r.name`,
         [win]);
 
-    // Downtime Pareto by reason code.
+    // Downtime Pareto by EQUIPMENT, cumulated over the fleet.
     const parQ = await query(
-        `SELECT COALESCE(NULLIF(trim(reason_code), ''), 'Unspecified') AS reason,
-                COALESCE(sum(duration_min), 0) / 60.0                   AS hours,
-                count(*)                                                AS records
+        `SELECT COALESCE(NULLIF(trim(asset), ''), asset_id, 'Unspecified') AS equipment,
+                COALESCE(sum(duration_min), 0) / 60.0                       AS hours,
+                count(*)                                                    AS records
          FROM rig_downtime
          WHERE start_ts > now() - ($1)::interval AND end_ts IS NOT NULL
          GROUP BY 1 ORDER BY hours DESC LIMIT 10`,
@@ -167,6 +167,20 @@ async function getMaintenanceKpis({ days = 30, tz = 'Asia/Kolkata' } = {}) {
                 sum((snapshot->'instrumentSummary'->>'overdue')::int)                 AS inst_overdue,
                 sum((snapshot->'instrumentSummary'->>'total')::int)                   AS inst_total
          FROM rig_cmms`);
+
+    // PM posture per EQUIPMENT class, cumulated across every rig's latest
+    // CMMS snapshot (status values per the edge shape: overdue | due-soon | ok).
+    const pmEqQ = await query(
+        `SELECT COALESCE(NULLIF(trim(p->>'asset'), ''), p->>'assetId', 'Unspecified') AS equipment,
+                count(*)                                              AS units,
+                count(*) FILTER (WHERE p->>'status' = 'overdue')      AS overdue,
+                count(*) FILTER (WHERE p->>'status' = 'due-soon')     AS due_soon,
+                count(*) FILTER (WHERE p->>'status' = 'ok')           AS ok,
+                avg((p->>'nextDueInHours')::double precision)
+                    FILTER (WHERE (p->>'nextDueInHours') ~ '^-?[0-9]+(\\.[0-9]+)?$') AS avg_next_due_h
+         FROM rig_cmms, jsonb_array_elements(COALESCE(snapshot->'pm', '[]'::jsonb)) AS p
+         GROUP BY 1
+         ORDER BY overdue DESC, due_soon DESC, equipment`);
 
     const rigCountQ = await query('SELECT count(*) AS n FROM rigs');
     const totalRigs = Number(rigCountQ.rows[0].n) || 0;
@@ -215,7 +229,20 @@ async function getMaintenanceKpis({ days = 30, tz = 'Asia/Kolkata' } = {}) {
             totalRigs,
         },
         rigs,
-        pareto: parQ.rows.map((r) => ({ reason: r.reason, hours: Number(r.hours) || 0, records: Number(r.records) || 0 })),
+        pmByEquipment: pmEqQ.rows.map((r) => {
+            const units = Number(r.units) || 0;
+            const overdue = Number(r.overdue) || 0;
+            return {
+                equipment: r.equipment,
+                units,
+                overdue,
+                dueSoon: Number(r.due_soon) || 0,
+                ok: Number(r.ok) || 0,
+                avgNextDueH: r.avg_next_due_h != null ? Number(r.avg_next_due_h) : null,
+                compliancePct: units > 0 ? ((units - overdue) / units) * 100 : null,
+            };
+        }),
+        pareto: parQ.rows.map((r) => ({ equipment: r.equipment, hours: Number(r.hours) || 0, records: Number(r.records) || 0 })),
         monthly: monQ.rows.map((m) => ({ month: m.ym, nptHours: Number(m.npt_hours) || 0, breakdowns: Number(m.breakdowns) || 0 })),
     };
 }
