@@ -154,7 +154,7 @@ function NavDrawer({ width, collapsed }) {
         <Drawer variant="permanent" sx={{ width, flexShrink: 0, whiteSpace: 'nowrap', boxSizing: 'border-box',
             '& .MuiDrawer-paper': { width, boxSizing: 'border-box', bgcolor: '#0f172a', borderRight: '1px solid rgba(255,255,255,0.06)', overflowX: 'hidden', transition: 'width .2s' } }}>
             <Toolbar sx={{ py: 1, px: collapsed ? 0 : 2, gap: 1.25, justifyContent: collapsed ? 'center' : 'flex-start' }}>
-                <OngcBlockLogo size={collapsed ? 34 : 40} />
+                <OngcBlockLogo size={collapsed ? 40 : 48} />
                 {!collapsed && (
                     <Box>
                         <Typography variant="h6" fontWeight={900} letterSpacing={1} lineHeight={1.2}>CRMF</Typography>
@@ -162,23 +162,6 @@ function NavDrawer({ width, collapsed }) {
                     </Box>
                 )}
             </Toolbar>
-            {/* 70-years anniversary tagline (expanded sidebar only) */}
-            {!collapsed && (
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 2, pb: 1.25 }}>
-                    <Box
-                        component="img"
-                        src="/brand/ongc-70.png"
-                        alt="70"
-                        sx={{ height: 24, width: 'auto', filter: 'drop-shadow(0 1px 4px rgba(0,0,0,0.4))' }}
-                    />
-                    <Typography
-                        noWrap
-                        sx={{ color: 'text.secondary', fontFamily: "Georgia, 'Times New Roman', serif", fontStyle: 'italic', fontSize: 12 }}
-                    >
-                        years in Energy Exploration
-                    </Typography>
-                </Box>
-            )}
             <Divider />
             <List sx={{ px: 1 }}>
                 {items.map((n) => {
