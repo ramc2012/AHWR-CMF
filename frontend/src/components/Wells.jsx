@@ -2,11 +2,10 @@ import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
     Box, Paper, Typography, Stack, Chip, TextField, InputAdornment, Select, MenuItem,
-    FormControl, InputLabel, IconButton, Tooltip, Alert,
+    FormControl, InputLabel, Tooltip, Alert,
 } from '@mui/material';
-import { Search, DeleteOutline } from '@mui/icons-material';
+import { Search } from '@mui/icons-material';
 import { api } from '../api';
-import { useAuth } from '../context/AuthContext';
 import { KpiCard, fmtNum } from './common';
 
 // Well lifecycle status palette (StatusChip's STATUS_COLOR is rig-liveness oriented and
@@ -74,7 +73,7 @@ function WellStatusChip({ status, size = 'small' }) {
 // Compact clickable well tile. Top line carries name + UWI; a row of meta chips sits below
 // (type, status coloured by lifecycle, asset unit, total depth, current rig). Admin gets a
 // delete control in the corner. Clicking the body opens the well detail.
-function WellTile({ well, canAdmin, onOpen, onDelete }) {
+function WellTile({ well, onOpen }) {
     const c = WELL_STATUS_COLOR[well.status] || '#64748b';
     const onKeyDown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(); } };
     return (
@@ -100,27 +99,20 @@ function WellTile({ well, canAdmin, onOpen, onDelete }) {
                     </Typography>
                 </Box>
                 {well.activeRun && <Tooltip title="Active run"><Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: '#22c55e', mt: 0.5, flex: '0 0 auto' }} /></Tooltip>}
-                {canAdmin && (
-                    <Tooltip title="Delete well">
-                        <IconButton size="small" color="error"
-                            onClick={(e) => { e.stopPropagation(); onDelete(); }}
-                            sx={{ mt: -0.5, mr: -0.5 }}>
-                            <DeleteOutline fontSize="small" />
-                        </IconButton>
-                    </Tooltip>
-                )}
             </Stack>
 
             <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap alignItems="center">
                 <OperationChip op={well.currentOperation} />
-                {(well.serviceType || well.wellType) && <Chip size="small" variant="outlined" label={well.serviceType || well.wellType} />}
-                <WellStatusChip status={well.status} />
+                {(well.serviceType || well.wellType) && (well.serviceType || well.wellType) !== 'workover' && (
+                    <Chip size="small" variant="outlined" label={well.serviceType || well.wellType} />
+                )}
+                {well.status !== 'workover' && <WellStatusChip status={well.status} />}
             </Stack>
 
             <Stack direction="row" spacing={2} sx={{ mt: 'auto', pt: 0.5 }}>
                 <MetaCol label="Asset" value={well.assetUnit || well.field || '—'} />
                 <MetaCol label="TD" value={well.totalDepth != null ? `${fmtNum(well.totalDepth, 0)} m` : '—'} />
-                <MetaCol label="Rig" value={well.currentRigId || '—'} mono />
+                <MetaCol label="Rig" value={well.currentRigId || well.lastRigId || '—'} mono />
             </Stack>
         </Paper>
     );
@@ -138,9 +130,6 @@ function MetaCol({ label, value, mono }) {
 
 export default function Wells() {
     const nav = useNavigate();
-    const { can } = useAuth();
-    const canAdmin = can('admin');
-
     const [rows, setRows] = useState([]);
     const [loading, setLoading] = useState(true);
     const [err, setErr] = useState('');
@@ -150,7 +139,11 @@ export default function Wells() {
     const [type, setType] = useState('all');
     const [op, setOp] = useState('all');
     const [q, setQ] = useState('');
-    const [qh, setQh] = useState('');   // separate search for the history panel
+    const [rigF, setRigF] = useState('all');
+    const [qh, setQh] = useState('');   // history panel has its own filter set
+    const [hStatus, setHStatus] = useState('all');
+    const [hUnit, setHUnit] = useState('all');
+    const [hRig, setHRig] = useState('all');
 
     const load = useCallback(() => {
         setErr('');
@@ -162,6 +155,11 @@ export default function Wells() {
 
     useEffect(() => { setLoading(true); load(); }, [load]);
 
+    const rigOptions = useMemo(() => {
+        const set = new Set(rows.map((r) => r.currentRigId || r.lastRigId).filter(Boolean));
+        return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    }, [rows]);
+
     const units = useMemo(() => {
         const set = new Set(rows.map((r) => r.assetUnit || r.field).filter(Boolean));
         return Array.from(set).sort((a, b) => a.localeCompare(b));
@@ -171,9 +169,12 @@ export default function Wells() {
     // TD date (job end) newest-first; falls back to well id.
     const historyRows = useMemo(() => rows
         .filter((r) => ['completed', 'producing', 'suspended', 'abandoned'].includes(r.status))
-        .filter((r) => !qh || `${r.name} ${r.uwi || ''} ${r.wellId} ${r.assetUnit || r.field || ''}`.toLowerCase().includes(qh.toLowerCase()))
+        .filter((r) => hStatus === 'all' || r.status === hStatus)
+        .filter((r) => hUnit === 'all' || (r.assetUnit || r.field) === hUnit)
+        .filter((r) => hRig === 'all' || (r.lastRigId || r.currentRigId) === hRig)
+        .filter((r) => !qh || `${r.name} ${r.uwi || ''} ${r.wellId} ${r.assetUnit || r.field || ''} ${r.lastRigId || ''}`.toLowerCase().includes(qh.toLowerCase()))
         .sort((a, b) => String(b.tdDate || '').localeCompare(String(a.tdDate || '')) || String(a.wellId).localeCompare(String(b.wellId))),
-    [rows, qh]);
+    [rows, qh, hStatus, hUnit, hRig]);
 
     // CURRENT panel: wells still in play; post-job lifecycle stages live in the
     // separate Well history panel below (unless a rig is back on the well).
@@ -183,9 +184,10 @@ export default function Wells() {
         if (status !== 'all' && r.status !== status) return false;
         if (type !== 'all' && r.wellType !== type) return false;
         if (op !== 'all' && opKey(r.currentOperation) !== op) return false;
+        if (rigF !== 'all' && r.currentRigId !== rigF) return false;
         if (q && !(`${r.name} ${r.uwi || ''} ${r.wellId} ${r.assetUnit || r.field || ''} ${r.currentRigId || ''}`.toLowerCase().includes(q.toLowerCase()))) return false;
         return true;
-    }), [rows, unit, status, type, op, q]);
+    }), [rows, unit, status, type, op, q, rigF]);
 
     // KPI counts span the full (unfiltered) set so the row stays a stable fleet
     // summary. PRIMARY axis: current OPERATION — what is being done on each well
@@ -207,13 +209,6 @@ export default function Wells() {
         });
         return { total: rows.length, onJob, offJob: rows.length - onJob, ops, lifecycle };
     }, [rows]);
-
-    const deleteWell = async (well) => {
-        if (!window.confirm(`Delete well "${well.name}" (${well.wellId})? This cannot be undone.`)) return;
-        setErr('');
-        try { await api.deleteWell(well.wellId); load(); }
-        catch (e) { if (e?.response?.status !== 401) setErr(e?.response?.data?.error || 'Failed to delete well'); }
-    };
 
     return (
         <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'auto' }}>
@@ -296,6 +291,13 @@ export default function Wells() {
                                 ))}
                             </Select>
                         </FormControl>
+                        <FormControl size="small" sx={{ minWidth: 140 }}>
+                            <InputLabel id="well-rig-label">Rig</InputLabel>
+                            <Select labelId="well-rig-label" label="Rig" value={rigF} onChange={(e) => setRigF(e.target.value)}>
+                                <MenuItem value="all">All rigs</MenuItem>
+                                {rigOptions.map((r) => <MenuItem key={r} value={r}>{r}</MenuItem>)}
+                            </Select>
+                        </FormControl>
                     </Stack>
                     <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
                         {filtered.length} well{filtered.length !== 1 ? 's' : ''}{filtered.length !== rows.length ? ` of ${rows.length}` : ''}
@@ -306,9 +308,8 @@ export default function Wells() {
                 <Box sx={{ maxHeight: 420, overflow: 'auto', px: 1.5, pb: 1.5 }}>
                     <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 1.25, alignItems: 'stretch' }}>
                         {filtered.map((w) => (
-                            <WellTile key={w.wellId} well={w} canAdmin={canAdmin}
-                                onOpen={() => nav('/wells/' + encodeURIComponent(w.wellId))}
-                                onDelete={() => deleteWell(w)} />
+                            <WellTile key={w.wellId} well={w}
+                                onOpen={() => nav('/wells/' + encodeURIComponent(w.wellId))} />
                         ))}
                     </Box>
                     {!loading && !filtered.length && (
@@ -331,8 +332,29 @@ export default function Wells() {
                     </Box>
                     <Box sx={{ p: 1.5, flex: '0 0 auto' }}>
                         <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-                            <TextField size="small" placeholder="Search name / UWI" value={qh} onChange={(e) => setQh(e.target.value)} sx={{ flex: 1, minWidth: 180 }}
+                            <TextField size="small" placeholder="Search name / UWI / rig" value={qh} onChange={(e) => setQh(e.target.value)} sx={{ flex: 1, minWidth: 180 }}
                                 InputProps={{ startAdornment: <InputAdornment position="start"><Search fontSize="small" /></InputAdornment> }} />
+                            <FormControl size="small" sx={{ minWidth: 140 }}>
+                                <InputLabel id="hist-status-label">Status</InputLabel>
+                                <Select labelId="hist-status-label" label="Status" value={hStatus} onChange={(e) => setHStatus(e.target.value)}>
+                                    <MenuItem value="all">All statuses</MenuItem>
+                                    {['completed', 'producing', 'suspended', 'abandoned'].map((st) => <MenuItem key={st} value={st}>{st}</MenuItem>)}
+                                </Select>
+                            </FormControl>
+                            <FormControl size="small" sx={{ minWidth: 150 }}>
+                                <InputLabel id="hist-unit-label">Asset unit</InputLabel>
+                                <Select labelId="hist-unit-label" label="Asset unit" value={hUnit} onChange={(e) => setHUnit(e.target.value)}>
+                                    <MenuItem value="all">All units</MenuItem>
+                                    {units.map((u) => <MenuItem key={u} value={u}>{u}</MenuItem>)}
+                                </Select>
+                            </FormControl>
+                            <FormControl size="small" sx={{ minWidth: 140 }}>
+                                <InputLabel id="hist-rig-label">Rig</InputLabel>
+                                <Select labelId="hist-rig-label" label="Rig" value={hRig} onChange={(e) => setHRig(e.target.value)}>
+                                    <MenuItem value="all">All rigs</MenuItem>
+                                    {rigOptions.map((r) => <MenuItem key={r} value={r}>{r}</MenuItem>)}
+                                </Select>
+                            </FormControl>
                             <Typography variant="caption" color="text.secondary">
                                 {historyRows.length} completed well{historyRows.length !== 1 ? 's' : ''} — click a well to open its historical EDR and operations / maintenance log
                             </Typography>
@@ -341,9 +363,8 @@ export default function Wells() {
                     <Box sx={{ maxHeight: 420, overflow: 'auto', px: 1.5, pb: 1.5 }}>
                         <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 1.25, alignItems: 'stretch' }}>
                             {historyRows.map((w) => (
-                                <WellTile key={w.wellId} well={w} canAdmin={canAdmin}
-                                    onOpen={() => nav('/wells/' + encodeURIComponent(w.wellId))}
-                                    onDelete={() => deleteWell(w)} />
+                                <WellTile key={w.wellId} well={w}
+                                    onOpen={() => nav('/wells/' + encodeURIComponent(w.wellId))} />
                             ))}
                         </Box>
                         {!loading && !historyRows.length && (

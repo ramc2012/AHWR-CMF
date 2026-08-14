@@ -131,9 +131,6 @@ export const api = {
     wellRuns: (id) => axios.get(`/api/wells/${encodeURIComponent(id)}/runs`).then((r) => r.data),
     // Well-history module: operations log + maintenance/NPT for one recorded run.
     wellRunLog: (id, runId) => axios.get(`/api/wells/${encodeURIComponent(id)}/runlog`, { params: runId ? { runId } : {} }).then((r) => r.data),
-    addWell: (b) => axios.post('/api/wells', b).then((r) => r.data),
-    updateWell: (id, p) => axios.patch(`/api/wells/${encodeURIComponent(id)}`, p).then((r) => r.data),
-    deleteWell: (id) => axios.delete(`/api/wells/${encodeURIComponent(id)}`).then((r) => r.data),
     // Range-mode multi-metric history (epochMs from/to) for offline EDR replay over a well run.
     rigHistoryRange: (id, metrics, fromMs, toMs, maxPoints) => axios.get(`/api/rigs/${id}/history-multi`, { params: { metrics: (metrics || []).join(','), from: fromMs, to: toMs, maxPoints } }).then((r) => r.data),
 };

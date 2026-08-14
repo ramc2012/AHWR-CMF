@@ -477,12 +477,10 @@ function buildApiRouter() {
             downtime,
         };
     }));
-    r.post('/wells', requireRoleAudited('admin'),
-        wrap((req) => wells.addWell(req.body, req.user.username)));
-    r.patch('/wells/:id', requireRoleAudited('admin'),
-        wrap((req) => wells.updateWell(req.params.id, req.body, req.user.username)));
-    r.delete('/wells/:id', requireRoleAudited('admin'),
-        wrap((req) => wells.deleteWell(req.params.id, req.user.username)));
+    // NO central well writes: the EDGE apps are the system of record for the
+    // well registry. Wells sync in via well.created/updated/started/completed
+    // events and accumulate their full operational history (runs, activity,
+    // telemetry aggregates, CMMS maintenance/NPT) in the central database.
 
     // ----- Rig registry CRUD (proposal §6.2 rig master, admin-only, audited) -----
     // MONITORING-ONLY: this manages the central rig REGISTRY (who we expect data

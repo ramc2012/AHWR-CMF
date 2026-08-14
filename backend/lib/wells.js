@@ -76,7 +76,8 @@ async function getWells({ assetUnit, status, q } = {}) {
         `SELECT w.well_id, w.name, w.uwi, w.well_type, w.service_type, w.status, w.asset_unit, w.field,
                 w.total_depth, w.current_rig_id, w.spud_date, w.td_date,
                 CASE WHEN w.current_rig_id IS NOT NULL THEN r.active_activity END AS current_operation,
-                EXISTS (SELECT 1 FROM well_runs wr WHERE wr.well_id = w.well_id AND wr.ended_at IS NULL) AS active_run
+                EXISTS (SELECT 1 FROM well_runs wr WHERE wr.well_id = w.well_id AND wr.ended_at IS NULL) AS active_run,
+                (SELECT wr2.rig_id FROM well_runs wr2 WHERE wr2.well_id = w.well_id ORDER BY wr2.started_at DESC LIMIT 1) AS last_rig_id
          FROM wells w
          LEFT JOIN rigs r ON r.rig_id = w.current_rig_id ${clause}
          ORDER BY w.well_id`, vals);
@@ -94,6 +95,7 @@ async function getWells({ assetUnit, status, q } = {}) {
         currentOperation: r.current_operation || null,
         spudDate: r.spud_date,
         tdDate: r.td_date,
+        lastRigId: r.last_rig_id,
         activeRun: r.active_run === true,
     }));
 }
