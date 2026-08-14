@@ -2,17 +2,16 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
     Box, Paper, Typography, Grid, Table, TableBody, TableCell, TableHead, TableRow, TableContainer,
-    Stack, Chip, ToggleButton, ToggleButtonGroup, Select, MenuItem, TextField, Button, Dialog,
-    DialogTitle, DialogContent, DialogActions, IconButton, Tooltip, Alert,
+    Stack, Chip, ToggleButton, ToggleButtonGroup, Select, MenuItem, TextField,
+    IconButton, Tooltip, Alert,
 } from '@mui/material';
-import { Add, CheckCircle, PlayArrow, Healing } from '@mui/icons-material';
+import { CheckCircle, PlayArrow, Healing } from '@mui/icons-material';
 import {
     ResponsiveContainer, ComposedChart, BarChart, Bar, Line, XAxis, YAxis, Tooltip as ChartTooltip, CartesianGrid, Legend,
 } from 'recharts';
 import ErrorBoundary from './ErrorBoundary';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
-import { useFleet } from '../context/FleetContext';
 import { KpiCard, fmtAgo, fmtNum } from './common';
 
 const TYPES = ['PM', 'calibration', 'breakdown', 'inspection'];
@@ -29,7 +28,6 @@ const chartTooltipStyle = { background: '#0d1526', border: '1px solid rgba(255,2
 export default function Maintenance() {
     const nav = useNavigate();
     const { can } = useAuth();
-    const { fleet } = useFleet();
     const editable = can('operator');
 
     const [filter, setFilter] = useState('all');
@@ -37,12 +35,15 @@ export default function Maintenance() {
     const [summary, setSummary] = useState(null);
     const [err, setErr] = useState('');
     const [loading, setLoading] = useState(true);
-    const [open, setOpen] = useState(false);
-    const [draft, setDraft] = useState({ rigId: '', type: 'PM', title: '', dueDate: '', runtimeHours: '', notes: '' });
-    const [saving, setSaving] = useState(false);
     const [daily, setDaily] = useState(null);   // rig-wise last-day log + NPT rollup
     const [kpis, setKpis] = useState(null);     // reliability KPIs (availability / MTBF / MTTR / Pareto)
     const [days, setDays] = useState(30);
+    // Log browser (rig-wise / asset-wise over the accumulated CMMS history).
+    const [logKind, setLogKind] = useState('maint');    // 'maint' | 'downtime'
+    const [logRig, setLogRig] = useState('all');
+    const [logAsset, setLogAsset] = useState('all');
+    const [logQ, setLogQ] = useState('');
+    const [log, setLog] = useState(null);
 
     const load = useCallback(() => {
         setErr('');
@@ -64,27 +65,21 @@ export default function Maintenance() {
     }, [days]);
     useEffect(() => { loadKpis(); const t = setInterval(loadKpis, 30000); return () => clearInterval(t); }, [loadKpis]);
 
-    const submit = async () => {
-        if (!draft.rigId || !draft.title) return;
-        setSaving(true);
-        try {
-            await api.addMaintenance({
-                rigId: draft.rigId,
-                type: draft.type,
-                title: draft.title,
-                dueDate: draft.dueDate || null,
-                runtimeHours: draft.runtimeHours === '' ? null : Number(draft.runtimeHours),
-                notes: draft.notes || null,
-            });
-            setOpen(false);
-            setDraft({ rigId: '', type: 'PM', title: '', dueDate: '', runtimeHours: '', notes: '' });
-            load();
-        } catch (e) {
-            if (e?.response?.status !== 401) setErr(e?.response?.data?.error || 'Failed to add record');
-        } finally {
-            setSaving(false);
-        }
-    };
+    // Log browser fetch — debounced so free-text search doesn't spam the API.
+    useEffect(() => {
+        const t = setTimeout(() => {
+            api.maintenanceLog({
+                kind: logKind,
+                days,
+                rig: logRig === 'all' ? undefined : logRig,
+                asset: logAsset === 'all' ? undefined : logAsset,
+                q: logQ || undefined,
+            }).then(setLog).catch(() => {});
+        }, 350);
+        return () => clearTimeout(t);
+    }, [logKind, logRig, logAsset, logQ, days]);
+
+    const rigSort = (a, b) => a.localeCompare(b, undefined, { numeric: true });
 
     const advance = async (rec, status) => {
         try {
@@ -112,7 +107,6 @@ export default function Maintenance() {
                     <ToggleButton value="all">All</ToggleButton>
                     {STATUSES.map((st) => <ToggleButton key={st} value={st} sx={{ textTransform: 'none' }}>{st.replace('_', ' ')}</ToggleButton>)}
                 </ToggleButtonGroup>
-                {editable && <Button variant="contained" startIcon={<Add />} onClick={() => setOpen(true)}>Add record</Button>}
             </Stack>
 
             {err && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setErr('')}>{err}</Alert>}
@@ -218,6 +212,100 @@ export default function Maintenance() {
                                 </TableCell></TableRow>
                             )}
                         </TableBody>
+                    </Table>
+                </TableContainer>
+            </Paper>
+
+            {/* ---- LOG BROWSER: rig-wise / asset-wise maintenance & downtime logs ---- */}
+            <Paper sx={{ mb: 2, flex: '0 0 auto' }}>
+                <Stack direction="row" alignItems="center" spacing={1.5} sx={{ p: 1.5, pb: 0.5 }} flexWrap="wrap" useFlexGap>
+                    <Typography variant="h6" sx={{ flexGrow: 1 }}>Log browser</Typography>
+                    <ToggleButtonGroup size="small" exclusive value={logKind} onChange={(_e, v) => v && setLogKind(v)}>
+                        <ToggleButton value="maint" sx={{ textTransform: 'none' }}>Maintenance log</ToggleButton>
+                        <ToggleButton value="downtime" sx={{ textTransform: 'none' }}>Downtime / NPT</ToggleButton>
+                    </ToggleButtonGroup>
+                </Stack>
+                <Stack direction="row" spacing={1} sx={{ px: 1.5, pb: 1 }} flexWrap="wrap" useFlexGap alignItems="center">
+                    <Select size="small" value={logRig} onChange={(e) => setLogRig(e.target.value)} sx={{ minWidth: 150 }}>
+                        <MenuItem value="all">All rigs</MenuItem>
+                        {(log?.rigs || []).slice().sort(rigSort).map((r) => <MenuItem key={r} value={r}>{r}</MenuItem>)}
+                    </Select>
+                    <Select size="small" value={logAsset} onChange={(e) => setLogAsset(e.target.value)} sx={{ minWidth: 170 }}>
+                        <MenuItem value="all">All assets</MenuItem>
+                        {(log?.assets || []).map((a) => <MenuItem key={a} value={a}>{a}</MenuItem>)}
+                    </Select>
+                    <TextField size="small" placeholder={logKind === 'maint' ? 'Search text / notification / by' : 'Search reason / notes'}
+                        value={logQ} onChange={(e) => setLogQ(e.target.value)} sx={{ flex: 1, minWidth: 200 }} />
+                    <Typography variant="caption" color="text.secondary">
+                        {log ? `${log.rows.length}${log.rows.length === 500 ? '+' : ''} entries · last ${log.windowDays}d` : 'Loading…'}
+                    </Typography>
+                </Stack>
+                <TableContainer sx={{ maxHeight: 320 }}>
+                    <Table size="small" stickyHeader>
+                        {logKind === 'maint' ? (
+                            <>
+                                <TableHead>
+                                    <TableRow>
+                                        <TableCell>Time</TableCell>
+                                        <TableCell>Rig</TableCell>
+                                        <TableCell>Notification</TableCell>
+                                        <TableCell>Asset</TableCell>
+                                        <TableCell>Category</TableCell>
+                                        <TableCell>Entry</TableCell>
+                                        <TableCell>By / shift</TableCell>
+                                    </TableRow>
+                                </TableHead>
+                                <TableBody>
+                                    {(log?.rows || []).map((l) => (
+                                        <TableRow key={`${l.rigId}-${l.entryId}`} hover>
+                                            <TableCell sx={{ whiteSpace: 'nowrap' }}>{l.ts ? new Date(l.ts).toLocaleString() : '—'}</TableCell>
+                                            <TableCell sx={{ fontFamily: 'monospace', fontWeight: 700, cursor: 'pointer' }}
+                                                onClick={() => nav(`/rigs/${encodeURIComponent(l.rigId)}`)}>{l.rigId}</TableCell>
+                                            <TableCell>{l.notificationNo ? <Chip size="small" variant="outlined" label={l.notificationNo} sx={{ height: 18, fontSize: 10, fontFamily: 'monospace' }} /> : '—'}</TableCell>
+                                            <TableCell>{l.asset || l.assetId || '—'}</TableCell>
+                                            <TableCell><Typography variant="caption" color="text.secondary">{l.category || l.logType || '—'}</Typography></TableCell>
+                                            <TableCell sx={{ maxWidth: 420 }}><Typography variant="caption">{l.text || '—'}</Typography></TableCell>
+                                            <TableCell><Typography variant="caption" color="text.secondary">{[l.by, l.shift].filter(Boolean).join(' · ') || '—'}</Typography></TableCell>
+                                        </TableRow>
+                                    ))}
+                                    {log && !log.rows.length && (
+                                        <TableRow><TableCell colSpan={7} align="center" sx={{ py: 4, color: 'text.secondary' }}>No maintenance-log entries match the filters.</TableCell></TableRow>
+                                    )}
+                                </TableBody>
+                            </>
+                        ) : (
+                            <>
+                                <TableHead>
+                                    <TableRow>
+                                        <TableCell>Start</TableCell>
+                                        <TableCell>Rig</TableCell>
+                                        <TableCell>Asset</TableCell>
+                                        <TableCell>Reason</TableCell>
+                                        <TableCell align="right">Duration</TableCell>
+                                        <TableCell>Notes</TableCell>
+                                    </TableRow>
+                                </TableHead>
+                                <TableBody>
+                                    {(log?.rows || []).map((d2) => (
+                                        <TableRow key={`${d2.rigId}-${d2.recordId}`} hover>
+                                            <TableCell sx={{ whiteSpace: 'nowrap' }}>{d2.start ? new Date(d2.start).toLocaleString() : '—'}</TableCell>
+                                            <TableCell sx={{ fontFamily: 'monospace', fontWeight: 700, cursor: 'pointer' }}
+                                                onClick={() => nav(`/rigs/${encodeURIComponent(d2.rigId)}`)}>{d2.rigId}</TableCell>
+                                            <TableCell>{d2.asset || d2.assetId || '—'}</TableCell>
+                                            <TableCell>{d2.reasonCode || '—'}</TableCell>
+                                            <TableCell align="right">
+                                                {d2.durationMin != null ? `${fmtNum(d2.durationMin, 0)} min`
+                                                    : <Chip size="small" color="warning" label="OPEN" sx={{ height: 18, fontSize: 10 }} />}
+                                            </TableCell>
+                                            <TableCell sx={{ maxWidth: 380 }}><Typography variant="caption" color="text.secondary">{d2.notes || '—'}</Typography></TableCell>
+                                        </TableRow>
+                                    ))}
+                                    {log && !log.rows.length && (
+                                        <TableRow><TableCell colSpan={6} align="center" sx={{ py: 4, color: 'text.secondary' }}>No downtime records match the filters.</TableCell></TableRow>
+                                    )}
+                                </TableBody>
+                            </>
+                        )}
                     </Table>
                 </TableContainer>
             </Paper>
@@ -376,28 +464,6 @@ export default function Maintenance() {
                 )}
             </Grid>
 
-            <Dialog open={open} onClose={() => setOpen(false)} fullWidth maxWidth="sm">
-                <DialogTitle>Add maintenance record</DialogTitle>
-                <DialogContent>
-                    <Stack spacing={2} mt={0.5}>
-                        <Select size="small" displayEmpty value={draft.rigId} onChange={(e) => setDraft({ ...draft, rigId: e.target.value })}>
-                            <MenuItem value="" disabled>Select rig…</MenuItem>
-                            {(fleet || []).map((r) => <MenuItem key={r.rigId} value={r.rigId}>{r.name || r.rigId} ({r.rigId})</MenuItem>)}
-                        </Select>
-                        <Select size="small" value={draft.type} onChange={(e) => setDraft({ ...draft, type: e.target.value })}>
-                            {TYPES.map((t) => <MenuItem key={t} value={t}>{t}</MenuItem>)}
-                        </Select>
-                        <TextField size="small" label="Title" value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
-                        <TextField size="small" label="Due date" type="date" InputLabelProps={{ shrink: true }} value={draft.dueDate} onChange={(e) => setDraft({ ...draft, dueDate: e.target.value })} />
-                        <TextField size="small" label="Runtime hours" type="number" value={draft.runtimeHours} onChange={(e) => setDraft({ ...draft, runtimeHours: e.target.value })} />
-                        <TextField size="small" label="Notes" multiline maxRows={3} value={draft.notes} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />
-                    </Stack>
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setOpen(false)}>Cancel</Button>
-                    <Button variant="contained" onClick={submit} disabled={saving || !draft.rigId || !draft.title}>{saving ? 'Saving…' : 'Add'}</Button>
-                </DialogActions>
-            </Dialog>
         </Box>
     );
 }

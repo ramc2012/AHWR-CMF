@@ -646,6 +646,71 @@ function buildApiRouter() {
     // Fleet reliability KPIs (availability, MTBF/MTTR, NPT, Pareto, monthly
     // trend + CMMS posture). Read-only.
     r.get('/maintenance/kpis', wrap((req) => gov.getMaintenanceKpis({ days: req.query.days, tz: req.query.tz })));
+    // Filterable LOG BROWSER over the accumulated CMMS history: maintenance-log
+    // entries or downtime/NPT records, rig-wise and asset-wise. Read-only.
+    r.get('/maintenance/log', wrap(async (req) => {
+        const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 365);
+        const rig = String(req.query.rig || '').trim();
+        const asset = String(req.query.asset || '').trim();
+        const q = String(req.query.q || '').trim();
+        const kind = req.query.kind === 'downtime' ? 'downtime' : 'maint';
+        const win = `${days} days`;
+
+        let rows;
+        if (kind === 'maint') {
+            const conds = ['m.at_ts > now() - ($1)::interval'];
+            const vals = [win];
+            if (rig) { vals.push(rig); conds.push(`m.rig_id = $${vals.length}`); }
+            if (asset) { vals.push(asset); conds.push(`(m.asset = $${vals.length} OR m.asset_id = $${vals.length})`); }
+            if (q) { vals.push(`%${q}%`); conds.push(`(m.text ILIKE $${vals.length} OR m.notification_no ILIKE $${vals.length} OR m.by_who ILIKE $${vals.length})`); }
+            const r2 = await query(
+                `SELECT m.rig_id AS "rigId", r.name, m.entry_id AS "entryId",
+                        m.log_type AS "logType", m.category, m.asset_id AS "assetId",
+                        m.asset, m.text, m.by_who AS "by", m.shift,
+                        m.notification_no AS "notificationNo", m.at_ts AS "ts"
+                 FROM rig_maint_log m LEFT JOIN rigs r ON r.rig_id = m.rig_id
+                 WHERE ${conds.join(' AND ')}
+                 ORDER BY m.at_ts DESC LIMIT 500`, vals);
+            rows = r2.rows;
+        } else {
+            const conds = ['d.start_ts > now() - ($1)::interval'];
+            const vals = [win];
+            if (rig) { vals.push(rig); conds.push(`d.rig_id = $${vals.length}`); }
+            if (asset) { vals.push(asset); conds.push(`(d.asset = $${vals.length} OR d.asset_id = $${vals.length})`); }
+            if (q) { vals.push(`%${q}%`); conds.push(`(d.reason_code ILIKE $${vals.length} OR d.notes ILIKE $${vals.length})`); }
+            const r2 = await query(
+                `SELECT d.rig_id AS "rigId", r.name, d.record_id AS "recordId",
+                        d.asset_id AS "assetId", d.asset, d.reason_code AS "reasonCode",
+                        d.start_ts AS "start", d.end_ts AS "end",
+                        d.duration_min AS "durationMin", d.notes
+                 FROM rig_downtime d LEFT JOIN rigs r ON r.rig_id = d.rig_id
+                 WHERE ${conds.join(' AND ')}
+                 ORDER BY d.start_ts DESC LIMIT 500`, vals);
+            rows = r2.rows;
+        }
+
+        // Facets for the dropdowns: assets + rigs seen in the window (both tables).
+        const facets = await query(
+            `SELECT DISTINCT asset FROM (
+                SELECT COALESCE(NULLIF(trim(asset), ''), asset_id) AS asset
+                FROM rig_maint_log WHERE at_ts > now() - ($1)::interval
+                UNION
+                SELECT COALESCE(NULLIF(trim(asset), ''), asset_id) AS asset
+                FROM rig_downtime WHERE start_ts > now() - ($1)::interval
+             ) x WHERE asset IS NOT NULL ORDER BY asset`, [win]);
+        const rigFacets = await query(
+            `SELECT DISTINCT rig_id FROM (
+                SELECT rig_id FROM rig_maint_log WHERE at_ts > now() - ($1)::interval
+                UNION
+                SELECT rig_id FROM rig_downtime WHERE start_ts > now() - ($1)::interval
+             ) x WHERE rig_id IS NOT NULL ORDER BY rig_id`, [win]);
+
+        return {
+            kind, windowDays: days, rows,
+            assets: facets.rows.map((x) => x.asset),
+            rigs: rigFacets.rows.map((x) => x.rig_id),
+        };
+    }));
 
     // Rig-wise daily maintenance/NPT rollup for the Maintenance & Reliability page.
     // - log:        maintenance-log entries for the most recent day that HAS entries
@@ -712,8 +777,9 @@ function buildApiRouter() {
             })),
         };
     }));
-    r.post('/maintenance', requireRoleAudited('operator'),
-        wrap((req) => maint.addMaintenance(req.body, req.user.username)));
+    // NO central record creation: the EDGE CMMS is the system of record for
+    // maintenance; records arrive via cmms.snapshot sync. Status updates on
+    // existing central records remain (PATCH below).
     r.patch('/maintenance/:id', requireRoleAudited('operator'),
         wrap((req) => maint.updateMaintenance(req.params.id, req.body, req.user.username)));
 
