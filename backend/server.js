@@ -92,7 +92,11 @@ const corsOptions = {
 };
 
 const app = express();
-app.set('trust proxy', 1);
+// Number of reverse proxies in front of the API. Default 1 (the frontend
+// nginx); the Delhi HA deployment adds a TLS proxy in front of that, so it
+// sets TRUST_PROXY_HOPS=2 — otherwise every client collapses into one IP
+// and the login/API rate limiters throttle the whole site as a single user.
+app.set('trust proxy', Math.max(1, Number(process.env.TRUST_PROXY_HOPS) || 1));
 app.use(helmet());
 app.use(cors(corsOptions));
 
